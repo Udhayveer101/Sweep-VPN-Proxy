@@ -1,0 +1,125 @@
+import XCTest
+import NetworkExtension
+import SweepVPNCore
+@testable import SweepVPNKit
+@testable import SweepVPNUI
+
+final class TunnelSettingsMapperTests: XCTestCase {
+    let server = Server(id: "s", name: "Stockholm", countryCode: "SE", publicKey: "pk",
+                        endpoints: [.init(host: "1.2.3.4", port: 51820, rung: .wireGuardUDP)],
+                        dnsServers: ["10.64.0.1"], ipv4Address: "10.64.0.2")
+
+    func testMaskConversion() {
+        XCTAssertEqual(TunnelSettingsMapper.mask4(0), "0.0.0.0")
+        XCTAssertEqual(TunnelSettingsMapper.mask4(24), "255.255.255.0")
+        XCTAssertEqual(TunnelSettingsMapper.mask4(32), "255.255.255.255")
+    }
+
+    func testBlackholeSettingsRouteEverythingAndResolveNothingOutside() {
+        let s = TunnelSettingsMapper.settings(for: SecurityPolicy().blackholePlan())
+        XCTAssertEqual(s.ipv4Settings?.includedRoutes?.first?.destinationAddress, "0.0.0.0")
+        XCTAssertEqual(s.ipv4Settings?.includedRoutes?.first?.destinationSubnetMask, "0.0.0.0")
+        XCTAssertEqual(s.dnsSettings?.matchDomains, [""])
+        XCTAssertNotNil(s.ipv6Settings, "IPv6 must be captured, not left to the physical interface")
+        XCTAssertEqual(s.ipv6Settings?.includedRoutes?.first?.destinationAddress, "::")
+    }
+
+    func testConnectedSettingsCaptureIPv6EvenWithoutAnIPv6Address() {
+        let plan = SecurityPolicy().connectedPlan(server: server, endpoint: server.endpoints[0])
+        let s = TunnelSettingsMapper.settings(for: plan)
+        XCTAssertNotNil(s.ipv6Settings)
+        XCTAssertEqual(s.dnsSettings?.servers, ["10.64.0.1"])
+        XCTAssertEqual(s.ipv4Settings?.addresses, ["10.64.0.2"])
+    }
+}
+
+final class AdapterFactoryTests: XCTestCase {
+    let server = Server(id: "s", name: "s", countryCode: "SE", publicKey: "pk",
+                        endpoints: [.init(host: "1.2.3.4", port: 443, rung: .stealthTCP443)],
+                        dnsServers: ["10.64.0.1"], ipv4Address: "10.64.0.2")
+
+    func testUnimplementedRungFailsLoudlyInsteadOfSubstituting() {
+        XCTAssertThrowsError(try AdapterFactory.make(rung: .stealthTCP443, server: server,
+                                                     privateKeyBase64: "k", presharedKeyBase64: nil,
+                                                     keepalive: 25)) {
+            XCTAssertEqual($0 as? AdapterFactoryError, .rungNotImplemented(.stealthTCP443))
+        }
+    }
+
+    func testMissingEndpointFails() {
+        XCTAssertThrowsError(try AdapterFactory.make(rung: .wireGuardUDP, server: server,
+                                                     privateKeyBase64: "k", presharedKeyBase64: nil,
+                                                     keepalive: 25)) {
+            XCTAssertEqual($0 as? AdapterFactoryError, .noEndpoint(.wireGuardUDP))
+        }
+    }
+
+    func testOnlyRungsWeActuallyShipAreAdvertised() {
+        XCTAssertEqual(AdapterFactory.implementedRungs, [.wireGuardUDP, .ikev2])
+    }
+}
+
+final class PresentationTests: XCTestCase {
+    func p(_ state: TunnelState) -> Presentation {
+        Presentation.make(state: state, serverName: "Stockholm", killSwitchArmed: true,
+                          onDemandArmed: true, quality: .good)
+    }
+
+    func testFailureNeverLooksLikeSafeToBrowse() {
+        for state: TunnelState in [.killSwitchActive, .error(.allRungsFailed), .reconnecting(attempt: 1),
+                                   .reasserting] {
+            let pres = p(state)
+            XCTAssertNotEqual(pres.tint, .good, "\(state) must not read as protected")
+            XCTAssertNotEqual(pres.headline, "Protected")
+        }
+    }
+
+    func testReconnectingSaysTrafficIsBlockedNotLeaking() {
+        XCTAssertTrue(p(.reconnecting(attempt: 1)).detail.lowercased().contains("paused"))
+        XCTAssertTrue(p(.reconnecting(attempt: 1)).voiceOver.lowercased().contains("not leaking"))
+    }
+
+    func testConnectedShowsServerAndQuality() {
+        let pres = p(.connected(rung: .wireGuardUDP, server: "s"))
+        XCTAssertEqual(pres.tint, .good)
+        XCTAssertEqual(pres.detail, "Stockholm")
+        XCTAssertTrue(pres.showsQuality)
+        XCTAssertEqual(pres.primaryAction, .disconnect)
+    }
+
+    func testDegradedStillReadsAsProtectedButWarned() {
+        let pres = p(.degraded(rung: .wireGuardUDP, reason: .highLoss))
+        XCTAssertEqual(pres.tint, .warning)
+        XCTAssertTrue(pres.headline.hasPrefix("Protected"))
+    }
+
+    func testErrorsNameACauseAndAnAction() {
+        let denied = p(.error(.systemDenied))
+        XCTAssertEqual(denied.primaryAction, .openSettings)
+        XCTAssertFalse(denied.detail.isEmpty)
+        let config = p(.error(.configurationInvalid))
+        XCTAssertTrue(config.detail.contains("signed configuration"))
+    }
+
+    func testQualityThresholds() {
+        XCTAssertEqual(Presentation.Quality.from(rttMs: 30, lossFraction: 0), .good)
+        XCTAssertEqual(Presentation.Quality.from(rttMs: 200, lossFraction: 0), .fair)
+        XCTAssertEqual(Presentation.Quality.from(rttMs: 30, lossFraction: 0.05), .weak)
+    }
+
+    func testEveryStateHasNonEmptyCopy() {
+        let states: [TunnelState] = [.disconnected, .onDemandArmed, .connecting(rung: .wireGuardUDP),
+                                     .handshaking(rung: .wireGuardUDP),
+                                     .connected(rung: .wireGuardUDP, server: "s"), .reasserting,
+                                     .reconnecting(attempt: 1),
+                                     .degraded(rung: .wireGuardUDP, reason: .highLoss),
+                                     .killSwitchActive, .error(.internalFailure)]
+        for s in states {
+            let pres = p(s)
+            XCTAssertFalse(pres.headline.isEmpty)
+            XCTAssertFalse(pres.detail.isEmpty)
+            XCTAssertFalse(pres.primaryActionTitle.isEmpty)
+            XCTAssertFalse(pres.voiceOver.isEmpty)
+        }
+    }
+}

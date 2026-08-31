@@ -1,0 +1,4 @@
+module SweepWireGuardC {
+    header "sweepwg.h"
+    export *
+}

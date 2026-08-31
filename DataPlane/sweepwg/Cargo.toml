@@ -1,0 +1,25 @@
+[package]
+name = "sweepwg"
+version = "0.1.0"
+edition = "2021"
+
+# Data plane = boringtun (Cloudflare's audited userspace WireGuard, Rust, no GC).
+# Chosen over wireguard-go because the NetworkExtension has a hard ~15 MiB
+# jetsam budget (vault 01-Apple-Platform/Network-Extension-Process-Memory-Limit).
+# No cryptography is implemented here — this is a C ABI shim only.
+[dependencies]
+boringtun = { version = "0.7", default-features = false }
+base64 = "0.22"
+
+[lib]
+name = "sweepwg"
+crate-type = ["staticlib", "rlib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+rand_core = "0.6"

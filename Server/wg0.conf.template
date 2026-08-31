@@ -1,0 +1,18 @@
+# Sweep VPN — WireGuard server (rung 1). One personal VPS, per-peer /32.
+# Install to /etc/wireguard/wg0.conf, chmod 600.
+[Interface]
+Address = 10.64.0.1/24, fd00:64::1/64
+ListenPort = 51820
+PrivateKey = __SERVER_PRIVATE_KEY__
+# No DNS= here: clients are told the in-tunnel resolver by the signed bundle.
+PostUp   = sysctl -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
+PostUp   = nft -f /etc/nftables.conf
+PostDown = nft flush ruleset
+
+# One peer per device. AllowedIPs is a /32 (+/128) — a peer may never source
+# traffic for another peer's address.
+[Peer]
+# device: __DEVICE_LABEL__
+PublicKey = __DEVICE_PUBLIC_KEY__
+PresharedKey = __DEVICE_PSK__
+AllowedIPs = 10.64.0.2/32, fd00:64::2/128

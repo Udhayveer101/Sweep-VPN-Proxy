@@ -1,0 +1,6 @@
+.build/
+target/
+DerivedData/
+*.xcodeproj/xcuserdata/
+DataPlane/sweepwg/fat/
+*.key
