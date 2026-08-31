@@ -14,9 +14,9 @@ public enum AppConfig {
     public static let tunnelBundleID = "com.sweep.vpn.mac.tunnel"
     #endif
 
-    /// Ed25519 public key, base64. Replace with your own signing key before
-    /// shipping — the placeholder below is a well-known test key and the app
-    /// refuses to use it in a release build.
+    /// Ed25519 public key, base64, injected at build time from
+    /// SWEEP_CONFIG_SIGNING_KEY. Empty means "no pinned key", which makes
+    /// `pinnedSigningKey()` throw and the app refuse to connect.
     public static let configSigningPublicKeyBase64 =
         (Bundle.main.object(forInfoDictionaryKey: "SweepConfigSigningKey") as? String) ?? ""
 
