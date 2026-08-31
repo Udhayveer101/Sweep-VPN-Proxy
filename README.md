@@ -32,8 +32,35 @@ xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-iOS -sdk iphonesimulator
 (cd DataPlane/sweepwg && cargo test --release)   # real handshake + tamper/replay/PSK rejection
 ```
 
+## Protocol ladder
+| Rung | Transport | Beats |
+|---|---|---|
+| 1 | WireGuard / UDP (native port) | the normal case |
+| 2 | WireGuard / UDP 443 | "block odd UDP ports" filters |
+| 3 | WireGuard over QUIC datagrams :443 | UDP DPI; helps roaming |
+| 4 | WireGuard over TLS 1.3, TCP :443 | networks that drop all UDP |
+| 5 | Shadowsocks-2022, TCP | active probing (no plaintext handshake) |
+| 6 | IKEv2 (kernel) | low power, no extension process |
+| 7 | WireGuard over TCP :443 | last resort |
+
+Every rung carries the *same* unmodified WireGuard tunnel — a fallback changes
+the envelope, never the cryptography. `Automatic` races a diverse set (preferred
++ UDP-block survivor + web-shaped), commits only once a peer authenticates, walks
+down on failure and remembers per network what worked.
+
+Server side: `Server/sweepbridge` (Rust) terminates TCP/TLS/QUIC and relays to
+wg0; rung 5 needs only a stock `ssserver`.
+
+## Servers
+`Tools/sweep-catalog` builds the catalog: your own machines, plus an optional
+import of a public relay list (marked `requiresAccount`). The app measures RTT
+itself and orders the list **Automatic → fastest server (pinned) → the rest,
+fastest to slowest**, re-evaluated on every measurement and on network change.
+
 ## What ships (Tier 1)
-- Rung 1 **WireGuard/UDP** (boringtun) and rung 4 **kernel IKEv2** profile.
+- Rungs 1–5 and 7 in the packet tunnel (boringtun core), rung 6 as a kernel profile.
+- **macOS second kill-switch layer**: `NEFilterDataProvider` that blocks by
+  default whenever the tunnel is not carrying traffic.
 - Kill switch: on-demand catch-all + `includeAllNetworks` + `excludeLocalNetworks`
   + provider blackhole-until-authenticated.
 - DNS forced in-tunnel (`matchDomains = [""]`), IPv6 routed or blackholed, never
