@@ -29,6 +29,10 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     private var startCompletion: ((Error?) -> Void)?
     private var readingPackets = false
     private var pqActive = false
+    private var handshakeDeadline: DispatchWorkItem?
+    /// If the peer never authenticates we must not sit blocked forever with no
+    /// explanation: fail closed with a named error so the UI can say why.
+    private static let handshakeTimeout: TimeInterval = 30
 
     /// Injected by the platform target: where secrets live. `nil` means the
     /// keychain or the pinned key is unavailable — that is a fail-closed error,
@@ -65,6 +69,7 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     open override func stopTunnel(with reason: NEProviderStopReason,
                                  completionHandler: @escaping () -> Void) {
         diagnostics.record("stopTunnel", "\(reason.rawValue)")
+        handshakeDeadline?.cancel(); handshakeDeadline = nil
         pathMonitor?.cancel(); pathMonitor = nil
         adapter?.stop(); adapter = nil
         machine.transition(to: .disconnected)
@@ -120,6 +125,14 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         machine.transition(to: .handshaking(rung: rung))
 
         let queue = stateQueue
+        let deadline = DispatchWorkItem { [weak self] in
+            guard let self, !self.machine.state.forwardingAllowed else { return }
+            self.fail(.allRungsFailed, nil, self.startCompletion)
+            self.adapter?.stop()
+        }
+        handshakeDeadline = deadline
+        stateQueue.asyncAfter(deadline: .now() + Self.handshakeTimeout, execute: deadline)
+
         adapter.start(
             onAuthenticated: { [weak self] in
                 queue.async { self?.peerAuthenticated(rung: rung, server: server) }
@@ -136,6 +149,7 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// The one place that opens the blackhole.
     private func peerAuthenticated(rung: ProtocolRung, server: Server) {
         guard let endpoint = currentEndpoint else { return }
+        handshakeDeadline?.cancel(); handshakeDeadline = nil
         diagnostics.record("authenticated", rung.displayName)
         let queue = stateQueue
         applyPlan(policy.connectedPlan(server: server, endpoint: endpoint)) { [weak self] error in
