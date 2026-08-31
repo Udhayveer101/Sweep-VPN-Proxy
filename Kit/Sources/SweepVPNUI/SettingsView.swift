@@ -24,14 +24,39 @@ public struct SettingsView: View {
                 }
                 Section("Connection") {
                     Picker("Mode", selection: Binding(
-                        get: { modeIndex },
-                        set: { model.apply(preference: preference(for: $0)) })) {
-                            Text("Automatic").tag(0)
-                            Text("Fast").tag(1)
-                            Text("Stealth").tag(2)
+                        get: { model.preference },
+                        set: { model.apply(preference: $0) })) {
+                            ForEach(VPNViewModel.selectableModes, id: \.self) { mode in
+                                Text(mode.displayName).tag(mode)
+                            }
                         }
-                    Text("Automatic picks the best working route for this network and only changes it under strict anti-flap rules.")
+                    Text("Automatic tries the routes this network is most likely to allow — plain WireGuard first, then QUIC, TLS or Shadowsocks if the network blocks it — and only changes route under strict anti-flap rules.")
                         .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("Advanced") {
+                    Picker("Force a route", selection: Binding(
+                        get: { model.forcedRung },
+                        set: { model.apply(forcedRung: $0) })) {
+                            Text("Off").tag(ProtocolRung?.none)
+                            ForEach(model.selectableRungs, id: \.self) { rung in
+                                Text(rung.displayName).tag(ProtocolRung?.some(rung))
+                            }
+                        }
+                    Toggle("Block ads and trackers in DNS", isOn: Binding(
+                        get: { model.options.dnsFilteringEnabled },
+                        set: { var o = model.options; o.dnsFilteringEnabled = $0; model.apply(options: o) }))
+                    Text("Forcing a route disables racing and automatic fallback. Leave it off unless you are debugging a specific network.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                #if os(macOS)
+                MacSettingsSection(model: model,
+                                   tunnelExtensionID: model.tunnelExtensionID,
+                                   filterExtensionID: model.filterExtensionID)
+                #endif
+                Section("Configuration") {
+                    Text(model.configStatus ?? "No configuration loaded yet.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                 }
                 Section("Diagnostics") {
                     Button("Export diagnostics") {
@@ -45,49 +70,190 @@ public struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
             }
+            .formStyle(.grouped)
+            #if os(macOS)
+            // A grouped form on macOS lays labels out in a leading column; the
+            // extra width keeps the longer ones from clipping in the settings
+            // window, and the padding keeps body text off the edge.
+            .padding(.horizontal, 8)
+            #endif
             .navigationTitle("Settings")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
         }
     }
-
-    private var modeIndex: Int {
-        switch model.preference {
-        case .automatic: return 0
-        case .fast: return 1
-        case .stealth: return 2
-        case .forced: return 0
-        }
-    }
-    private func preference(for index: Int) -> ProtocolPreference {
-        [0: .automatic, 1: .fast, 2: .stealth][index] ?? .automatic
-    }
 }
 
+/// Server list. Row 1 is Automatic (connect to whatever is fastest right now),
+/// row 2 is the fastest server pinned so it is always one tap away, and the rest
+/// are ordered fastest → slowest from live measurements.
+/// Server list. Row 1 is Automatic (connect to whatever is fastest right now),
+/// row 2 is the fastest server pinned so it is always one tap away, and the rest
+/// are ordered fastest → slowest from live measurements.
+///
+/// Built on a lazy stack rather than `List` so it renders identically inside the
+/// macOS menu-bar popover and stays cheap with a few hundred servers.
 public struct ServerPickerView: View {
     @ObservedObject var model: VPNViewModel
     @Environment(\.dismiss) private var dismiss
+    @State private var search = ""
 
     public init(model: VPNViewModel) { self.model = model }
 
+    private var visibleEntries: [ServerListEntry] {
+        guard !search.isEmpty else { return model.listEntries }
+        let needle = search.lowercased()
+        return model.listEntries.filter { entry in
+            switch entry {
+            case .automatic: return true
+            case .fastest(let s, _), .server(let s, _):
+                return s.name.lowercased().contains(needle)
+                    || s.countryCode.lowercased().contains(needle)
+                    || (s.cityName?.lowercased().contains(needle) ?? false)
+            }
+        }
+    }
+
     public var body: some View {
-        NavigationStack {
-            List(model.servers) { server in
-                Button {
-                    model.select(server: server)
-                    dismiss()
-                } label: {
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text(server.name)
-                            Text(server.countryCode).font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        if model.serverName == server.name { Image(systemName: "checkmark") }
+        VStack(spacing: 0) {
+            header
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(visibleEntries) { entry in
+                        row(for: entry)
+                            .padding(.horizontal, 16).padding(.vertical, 10)
+                        Divider().padding(.leading, 16)
                     }
+                    footer
                 }
             }
-            .navigationTitle("Server")
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
         }
+        .frame(minWidth: 320)
+    }
+
+    /// The rows themselves, without the scroll container, so they can be
+    /// rendered and inspected off-screen as well as scrolled in the app.
+    var content: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(visibleEntries) { entry in
+                row(for: entry)
+                    .padding(.horizontal, 16).padding(.vertical, 10)
+                Divider().padding(.leading, 16)
+            }
+            footer
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            Text("Server").font(.headline)
+            Spacer()
+            TextField("Search", text: $search)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 160)
+            Button("Done") { dismiss() }
+        }
+        .padding(16)
+    }
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Speeds are measured from this network. The list re-orders itself as measurements arrive, and again whenever you change network.")
+                .font(.caption).foregroundStyle(.secondary)
+            Toggle("Show servers that need an operator account",
+                   isOn: Binding(get: { model.showAccountOnlyServers },
+                                 set: { model.setShowAccountOnlyServers($0) }))
+                .font(.callout)
+            Text("Imported public relay lists are measurable but only carry traffic once this device's key is registered with that operator.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(16)
+    }
+
+    @ViewBuilder
+    private func row(for entry: ServerListEntry) -> some View {
+        switch entry {
+        case .automatic(let fastest):
+            Button {
+                model.selectAutomatic()
+                dismiss()
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "bolt.badge.automatic.fill").foregroundStyle(.tint)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Automatic").font(.body.weight(.semibold))
+                        Text(fastest.map { "Fastest right now — \($0.name)" } ?? "No server measured yet")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if model.isAutomaticSelected { Image(systemName: "checkmark") }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+        case .fastest(let server, let probe):
+            serverRow(server, probe, badge: "Fastest")
+
+        case .server(let server, let probe):
+            serverRow(server, probe, badge: nil)
+        }
+    }
+
+    private func serverRow(_ server: Server, _ probe: ServerProbe?, badge: String?) -> some View {
+        Button {
+            model.select(server: server)
+            dismiss()
+        } label: {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(server.name).lineLimit(1)
+                        if let badge {
+                            Text(badge)
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(.tint.opacity(0.15), in: Capsule())
+                        }
+                        if server.requiresAccount {
+                            Image(systemName: "person.badge.key")
+                                .font(.caption2).foregroundStyle(.secondary)
+                                .accessibilityLabel("needs an operator account")
+                        }
+                    }
+                    HStack(spacing: 6) {
+                        Text(server.countryCode)
+                        if let provider = server.provider { Text("· \(provider)").lineLimit(1) }
+                    }
+                    .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                latency(probe)
+                if model.selectedServerID == server.id { Image(systemName: "checkmark") }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityText(server, probe, badge: badge))
+    }
+
+    @ViewBuilder
+    private func latency(_ probe: ServerProbe?) -> some View {
+        if let probe, probe.rttMs.isFinite {
+            Text("\(Int(probe.rttMs)) ms")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(Presentation.Quality
+                    .from(rttMs: probe.rttMs, lossFraction: probe.lossFraction).tint)
+        } else {
+            Text("—").font(.caption).foregroundStyle(.tertiary)
+        }
+    }
+
+    private func accessibilityText(_ server: Server, _ probe: ServerProbe?, badge: String?) -> String {
+        var parts = [server.name]
+        if badge != nil { parts.append("fastest server") }
+        if let probe, probe.rttMs.isFinite { parts.append("\(Int(probe.rttMs)) milliseconds") }
+        if server.requiresAccount { parts.append("needs an operator account") }
+        return parts.joined(separator: ", ")
     }
 }

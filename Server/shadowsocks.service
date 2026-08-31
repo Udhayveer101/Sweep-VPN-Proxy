@@ -1,0 +1,20 @@
+[Unit]
+Description=Sweep VPN Shadowsocks-2022 rung
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# The key is the same 32-byte base64 PSK carried in the signed bundle.
+EnvironmentFile=/etc/sweep/shadowsocks.env
+ExecStart=/usr/local/bin/ssserver -s 0.0.0.0:8443 -k ${SS_PSK} -m 2022-blake3-aes-256-gcm
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

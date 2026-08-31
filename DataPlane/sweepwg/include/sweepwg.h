@@ -25,4 +25,12 @@ int sweepwg_tick(SweepTunnel *t, uint8_t *dst, size_t dst_cap, size_t *out_len);
 int sweepwg_force_handshake(SweepTunnel *t, uint8_t *dst, size_t dst_cap, size_t *out_len);
 int64_t sweepwg_seconds_since_handshake(SweepTunnel *t);
 int sweepwg_transfer(SweepTunnel *t, uint64_t *tx, uint64_t *rx);
+
+/* Shadowsocks-2022 loopback tunnel (rung 5). Returns the local port, 0 on failure. */
+typedef struct SsTunnel SsTunnel;
+uint16_t sweepss_start(const char *server_host, uint16_t server_port,
+                       const char *password_b64, const char *target_host,
+                       uint16_t target_port, SsTunnel **out);
+void sweepss_stop(SsTunnel *t);
+uint16_t sweepss_port(SsTunnel *t);
 #endif

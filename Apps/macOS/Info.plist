@@ -13,4 +13,5 @@
   <key>LSUIElement</key><true/>
   <key>ITSAppUsesNonExemptEncryption</key><true/>
   <key>SweepConfigSigningKey</key><string>$(SWEEP_CONFIG_SIGNING_KEY)</string>
+  <key>SweepConfigURL</key><string>$(SWEEP_CONFIG_URL)</string>
 </dict></plist>

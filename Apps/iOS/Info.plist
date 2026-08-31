@@ -13,4 +13,5 @@
   <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
   <key>ITSAppUsesNonExemptEncryption</key><true/>
   <key>SweepConfigSigningKey</key><string>$(SWEEP_CONFIG_SIGNING_KEY)</string>
+  <key>SweepConfigURL</key><string>$(SWEEP_CONFIG_URL)</string>
 </dict></plist>

@@ -10,6 +10,8 @@ edition = "2021"
 [dependencies]
 boringtun = { version = "0.7", default-features = false }
 base64 = "0.22"
+shadowsocks = { version = "1.25.0", default-features = false, features = ["aead-cipher-2022"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "macros"] }
 
 [lib]
 name = "sweepwg"

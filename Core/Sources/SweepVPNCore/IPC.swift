@@ -8,6 +8,8 @@ public enum AppToProvider: Codable, Sendable, Equatable {
     case setSecurityOptions(SecurityPolicyOptions)
     case reconnect
     case exportDiagnostics
+    case getServers
+    case selectServer(ServerID)
 }
 
 public struct ProviderStatus: Codable, Sendable, Equatable {
@@ -29,7 +31,20 @@ public struct ProviderStatus: Codable, Sendable, Equatable {
 public enum ProviderToApp: Codable, Sendable, Equatable {
     case status(ProviderStatus)
     case diagnostics([DiagnosticEvent])
+    case servers([RankedServer])
     case failed(TunnelErrorKind)
+}
+
+/// A server plus its latest measurement, in the order the UI should show them.
+public struct RankedServer: Codable, Sendable, Equatable, Identifiable {
+    public var server: Server
+    public var rttMs: Double?
+    public var lossFraction: Double?
+    public var id: ServerID { server.id }
+
+    public init(server: Server, rttMs: Double?, lossFraction: Double?) {
+        self.server = server; self.rttMs = rttMs; self.lossFraction = lossFraction
+    }
 }
 
 public enum IPCCodec {

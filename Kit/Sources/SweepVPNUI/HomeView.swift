@@ -28,6 +28,9 @@ public struct HomeView: View {
             }
         }
         .sheet(isPresented: $model.showSettings) { SettingsView(model: model) }
+        .sheet(isPresented: $model.showOnboarding) {
+            OnboardingView(model: model).interactiveDismissDisabled()
+        }
     }
 
     private var statusPanel: some View {
@@ -45,6 +48,10 @@ public struct HomeView: View {
             if model.presentation.showsQuality, let q = model.quality {
                 QualityRow(quality: q)
             }
+            if let route = model.routeDescription {
+                Text(route).font(.caption2).foregroundStyle(.secondary)
+                    .accessibilityLabel("Route in use: \(route)")
+            }
             SecurityGlyphRow(killSwitchArmed: model.killSwitchArmed,
                              onDemandArmed: model.onDemandArmed,
                              pqActive: model.pqHybridActive)
@@ -60,8 +67,13 @@ public struct HomeView: View {
     private var serverPill: some View {
         Button { model.showServerPicker = true } label: {
             HStack(spacing: 8) {
-                Image(systemName: "mappin.and.ellipse")
-                Text(model.serverName ?? "No server selected")
+                Image(systemName: model.isAutomaticSelected ? "bolt.badge.automatic.fill" : "mappin.and.ellipse")
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(model.isAutomaticSelected ? "Automatic" : (model.serverName ?? "No server selected"))
+                    if let subtitle = model.serverSubtitle {
+                        Text(subtitle).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
                 Image(systemName: "chevron.right").font(.caption)
             }
             .padding(.horizontal, 16).padding(.vertical, 10)
@@ -80,6 +92,7 @@ public struct HomeView: View {
         }
         .buttonStyle(.borderedProminent)
         .tint(model.presentation.tint == .good ? .green : .accentColor)
+        .controlSize(.large)
         .frame(maxWidth: 420)
         .disabled(model.isBusy)
     }
@@ -92,14 +105,32 @@ struct Backdrop: View {
     let animate: Bool
     @State private var phase = false
 
+    /// The tint is a hint, not a wash: the state is already carried by the icon,
+    /// the headline and the button. A heavy gradient hurts contrast for the text
+    /// sitting on it and costs GPU time on an always-visible surface.
+    private var strength: Double { tint == .neutral ? 0.06 : 0.14 }
+
     var body: some View {
-        LinearGradient(colors: [tint.color.opacity(0.35), Color.clear, tint.color.opacity(0.18)],
-                       startPoint: phase ? .topLeading : .bottomTrailing,
-                       endPoint: phase ? .bottomTrailing : .topLeading)
-            .ignoresSafeArea()
-            .animation(animate ? .easeInOut(duration: 12).repeatForever(autoreverses: true) : nil,
-                       value: phase)
-            .onAppear { if animate { phase.toggle() } }
+        ZStack {
+            Color(nsColorOrSystemBackground)
+            LinearGradient(colors: [tint.color.opacity(strength),
+                                    Color.clear,
+                                    tint.color.opacity(strength * 0.5)],
+                           startPoint: phase ? .topLeading : .bottomTrailing,
+                           endPoint: phase ? .bottomTrailing : .topLeading)
+        }
+        .ignoresSafeArea()
+        .animation(animate ? .easeInOut(duration: 14).repeatForever(autoreverses: true) : nil,
+                   value: phase)
+        .onAppear { if animate { phase.toggle() } }
+    }
+
+    private var nsColorOrSystemBackground: Color {
+        #if os(macOS)
+        Color(nsColor: .windowBackgroundColor)
+        #else
+        Color(uiColor: .systemBackground)
+        #endif
     }
 }
 

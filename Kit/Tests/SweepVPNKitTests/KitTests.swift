@@ -35,14 +35,14 @@ final class TunnelSettingsMapperTests: XCTestCase {
 
 final class AdapterFactoryTests: XCTestCase {
     let server = Server(id: "s", name: "s", countryCode: "SE", publicKey: "pk",
-                        endpoints: [.init(host: "1.2.3.4", port: 443, rung: .stealthTCP443)],
+                        endpoints: [.init(host: "1.2.3.4", port: 443, rung: .wireGuardTLS)],
                         dnsServers: ["10.64.0.1"], ipv4Address: "10.64.0.2")
 
-    func testUnimplementedRungFailsLoudlyInsteadOfSubstituting() {
-        XCTAssertThrowsError(try AdapterFactory.make(rung: .stealthTCP443, server: server,
+    func testKernelRungIsNeverBuiltAsAnAdapter() {
+        XCTAssertThrowsError(try AdapterFactory.make(rung: .ikev2, server: server,
                                                      privateKeyBase64: "k", presharedKeyBase64: nil,
                                                      keepalive: 25)) {
-            XCTAssertEqual($0 as? AdapterFactoryError, .rungNotImplemented(.stealthTCP443))
+            XCTAssertEqual($0 as? AdapterFactoryError, .rungNotImplemented(.ikev2))
         }
     }
 
@@ -54,8 +54,13 @@ final class AdapterFactoryTests: XCTestCase {
         }
     }
 
-    func testOnlyRungsWeActuallyShipAreAdvertised() {
-        XCTAssertEqual(AdapterFactory.implementedRungs, [.wireGuardUDP, .ikev2])
+    func testShippedRungsCoverEveryFailureModeAndExcludeTheKernelOne() {
+        XCTAssertEqual(AdapterFactory.implementedRungs,
+                       [.wireGuardUDP, .wireGuardUDP443, .wireGuardQUIC,
+                        .wireGuardTLS, .shadowsocks2022, .wireGuardTCP])
+        XCTAssertFalse(AdapterFactory.implementedRungs.contains(.ikev2),
+                       "IKEv2 is a kernel profile, not a packet-tunnel adapter")
+        XCTAssertTrue(AdapterFactory.availableRungs.contains(.ikev2))
     }
 }
 

@@ -57,7 +57,12 @@ final class AutoModeTests: XCTestCase {
         guard case .race(let rungs) = e.decideStart(memory: .init(), signals: .init(), now: t0) else {
             return XCTFail("expected race")
         }
-        XCTAssertEqual(rungs, [.wireGuardUDP, .wireGuardQUIC, .stealthTCP443])
+        // Diverse by construction: preferred + first UDP-block survivor + first
+        // web-shaped rung, never three rungs that fail the same way.
+        XCTAssertEqual(rungs.first, .wireGuardUDP)
+        XCTAssertTrue(rungs.contains { $0.survivesUDPBlock })
+        XCTAssertTrue(rungs.contains { $0.looksLikeWeb })
+        XCTAssertEqual(rungs.count, 3)
     }
 
     func testUDPBlockedRemovesUDPRungs() {
@@ -87,7 +92,7 @@ final class AutoModeTests: XCTestCase {
         XCTAssertEqual(e.observe(health: bad, now: t0.addingTimeInterval(1)), .stay)
         // Second failure bypasses the 120 s dwell — a broken tunnel is a reconnect.
         XCTAssertEqual(e.observe(health: bad, now: t0.addingTimeInterval(2)),
-                       .downgrade(to: .wireGuardQUIC, reason: .handshakeFlapping))
+                       .downgrade(to: .wireGuardUDP443, reason: .handshakeFlapping))
     }
 
     func testSustainedLossDowngradesOnlyAfterWindow() {
@@ -148,7 +153,7 @@ final class ServerScoringTests: XCTestCase {
     func testRttGateAndProtocolGate() {
         let s = server("a")
         XCTAssertFalse(ServerScoring.isEligible(s, .init(rttMs: 900, lossFraction: 0), rung: .wireGuardUDP))
-        XCTAssertFalse(ServerScoring.isEligible(s, .init(rttMs: 10, lossFraction: 0), rung: .stealthTCP443))
+        XCTAssertFalse(ServerScoring.isEligible(s, .init(rttMs: 10, lossFraction: 0), rung: .wireGuardTLS))
     }
 
     func testHardAvoidJurisdiction() {
@@ -355,10 +360,12 @@ final class PostQuantumTests: XCTestCase {
         XCTAssertEqual(psk.bitCount, 256)
     }
 
-    func testOnlyRungs1And2CarryPQ() {
-        XCTAssertTrue(ProtocolRung.wireGuardUDP.supportsHybridPQ)
-        XCTAssertTrue(ProtocolRung.wireGuardQUIC.supportsHybridPQ)
+    /// Every WireGuard rung carries the same tunnel, so the hybrid PSK applies
+    /// to all of them; only the kernel IKEv2 rung has no PQ story.
+    func testEveryWireGuardRungCarriesPQAndIKEv2DoesNot() {
+        for rung in ProtocolRung.allCases where rung != .ikev2 {
+            XCTAssertTrue(rung.supportsHybridPQ, "\(rung) should carry the hybrid PSK")
+        }
         XCTAssertFalse(ProtocolRung.ikev2.supportsHybridPQ)
-        XCTAssertFalse(ProtocolRung.wireGuardTCP.supportsHybridPQ)
     }
 }

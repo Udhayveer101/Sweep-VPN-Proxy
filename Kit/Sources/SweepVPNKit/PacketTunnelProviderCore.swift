@@ -3,40 +3,54 @@ import NetworkExtension
 import Network
 import SweepVPNCore
 
-/// Shared provider logic for iOS and macOS. The platform targets subclass
-/// `SweepPacketTunnelProvider` and add nothing but packaging.
+/// Shared provider logic for iOS and macOS. The platform targets subclass this
+/// and add nothing but packaging.
 ///
 /// Order of operations is the security-critical part:
 ///   1. install the blackhole tunnel settings (default route, forwarding off)
-///   2. start the adapter
-///   3. only after the peer authenticates, install the real settings and
-///      start reading from packetFlow
-/// The completion handler is never called before step 3 succeeds, so the OS
-/// holds traffic rather than falling back to the physical interface.
+///   2. race/walk the protocol ladder
+///   3. only once a peer *authenticates*, install the real settings and start
+///      reading from packetFlow
+/// The start completion handler is never called before step 3, so the OS holds
+/// traffic rather than falling back to the physical interface.
 open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     /// All mutable provider state is confined to this serial queue; adapter and
     /// path-monitor callbacks hop onto it before touching anything.
     private let stateQueue = DispatchQueue(label: "vpn.sweep.provider")
+
     public let diagnostics = Diagnostics()
     public private(set) var machine = StateMachine()
     public private(set) var policy = SecurityPolicy()
-    private var engine = AutoModeEngine()
-    private var adapter: TunnelAdapter?
-    private var currentServer: Server?
-    private var currentEndpoint: ServerEndpoint?
+    public private(set) var preference: ProtocolPreference = .automatic
+
+    private var coordinator: ConnectionCoordinator?
+    private var catalog = ServerCatalog()
+    private var memoryStore: NetworkMemoryStore?
+    private var fingerprint: String?
     private var connectedSince: Date?
     private var pathMonitor: NWPathMonitor?
     private var startCompletion: ((Error?) -> Void)?
     private var readingPackets = false
     private var pqActive = false
+    private var healthTimer: DispatchSourceTimer?
+    private var probeTimer: DispatchSourceTimer?
+    private let prober = ServerProber()
     private var handshakeDeadline: DispatchWorkItem?
-    /// If the peer never authenticates we must not sit blocked forever with no
-    /// explanation: fail closed with a named error so the UI can say why.
-    private static let handshakeTimeout: TimeInterval = 30
+    private var lastSignals = NetworkSignals()
+
+    /// If no peer authenticates in this long we fail closed with a named error
+    /// rather than sitting blocked and silent.
+    private static let handshakeTimeout: TimeInterval = 45
+    private static let healthInterval: TimeInterval = 10
+    private static let probeInterval: TimeInterval = 900
+
+    /// macOS only: the tunnel publishes its state here so the content-filter
+    /// extension (kill-switch layer 2) knows when to block. On iOS this is nil.
+    open var filterStateStore: FilterStateStore? { nil }
 
     /// Injected by the platform target: where secrets live. `nil` means the
-    /// keychain or the pinned key is unavailable — that is a fail-closed error,
-    /// never a reason to bring up an unauthenticated tunnel.
+    /// keychain or the pinned key is unavailable — a fail-closed error, never a
+    /// reason to bring up an unauthenticated tunnel.
     open var configStore: ConfigStore? { nil }
     open var appBuild: Int { 1 }
 
@@ -47,21 +61,18 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         startCompletion = completionHandler
         diagnostics.record("startTunnel")
 
-        // 1. Fail closed first, always.
         let queue = stateQueue
+        // 1. Fail closed first, always.
         applyPlan(policy.blackholePlan()) { [weak self] error in
             queue.async {
-            guard let self else { return }
-            if let error {
-                self.fail(.internalFailure, error, completionHandler)
-                return
-            }
-            self.machine.transition(to: .connecting(rung: .wireGuardUDP))
-            do {
-                try self.beginConnection()
-            } catch {
-                self.fail(.configurationInvalid, error, completionHandler)
-            }
+                guard let self else { return }
+                if let error { return self.fail(.internalFailure, error, completionHandler) }
+                self.machine.transition(to: .connecting(rung: .wireGuardUDP))
+                do {
+                    try self.beginConnection()
+                } catch {
+                    self.fail(.configurationInvalid, error, completionHandler)
+                }
             }
         }
     }
@@ -69,99 +80,124 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     open override func stopTunnel(with reason: NEProviderStopReason,
                                  completionHandler: @escaping () -> Void) {
         diagnostics.record("stopTunnel", "\(reason.rawValue)")
-        handshakeDeadline?.cancel(); handshakeDeadline = nil
-        pathMonitor?.cancel(); pathMonitor = nil
-        adapter?.stop(); adapter = nil
-        machine.transition(to: .disconnected)
-        completionHandler()
+        stateQueue.async { [weak self] in
+            self?.publishFilterState(up: false, server: nil)
+            self?.teardown()
+            self?.machine.transition(to: .disconnected)
+            completionHandler()
+        }
     }
 
     open override func sleep(completionHandler: @escaping () -> Void) {
         diagnostics.record("sleep")
-        machine.transition(to: .reasserting)
-        completionHandler()
+        stateQueue.async { [weak self] in
+            self?.machine.transition(to: .reasserting)
+            completionHandler()
+        }
     }
 
     open override func wake() {
         diagnostics.record("wake")
-        // Re-validate the peer before any packet is forwarded again.
-        machine.transition(to: .reasserting)
-        adapter?.reassert()
+        stateQueue.async { [weak self] in
+            // Re-validate the peer before any packet is forwarded again.
+            self?.machine.transition(to: .reasserting)
+            self?.coordinator?.reassert()
+        }
+    }
+
+    private func teardown() {
+        handshakeDeadline?.cancel(); handshakeDeadline = nil
+        healthTimer?.cancel(); healthTimer = nil
+        probeTimer?.cancel(); probeTimer = nil
+        pathMonitor?.cancel(); pathMonitor = nil
+        persistNetworkMemory()
+        coordinator?.stop()
+        coordinator = nil
     }
 
     // MARK: - Connection
 
     private func beginConnection() throws {
         guard let store = configStore else { throw ConfigError.badSignature }
-        guard let bundle = try store.loadBundle() else {
-            throw ConfigError.noServers        // no verified config -> stay blocked
-        }
-        engine = AutoModeEngine(preference: preference,
-                                enabledRungs: Set(bundle.enabledRungs)
-                                    .intersection(AdapterFactory.implementedRungs))
-        let memory = NetworkMemory()           // per-network memory is loaded by the app facade
-        let decision = engine.decideStart(memory: memory, signals: currentSignals(), now: Date())
-        let rung: ProtocolRung
-        switch decision {
-        case .connect(let r): rung = r
-        case .race(let rs): rung = rs[0]       // racing is Tier 2; take the preferred rung
-        case .failClosed(let kind): throw NSError(domain: "sweep", code: kind.hashValue)
-        default: rung = .wireGuardUDP
-        }
+        guard let bundle = try store.loadBundle() else { throw ConfigError.noServers }
 
-        guard let server = bundle.servers.first(where: { $0.supports(rung) }),
-              let endpoint = server.endpoints.first(where: { $0.rung == rung }) else {
-            throw AdapterFactoryError.noEndpoint(rung)
-        }
-        currentServer = server
-        currentEndpoint = endpoint
+        catalog = ServerCatalog(servers: bundle.servers, rung: .wireGuardUDP)
+        let memoryStore = NetworkMemoryStore(store: store.store)
+        self.memoryStore = memoryStore
+        let fingerprint = currentFingerprint(store: store)
+        self.fingerprint = fingerprint
+        let memory = fingerprint.map { memoryStore.memory(for: $0) } ?? NetworkMemory()
+
+        let enabled = Set(bundle.enabledRungs).intersection(AdapterFactory.implementedRungs)
+        guard !enabled.isEmpty else { throw AdapterFactoryError.rungNotImplemented(.wireGuardUDP) }
+        let engine = AutoModeEngine(preference: preference, enabledRungs: enabled)
 
         let privateKey = try store.devicePrivateKey().rawRepresentation.base64EncodedString()
-        let keepalive = KeepalivePolicy.interval(isExpensive: false, isLowPowerMode: false, userActive: true)
-        let adapter = try AdapterFactory.make(rung: rung, server: server,
-                                              privateKeyBase64: privateKey,
-                                              presharedKeyBase64: nil, keepalive: keepalive)
-        self.adapter = adapter
-        machine.transition(to: .handshaking(rung: rung))
+        let signals = currentSignals()
+        lastSignals = signals
+        let keepalive = KeepalivePolicy.interval(isExpensive: signals.isExpensive,
+                                                 isLowPowerMode: signals.isLowPowerMode,
+                                                 userActive: true)
 
-        let queue = stateQueue
+        let coordinator = ConnectionCoordinator(
+            engine: engine, catalog: catalog, memory: memory,
+            build: { rung, server in
+                try AdapterFactory.make(rung: rung, server: server, privateKeyBase64: privateKey,
+                                        presharedKeyBase64: nil, keepalive: keepalive)
+            },
+            callbacks: .init(
+                onAuthenticated: { [weak self] adapter, server in
+                    self?.stateQueue.async { self?.peerAuthenticated(adapter: adapter, server: server) }
+                },
+                onInbound: { [weak self] packets, protocols in
+                    self?.deliverInbound(packets, protocols)
+                },
+                onExhausted: { [weak self] kind in
+                    self?.stateQueue.async { self?.fail(kind, nil, self?.startCompletion) }
+                },
+                onEvent: { [weak self] kind, detail in
+                    self?.diagnostics.record(kind, detail)
+                }))
+        self.coordinator = coordinator
+
+        machine.transition(to: .handshaking(rung: .wireGuardUDP))
+        armHandshakeDeadline()
+        coordinator.start(signals: signals)
+        startPathMonitor()
+        startProbing()
+    }
+
+    private func armHandshakeDeadline() {
         let deadline = DispatchWorkItem { [weak self] in
             guard let self, !self.machine.state.forwardingAllowed else { return }
             self.fail(.allRungsFailed, nil, self.startCompletion)
-            self.adapter?.stop()
+            self.coordinator?.stop()
         }
+        handshakeDeadline?.cancel()
         handshakeDeadline = deadline
         stateQueue.asyncAfter(deadline: .now() + Self.handshakeTimeout, execute: deadline)
-
-        adapter.start(
-            onAuthenticated: { [weak self] in
-                queue.async { self?.peerAuthenticated(rung: rung, server: server) }
-            },
-            onInbound: { [weak self] packets, protos in
-                queue.async { self?.deliverInbound(packets, protos) }
-            },
-            onFailure: { [weak self] kind in
-                queue.async { self?.adapterFailed(kind) }
-            })
-        startPathMonitor()
     }
 
     /// The one place that opens the blackhole.
-    private func peerAuthenticated(rung: ProtocolRung, server: Server) {
-        guard let endpoint = currentEndpoint else { return }
+    private func peerAuthenticated(adapter: TunnelAdapter, server: Server) {
+        guard let endpoint = server.endpoints.first(where: { $0.rung == adapter.rung })
+                ?? server.endpoints.first else { return }
         handshakeDeadline?.cancel(); handshakeDeadline = nil
-        diagnostics.record("authenticated", rung.displayName)
+        diagnostics.record("authenticated", adapter.rung.shortName)
+
         let queue = stateQueue
         applyPlan(policy.connectedPlan(server: server, endpoint: endpoint)) { [weak self] error in
             queue.async {
-            guard let self else { return }
-            if let error { return self.fail(.internalFailure, error, self.startCompletion) }
-            self.machine.transition(to: .connected(rung: rung, server: server.id))
-            self.engine.noteConnected(rung: rung, now: Date())
-            self.connectedSince = Date()
-            self.startReadingPackets()
-            self.startCompletion?(nil)
-            self.startCompletion = nil
+                guard let self else { return }
+                if let error { return self.fail(.internalFailure, error, self.startCompletion) }
+                self.machine.transition(to: .connected(rung: adapter.rung, server: server.id))
+                self.connectedSince = Date()
+                self.publishFilterState(up: true, server: server)
+                self.persistNetworkMemory()
+                self.startReadingPackets()
+                self.startHealthMonitor()
+                self.startCompletion?(nil)
+                self.startCompletion = nil
             }
         }
     }
@@ -184,7 +220,7 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             queue.async {
                 guard let self else { return }
                 if self.policy.mayForward(state: self.machine.state) {
-                    self.adapter?.send(packets: packets, protocols: protocols)
+                    self.coordinator?.send(packets: packets, protocols: protocols)
                 }
                 // Packets read while blocked are dropped, not queued, not leaked.
                 self.readPackets()
@@ -192,50 +228,134 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         }
     }
 
-    private func adapterFailed(_ kind: TunnelErrorKind) {
-        diagnostics.record("adapterFailed", kind.rawValue)
-        machine.transition(to: .reconnecting(attempt: 1))
-        // Blackhole stays installed; the OS keeps holding traffic.
-        adapter?.reassert()
+    /// Keep the second kill-switch layer in step with the tunnel. Anything other
+    /// than "connected" publishes `up: false`, which makes the filter drop.
+    private func publishFilterState(up: Bool, server: Server?) {
+        guard let filterStateStore else { return }
+        let addresses = Set((server?.endpoints ?? []).map(\.host))
+        filterStateStore.write(FilterState(tunnelInterface: nil, tunnelIsUp: up,
+                                           serverAddresses: addresses, options: policy.options))
     }
 
     private func fail(_ kind: TunnelErrorKind, _ error: Error?, _ completion: ((Error?) -> Void)?) {
         diagnostics.record("failClosed", kind.rawValue)
+        publishFilterState(up: false, server: coordinator?.activeServer)
         machine.transition(to: .error(kind))
+        persistNetworkMemory()
         completion?(error ?? NSError(domain: "vpn.sweep", code: 1))
         startCompletion = nil
+    }
+
+    // MARK: - Health and measurement
+
+    /// Health is derived from the tunnel itself — handshake age and byte
+    /// counters — not from extra probe traffic that would cost battery.
+    private func startHealthMonitor() {
+        guard healthTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: stateQueue)
+        timer.schedule(deadline: .now() + Self.healthInterval, repeating: Self.healthInterval,
+                       leeway: .seconds(2))
+        timer.setEventHandler { [weak self] in self?.sampleHealth() }
+        timer.resume()
+        healthTimer = timer
+    }
+
+    private func sampleHealth() {
+        guard let coordinator, let rung = coordinator.activeRung else { return }
+        let age = coordinator.handshakeAgeSeconds
+        // WireGuard rekeys about every two minutes; an older handshake with no
+        // traffic means the path is gone.
+        let healthy = age >= 0 && age < 180
+        let health = LinkHealth(rttMs: Double(max(age, 0)) * 1000 / 180,
+                                lossFraction: healthy ? 0 : 1, handshakeOK: healthy)
+        if !healthy, machine.state.forwardingAllowed {
+            publishFilterState(up: false, server: coordinator.activeServer)
+            machine.transition(to: .degraded(rung: rung, reason: .handshakeFlapping))
+        } else if healthy, case .degraded = machine.state, let server = coordinator.activeServer {
+            machine.transition(to: .connected(rung: rung, server: server.id))
+        }
+        coordinator.observe(health: health)
+    }
+
+    /// Keep the server ranking honest: re-measure occasionally and on network
+    /// change so "fastest" means fastest *here, now*.
+    private func startProbing() {
+        probeServers()
+        guard probeTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: stateQueue)
+        timer.schedule(deadline: .now() + Self.probeInterval, repeating: Self.probeInterval,
+                       leeway: .seconds(30))
+        timer.setEventHandler { [weak self] in self?.probeServers() }
+        timer.resume()
+        probeTimer = timer
+    }
+
+    private func probeServers() {
+        let targets = catalog.probeTargets(limit: 5)
+        guard !targets.isEmpty else { return }
+        let rung = catalog.rung
+        prober.probe(targets, rung: rung) { [weak self] results in
+            self?.stateQueue.async {
+                guard let self else { return }
+                for result in results { self.catalog.record(result.probe, for: result.id) }
+                self.diagnostics.record("probed", "\(results.count) servers")
+            }
+        }
+    }
+
+    private func persistNetworkMemory() {
+        guard let fingerprint, let memoryStore, let coordinator else { return }
+        let learned = coordinator.updatedMemory
+        memoryStore.update(fingerprint) { $0 = learned }
     }
 
     // MARK: - Roaming
 
     private func startPathMonitor() {
-        let monitor = NWPathMonitor()
         let queue = stateQueue
+        let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
             let expensive = path.isExpensive
             let satisfied = path.status == .satisfied
-            queue.async { self?.handlePathChange(satisfied: satisfied, expensive: expensive) }
+            let constrained = path.isConstrained
+            queue.async {
+                self?.handlePathChange(satisfied: satisfied, expensive: expensive,
+                                       constrained: constrained)
+            }
         }
         monitor.start(queue: DispatchQueue(label: "vpn.sweep.path"))
         pathMonitor = monitor
     }
 
-    private func handlePathChange(satisfied: Bool, expensive: Bool) {
-        do {
-            guard satisfied else {
-                diagnostics.record("pathLost")
-                machine.transition(to: .reasserting)
-                return
-            }
-            diagnostics.record("pathChanged", expensive ? "expensive" : "cheap")
+    private func handlePathChange(satisfied: Bool, expensive: Bool, constrained: Bool) {
+        guard satisfied else {
+            diagnostics.record("pathLost")
+            publishFilterState(up: false, server: coordinator?.activeServer)
             machine.transition(to: .reasserting)
-            adapter?.reassert()          // re-handshake, forwarding stays gated
+            return
         }
+        diagnostics.record("pathChanged", expensive ? "expensive" : "cheap")
+        lastSignals = NetworkSignals(isExpensive: expensive,
+                                     isLowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled,
+                                     isConstrained: constrained)
+        machine.transition(to: .reasserting)
+        coordinator?.reassert()   // re-handshake; forwarding stays gated
+        probeServers()            // the fastest server on Wi-Fi is rarely the fastest on cellular
     }
 
     private func currentSignals() -> NetworkSignals {
-        NetworkSignals(isExpensive: false,
-                       isLowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled)
+        NetworkSignals(isExpensive: lastSignals.isExpensive,
+                       isLowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled,
+                       isConstrained: lastSignals.isConstrained)
+    }
+
+    private func currentFingerprint(store: ConfigStore) -> String? {
+        guard let secret = try? store.fingerprintSecret() else { return nil }
+        // SSID is unavailable to an extension without extra entitlements; the
+        // interface type plus the tunnel's local address is a stable-enough key.
+        return NetworkFingerprint.key(deviceSecret: secret, ssid: nil, gatewayMAC: nil,
+                                      dnsSuffix: nil,
+                                      interface: lastSignals.isExpensive ? "cellular" : "wifi")
     }
 
     // MARK: - Settings
@@ -246,39 +366,50 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
 
     // MARK: - IPC
 
-    public private(set) var preference: ProtocolPreference = .automatic
-
     open override func handleAppMessage(_ messageData: Data,
                                         completionHandler: ((Data?) -> Void)?) {
         guard let message = try? IPCCodec.decode(AppToProvider.self, messageData) else {
             completionHandler?(nil); return
         }
-        switch message {
-        case .getStatus:
-            let status = ProviderStatus(state: machine.state,
-                                        serverName: currentServer?.name,
-                                        rung: engine.activeRung,
-                                        connectedSince: connectedSince,
-                                        rttMs: nil,
-                                        killSwitchArmed: policy.includeAllNetworks,
-                                        pqHybridActive: pqActive)
-            completionHandler?(try? IPCCodec.encode(ProviderToApp.status(status)))
-        case .setPreference(let p):
-            preference = p
-            completionHandler?(try? IPCCodec.encode(ProviderToApp.status(
-                ProviderStatus(state: machine.state, serverName: currentServer?.name,
-                               rung: engine.activeRung, connectedSince: connectedSince,
-                               rttMs: nil, killSwitchArmed: policy.includeAllNetworks,
-                               pqHybridActive: pqActive))))
-        case .setSecurityOptions(let o):
-            policy = SecurityPolicy(options: o)
-            completionHandler?(nil)
-        case .reconnect:
-            adapter?.reassert()
-            completionHandler?(nil)
-        case .exportDiagnostics:
-            completionHandler?(try? IPCCodec.encode(ProviderToApp.diagnostics(diagnostics.snapshot())))
+        stateQueue.async { [weak self] in
+            guard let self else { return completionHandler?(nil) ?? () }
+            switch message {
+            case .getStatus:
+                completionHandler?(try? IPCCodec.encode(ProviderToApp.status(self.status())))
+            case .setPreference(let p):
+                self.preference = p
+                self.diagnostics.record("preferenceChanged", p.displayName)
+                completionHandler?(try? IPCCodec.encode(ProviderToApp.status(self.status())))
+            case .setSecurityOptions(let o):
+                self.policy = SecurityPolicy(options: o)
+                completionHandler?(try? IPCCodec.encode(ProviderToApp.status(self.status())))
+            case .reconnect:
+                self.coordinator?.reassert()
+                completionHandler?(try? IPCCodec.encode(ProviderToApp.status(self.status())))
+            case .exportDiagnostics:
+                completionHandler?(try? IPCCodec.encode(
+                    ProviderToApp.diagnostics(self.diagnostics.snapshot())))
+            case .getServers:
+                completionHandler?(try? IPCCodec.encode(
+                    ProviderToApp.servers(self.catalog.rankedSnapshot())))
+            case .selectServer(let id):
+                self.diagnostics.record("serverSelected", id)
+                self.coordinator?.reassert()
+                completionHandler?(try? IPCCodec.encode(ProviderToApp.status(self.status())))
+            }
         }
+    }
+
+    private func status() -> ProviderStatus {
+        let rung = coordinator?.activeRung
+        let server = coordinator?.activeServer
+        return ProviderStatus(state: machine.state,
+                              serverName: server?.name,
+                              rung: rung,
+                              connectedSince: connectedSince,
+                              rttMs: server.flatMap { catalog.probes[$0.id]?.rttMs },
+                              killSwitchArmed: policy.includeAllNetworks,
+                              pqHybridActive: pqActive)
     }
 }
 
@@ -297,8 +428,8 @@ public enum TunnelSettingsMapper {
         }
         s.ipv4Settings = v4
 
-        // IPv6 is either routed into the tunnel or blackholed by routing ::/0
-        // at an address we own. It is never left to the physical interface.
+        // IPv6 is either routed into the tunnel or blackholed at an address we
+        // own. It is never left to the physical interface.
         let v6Address = plan.ipv6Address ?? (plan.ipv6Blocked ? "fd00:5:e:e:p::1" : nil)
         if let v6Address, !plan.ipv6Routes.isEmpty {
             let v6 = NEIPv6Settings(addresses: [v6Address], networkPrefixLengths: [128])

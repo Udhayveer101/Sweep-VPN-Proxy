@@ -30,6 +30,10 @@ public struct SecurityPolicyOptions: Sendable, Equatable, Codable {
     public var blockIPv6WhenUnavailable: Bool = true
     public var allowCaptivePortalWindow: Bool = false // opt-in, time-boxed
     public var lanSuffixes: [String] = ["local"]
+    /// Opt-in ad/tracker/malware blocking done by the in-tunnel resolver
+    /// (Proton-NetShield / Mullvad-DNS class, vault What-Leading-VPNs-Do-Best).
+    /// It selects a different resolver address on the same VPS — no third party.
+    public var dnsFilteringEnabled: Bool = false
     public init() {}
 }
 
@@ -69,7 +73,8 @@ public struct SecurityPolicy: Sendable {
             // to the physical interface (vault 01-Apple-Platform/IPv4-IPv6-Routing-And-Leak-Risk).
             ipv6Routes: (hasV6 || options.blockIPv6WhenUnavailable) ? [.init("::", 0)] : [],
             ipv6Blocked: !hasV6 && options.blockIPv6WhenUnavailable,
-            dnsServers: server.dnsServers,
+            dnsServers: options.dnsFilteringEnabled && !server.filteringDNSServers.isEmpty
+                ? server.filteringDNSServers : server.dnsServers,
             dnsMatchDomains: [""],
             splitDNSDomains: options.lanSuffixes,
             mtu: mtu,

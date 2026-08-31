@@ -29,12 +29,18 @@ public struct NetworkSignals: Sendable, Equatable {
     public var isLowPowerMode: Bool
     public var isConstrained: Bool        // Low Data Mode
     public var udpBlockedHint: Bool
+    /// Set when the network looks like it is filtering, not merely lossy — a
+    /// captive/DPI network where plain tunnels die but HTTPS lives
+    /// (Surfshark-NoBorders-class auto-evasion, vault 04-VPN-Products).
+    public var hostileNetworkSuspected: Bool
     public init(isExpensive: Bool = false, isLowPowerMode: Bool = false,
-                isConstrained: Bool = false, udpBlockedHint: Bool = false) {
+                isConstrained: Bool = false, udpBlockedHint: Bool = false,
+                hostileNetworkSuspected: Bool = false) {
         self.isExpensive = isExpensive
         self.isLowPowerMode = isLowPowerMode
         self.isConstrained = isConstrained
         self.udpBlockedHint = udpBlockedHint
+        self.hostileNetworkSuspected = hostileNetworkSuspected
     }
 }
 
@@ -51,8 +57,30 @@ public struct LinkHealth: Sendable, Equatable {
 public struct NetworkMemory: Codable, Sendable, Equatable {
     public var lastGoodRung: ProtocolRung?
     public var udpBlockedUntil: Date?
+    public var hostileUntil: Date?
     public var successCounts: [Int: Int] = [:]   // rung.rawValue -> successes
+    public var lastSeen: Date?
     public init() {}
+
+    public func isUDPBlocked(now: Date) -> Bool { (udpBlockedUntil ?? .distantPast) > now }
+    public func isHostile(now: Date) -> Bool { (hostileUntil ?? .distantPast) > now }
+
+    /// A network that just refused every UDP rung is remembered for a while, so
+    /// the next connect there does not waste the race deadline on UDP again.
+    public mutating func noteUDPBlocked(now: Date, ttl: TimeInterval = 6 * 3600) {
+        udpBlockedUntil = now.addingTimeInterval(ttl)
+    }
+
+    public mutating func noteHostile(now: Date, ttl: TimeInterval = 6 * 3600) {
+        hostileUntil = now.addingTimeInterval(ttl)
+    }
+
+    public mutating func noteSuccess(rung: ProtocolRung, now: Date) {
+        lastGoodRung = rung
+        lastSeen = now
+        successCounts[rung.rawValue, default: 0] += 1
+        if rung.isUDP { udpBlockedUntil = nil }
+    }
 }
 
 public enum AutoDecision: Equatable, Sendable {
@@ -82,7 +110,7 @@ public struct AutoModeEngine: Sendable {
 
     public init(constants: AutoModeConstants = .init(),
                 preference: ProtocolPreference = .automatic,
-                enabledRungs: Set<ProtocolRung> = [.wireGuardUDP, .ikev2, .wireGuardTCP]) {
+                enabledRungs: Set<ProtocolRung> = Set(ProtocolRung.allCases)) {
         self.constants = constants
         self.preference = preference
         self.enabledRungs = enabledRungs
@@ -101,12 +129,17 @@ public struct AutoModeEngine: Sendable {
             return .connect(.ikev2)
         }
         // An unexpired "UDP blocked" flag removes the UDP rungs from this network.
-        if let until = memory.udpBlockedUntil, until > now || signals.udpBlockedHint {
-            permitted.removeAll { $0.isUDP }
-        } else if signals.udpBlockedHint {
+        if memory.isUDPBlocked(now: now) || signals.udpBlockedHint {
             permitted.removeAll { $0.isUDP }
         }
         if permitted.isEmpty { return .failClosed(.allRungsFailed) }
+
+        // A filtering network gets the web-shaped rungs first, without waiting
+        // for the plain ones to fail.
+        if signals.hostileNetworkSuspected || memory.isHostile(now: now) {
+            let web = permitted.filter(\.looksLikeWeb)
+            if !web.isEmpty { permitted = web + permitted.filter { !$0.looksLikeWeb } }
+        }
 
         if let known = memory.lastGoodRung, permitted.contains(known) {
             return .connect(known)
@@ -114,7 +147,24 @@ public struct AutoModeEngine: Sendable {
         guard preference.allowsVoluntarySwitching, permitted.count > 1 else {
             return .connect(permitted[0])
         }
-        return .race(Array(permitted.prefix(constants.raceMaxConcurrent)))
+        return .race(Self.raceSet(from: permitted, max: constants.raceMaxConcurrent))
+    }
+
+    /// Race a *diverse* set, not the top N by preference: racing three rungs
+    /// that all fail the same way (all UDP) wastes the whole 3 s deadline.
+    /// One preferred rung + one that survives a UDP block + one that looks like
+    /// ordinary web traffic covers the three ways a network usually breaks.
+    static func raceSet(from permitted: [ProtocolRung], max: Int) -> [ProtocolRung] {
+        var chosen: [ProtocolRung] = []
+        func add(_ rung: ProtocolRung?) {
+            guard let rung, !chosen.contains(rung), chosen.count < max else { return }
+            chosen.append(rung)
+        }
+        add(permitted.first)
+        add(permitted.first(where: \.survivesUDPBlock))
+        add(permitted.first(where: \.looksLikeWeb))
+        for rung in permitted { add(rung) }
+        return chosen
     }
 
     public mutating func noteConnected(rung: ProtocolRung, now: Date) {

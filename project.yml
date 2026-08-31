@@ -7,6 +7,7 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     SWEEP_CONFIG_SIGNING_KEY: ""
+    SWEEP_CONFIG_URL: ""
     CODE_SIGN_STYLE: Automatic
     ENABLE_USER_SCRIPT_SANDBOXING: NO
 packages:
@@ -67,12 +68,32 @@ targets:
     dependencies:
       - target: SweepVPN-macOS-Tunnel
         embed: true
+      - target: SweepVPN-macOS-Filter
+        embed: true
       - package: SweepVPNCore
         product: SweepVPNCore
       - package: SweepVPNKit
         product: SweepVPNKit
       - package: SweepVPNKit
         product: SweepVPNUI
+  SweepVPN-macOS-Filter:
+    type: app-extension
+    platform: macOS
+    sources: [Apps/macOSFilter, Apps/Shared]
+    entitlements: { path: Apps/macOSFilter/Filter.entitlements }
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sweep.vpn.mac.filter
+        INFOPLIST_FILE: Apps/macOSFilter/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+    dependencies:
+      - package: SweepVPNCore
+        product: SweepVPNCore
+      - package: SweepVPNKit
+        product: SweepVPNKit
+
   SweepVPN-macOS-Tunnel:
     type: app-extension
     platform: macOS

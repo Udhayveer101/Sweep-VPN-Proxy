@@ -20,6 +20,12 @@ public enum AppConfig {
     public static let configSigningPublicKeyBase64 =
         (Bundle.main.object(forInfoDictionaryKey: "SweepConfigSigningKey") as? String) ?? ""
 
+    /// Static host serving the offline-signed bundle. No account API.
+    public static var configURL: URL? {
+        (Bundle.main.object(forInfoDictionaryKey: "SweepConfigURL") as? String)
+            .flatMap(URL.init(string:))
+    }
+
     public static var appBuild: Int {
         Int(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1") ?? 1
     }
@@ -31,8 +37,20 @@ public enum AppConfig {
         return try Curve25519.Signing.PublicKey(rawRepresentation: raw)
     }
 
+    /// The app and the extension share secrets through the App Group keychain.
+    /// On the simulator that entitlement is not granted (and a simulator cannot
+    /// host a NetworkExtension at all, so nothing is shared there) — fall back to
+    /// the app's own keychain so the UI can still be exercised.
+    public static var keychainAccessGroup: String? {
+        #if targetEnvironment(simulator)
+        return nil
+        #else
+        return appGroup
+        #endif
+    }
+
     public static func makeConfigStore() throws -> ConfigStore {
-        ConfigStore(store: KeychainStore(service: keychainService, accessGroup: appGroup),
+        ConfigStore(store: KeychainStore(service: keychainService, accessGroup: keychainAccessGroup),
                     pinnedSigningKey: try pinnedSigningKey(),
                     appBuild: appBuild)
     }

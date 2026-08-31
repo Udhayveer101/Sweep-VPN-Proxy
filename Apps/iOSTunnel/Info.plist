@@ -10,6 +10,7 @@
   <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
   <key>CFBundlePackageType</key><string>XPC!</string>
   <key>SweepConfigSigningKey</key><string>$(SWEEP_CONFIG_SIGNING_KEY)</string>
+  <key>SweepConfigURL</key><string>$(SWEEP_CONFIG_URL)</string>
   <key>NSExtension</key><dict>
     <key>NSExtensionPointIdentifier</key><string>com.apple.networkextension.packet-tunnel</string>
     <key>NSExtensionPrincipalClass</key><string>$(PRODUCT_MODULE_NAME).PacketTunnelProvider</string>

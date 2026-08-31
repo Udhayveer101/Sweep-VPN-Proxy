@@ -15,28 +15,71 @@ public final class VPNViewModel: ObservableObject {
     @Published public private(set) var killSwitchArmed = true
     @Published public private(set) var onDemandArmed = true
     @Published public private(set) var pqHybridActive = false
+    @Published public private(set) var rung: ProtocolRung?
     @Published public private(set) var isBusy = false
     @Published public var showSettings = false
+    @Published public var showOnboarding = !UserDefaults.standard.bool(forKey: "sweep.onboarded")
     @Published public var showServerPicker = false
     @Published public var lastError: String?
+    /// Why the app has no usable configuration, shown to the user instead of a
+    /// silent "not protected".
+    @Published public private(set) var configStatus: String?
     @Published public var options = SecurityPolicyOptions()
     @Published public var preference: ProtocolPreference = .automatic
     @Published public private(set) var servers: [Server] = []
+    /// The ordered list the picker renders: Automatic, then the fastest server,
+    /// then everything else fastest → slowest.
+    @Published public private(set) var listEntries: [ServerListEntry] = []
+    @Published public private(set) var selectedServerID: ServerID?
+    /// Servers that need an operator account are hidden until the user opts in.
+    @Published public var showAccountOnlyServers = false
     /// No verified, unexpired signed bundle => the app has nothing it is allowed
     /// to connect to, and says so instead of implying it is standing guard.
     @Published public private(set) var hasVerifiedConfig = false
+
+    /// Second line on the server pill: which server Automatic landed on, or the
+    /// latency of the pinned one.
+    public var serverSubtitle: String? {
+        if isAutomaticSelected {
+            return serverName.map { "Fastest — \($0)" }
+        }
+        return rung?.displayName
+    }
+
+    /// The route actually carrying traffic, shown only while connected so the
+    /// user can see when the app has fallen back to a stealth rung.
+    public var routeDescription: String? {
+        guard state.forwardingAllowed, let rung else { return nil }
+        return rung == .wireGuardUDP ? nil : "via \(rung.displayName)"
+    }
 
     public var animateBackdrop: Bool {
         !ProcessInfo.processInfo.isLowPowerModeEnabled && state.forwardingAllowed
     }
 
+    /// Bundle ids the macOS settings pane needs to install/activate extensions.
+    public var tunnelExtensionID: String { configurator.bundleIdentifier }
+    public var filterExtensionID: String {
+        configurator.bundleIdentifier.replacingOccurrences(of: ".tunnel", with: ".filter")
+    }
+
     private let configurator: VPNConfigurator
+    private var catalog = ServerCatalog()
     private var pollTask: Task<Void, Never>?
 
     public init(configurator: VPNConfigurator) {
         self.configurator = configurator
         self.presentation = Presentation.make(state: .disconnected, serverName: nil,
                                               killSwitchArmed: true, onDemandArmed: true, quality: nil)
+    }
+
+    /// Test/preview seam: force a state without a running extension.
+    public func overrideStateForPreview(_ state: TunnelState, rung: ProtocolRung? = nil,
+                                        quality: Presentation.Quality? = nil) {
+        self.state = state
+        self.rung = rung
+        self.quality = quality
+        recompute()
     }
 
     public func onAppear() {
@@ -57,10 +100,20 @@ public final class VPNViewModel: ObservableObject {
 
     public func onDisappear() { pollTask?.cancel(); pollTask = nil }
 
+    /// Remembering that the primer was shown is the only thing this app stores
+    /// outside the Keychain — it is not a secret and not user data.
+    public func completeOnboarding() {
+        UserDefaults.standard.set(true, forKey: "sweep.onboarded")
+        showOnboarding = false
+    }
+
     public func refresh() async {
         guard let response = try? await configurator.send(.getStatus) else {
             applySystemStatus()
             return
+        }
+        if case .servers(let ranked) = try? await configurator.send(.getServers) {
+            apply(ranked: ranked)
         }
         if case .status(let s) = response {
             state = s.state
@@ -68,6 +121,7 @@ public final class VPNViewModel: ObservableObject {
             killSwitchArmed = s.killSwitchArmed
             onDemandArmed = options.killSwitchEnabled
             pqHybridActive = s.pqHybridActive
+            rung = s.rung
             quality = s.rttMs.map { Presentation.Quality.from(rttMs: $0, lossFraction: 0) }
             recompute()
         }
@@ -128,6 +182,23 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
+    /// Modes a user can pick directly; `forced` is set from the Advanced picker.
+    public static let selectableModes: [ProtocolPreference] = [.automatic, .fast, .stealth, .lowPower]
+
+    /// Rungs this build can actually run, in ladder order.
+    public var selectableRungs: [ProtocolRung] {
+        ProtocolRung.allCases.filter(AdapterFactory.availableRungs.contains)
+    }
+
+    public var forcedRung: ProtocolRung? {
+        if case .forced(let r) = preference { return r }
+        return nil
+    }
+
+    public func apply(forcedRung rung: ProtocolRung?) {
+        apply(preference: rung.map { ProtocolPreference.forced($0) } ?? .automatic)
+    }
+
     public func apply(preference newPreference: ProtocolPreference) {
         preference = newPreference
         Task {
@@ -136,17 +207,70 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
-    public func load(servers: [Server]) {
-        self.servers = servers
-        hasVerifiedConfig = !servers.isEmpty
-        if serverName == nil { serverName = servers.first?.name }
+    /// Record a configuration problem — the app must never look idle-but-fine
+    /// when it simply could not get a verified server list.
+    public func noteConfigurationFailure(_ description: String) {
+        configStatus = description
+        hasVerifiedConfig = false
         applySystemStatus()
     }
 
-    public func select(server: Server) {
-        serverName = server.name
+    public func noteConfigurationLoaded(version: UInt64, servers: Int) {
+        configStatus = "Configuration v\(version), \(servers) servers"
+    }
+
+    public func load(servers: [Server]) {
+        self.servers = servers
+        hasVerifiedConfig = !servers.isEmpty
+        catalog.replaceServers(servers)
+        rebuildList()
+        applySystemStatus()
+    }
+
+    /// Merge the measurements the extension reports into the local catalog, so
+    /// the ordering the user sees is the ordering the tunnel actually uses.
+    public func apply(ranked: [RankedServer]) {
+        catalog.replaceServers(ranked.map(\.server))
+        for row in ranked {
+            guard let rtt = row.rttMs else { continue }
+            catalog.record(ServerProbe(rttMs: rtt, lossFraction: row.lossFraction ?? 0), for: row.id)
+        }
+        servers = ranked.map(\.server)
+        hasVerifiedConfig = !servers.isEmpty
+        rebuildList()
+    }
+
+    private func rebuildList() {
+        listEntries = catalog.listEntries(includeAccountRequired: showAccountOnlyServers)
+        // "Automatic" means the fastest measured server, re-evaluated as
+        // measurements arrive — the name shown must follow it.
+        if selectedServerID == nil || selectedServerID == automaticID {
+            serverName = catalog.fastest(includeAccountRequired: showAccountOnlyServers)?.name
+        }
+        recompute()
+    }
+
+    public let automaticID: ServerID = "__automatic__"
+
+    public var isAutomaticSelected: Bool { selectedServerID == nil || selectedServerID == automaticID }
+
+    public func selectAutomatic() {
+        selectedServerID = automaticID
+        serverName = catalog.fastest(includeAccountRequired: showAccountOnlyServers)?.name
         recompute()
         Task { _ = try? await configurator.send(.reconnect) }
+    }
+
+    public func select(server: Server) {
+        selectedServerID = server.id
+        serverName = server.name
+        recompute()
+        Task { _ = try? await configurator.send(.selectServer(server.id)) }
+    }
+
+    public func setShowAccountOnlyServers(_ show: Bool) {
+        showAccountOnlyServers = show
+        rebuildList()
     }
 
     public func exportDiagnostics() async -> String {

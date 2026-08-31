@@ -1,0 +1,23 @@
+[package]
+name = "sweepbridge"
+version = "0.1.0"
+edition = "2021"
+
+# Server side of the non-UDP rungs: terminates TCP/TLS/QUIC on :443 and forwards
+# the WireGuard datagrams inside to the local wg0 UDP port. It never sees
+# plaintext — the payload is an intact WireGuard tunnel.
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "signal"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+anyhow = "1"
+
+[lib]
+name = "sweepbridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sweepbridge"
+path = "src/main.rs"

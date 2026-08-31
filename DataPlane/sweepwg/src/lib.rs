@@ -4,6 +4,7 @@
 //! crate that already implements WireGuard; Swift only moves bytes between the
 //! NEPacketTunnelProvider's packetFlow / UDP socket and these calls.
 //! No cryptography is implemented in this file.
+pub mod ss2022;
 
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};

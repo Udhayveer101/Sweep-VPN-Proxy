@@ -93,6 +93,17 @@ public struct Presentation: Equatable, Sendable {
     }
 }
 
+public extension Presentation.Quality {
+    /// Colour used for latency figures in the server list.
+    var tint: Color {
+        switch self {
+        case .good: return .green
+        case .fair: return .orange
+        case .weak: return .red
+        }
+    }
+}
+
 public extension Presentation.Tint {
     var color: Color {
         switch self {

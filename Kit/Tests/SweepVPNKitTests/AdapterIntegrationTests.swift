@@ -9,6 +9,9 @@ import SweepWireGuardC
 /// WireGuard peer is run on loopback UDP using the same data plane, and the
 /// adapter must handshake with it and carry a packet both ways.
 final class AdapterIntegrationTests: XCTestCase {
+    /// A minimal, valid IPv4 packet shared by the transport integration tests.
+    static let samplePacket = Data(LoopbackPeer.samplePacketBytes)
+
 
     /// Minimal in-process WireGuard peer bound to 127.0.0.1.
     final class LoopbackPeer: @unchecked Sendable {
@@ -18,11 +21,19 @@ final class AdapterIntegrationTests: XCTestCase {
         let queue = DispatchQueue(label: "test.peer")
         var onPlaintext: ((Data) -> Void)?
 
-        init(privateKeyB64: String, peerPublicKeyB64: String) throws {
+        static let samplePacketBytes: [UInt8] = {
+            var p = [UInt8](repeating: 0, count: 20)
+            p[0] = 0x45; p[3] = 20; p[9] = 1
+            p[12...15] = [10, 64, 0, 2][0...3]
+            p[16...19] = [10, 64, 0, 1][0...3]
+            return p
+        }()
+
+        init(privateKeyB64: String, peerPublicKeyB64: String, transport: NWParameters = .udp) throws {
             tunnel = privateKeyB64.withCString { sk in
                 peerPublicKeyB64.withCString { pk in sweepwg_new(sk, pk, nil, 0, 2)! }
             }
-            listener = try NWListener(using: .udp, on: .any)
+            listener = try NWListener(using: transport, on: .any)
             listener.newConnectionHandler = { [weak self] conn in
                 guard let self else { return }
                 self.connection = conn
@@ -98,20 +109,14 @@ final class AdapterIntegrationTests: XCTestCase {
                             endpoints: [.init(host: "127.0.0.1", port: peer.port, rung: .wireGuardUDP)],
                             dnsServers: ["127.0.0.1"], ipv4Address: "10.64.0.2")
 
-        let adapter = WireGuardAdapter(server: server, endpoint: server.endpoints[0],
-                                       privateKeyBase64: clientPrivB64,
-                                       presharedKeyBase64: nil, keepalive: nil)
+        let adapter = try AdapterFactory.make(rung: .wireGuardUDP, server: server,
+                                              privateKeyBase64: clientPrivB64,
+                                              presharedKeyBase64: nil, keepalive: nil)
         let authenticated = XCTestExpectation(description: "handshake completed")
         let inbound = XCTestExpectation(description: "packet received back through the tunnel")
         let serverSaw = XCTestExpectation(description: "server decrypted the packet")
 
-        let packet: Data = {
-            var p = [UInt8](repeating: 0, count: 20)
-            p[0] = 0x45; p[3] = 20; p[9] = 1
-            p[12...15] = [10, 64, 0, 2][0...3]
-            p[16...19] = [10, 64, 0, 1][0...3]
-            return Data(p)
-        }()
+        let packet = Self.samplePacket
         peer.onPlaintext = { received in
             if received == packet { serverSaw.fulfill() }
         }

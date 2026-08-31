@@ -10,5 +10,11 @@ final class PacketTunnelProvider: SweepPacketTunnelProvider {
     /// and the tunnel refuses to start, leaving the blackhole in place.
     override var configStore: ConfigStore? { try? AppConfig.makeConfigStore() }
 
+    /// macOS runs a second, independent kill-switch layer; the tunnel tells it
+    /// when traffic may leave.
+    override var filterStateStore: FilterStateStore? {
+        FilterStateStore(appGroup: AppConfig.appGroup)
+    }
+
     override var appBuild: Int { AppConfig.appBuild }
 }

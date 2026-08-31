@@ -3,18 +3,20 @@ import Network
 import SweepVPNCore
 import SweepWireGuardC
 
-/// Rung 1: WireGuard over UDP, boringtun data plane, NWConnection socket.
+/// Every WireGuard rung: one boringtun tunnel plus whichever `PacketTransport`
+/// the rung selects. The crypto is identical on all rungs — only the envelope
+/// changes — so a fallback never trades security for reachability.
 public final class WireGuardAdapter: TunnelAdapter, @unchecked Sendable {
-    public let rung: ProtocolRung = .wireGuardUDP
+    public let rung: ProtocolRung
 
     private let server: Server
     private let endpoint: ServerEndpoint
     private let privateKeyBase64: String
     private var presharedKeyBase64: String?
     private let keepalive: UInt16
+    private let transport: PacketTransport
 
     private var tunnel: OpaquePointer?
-    private var connection: NWConnection?
     private let queue = DispatchQueue(label: "vpn.sweep.wg", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
     private var authenticated = false
@@ -25,10 +27,13 @@ public final class WireGuardAdapter: TunnelAdapter, @unchecked Sendable {
 
     private static let bufferSize = 65_536
 
-    public init(server: Server, endpoint: ServerEndpoint, privateKeyBase64: String,
+    public init(rung: ProtocolRung, server: Server, endpoint: ServerEndpoint,
+                transport: PacketTransport, privateKeyBase64: String,
                 presharedKeyBase64: String?, keepalive: Int?) {
+        self.rung = rung
         self.server = server
         self.endpoint = endpoint
+        self.transport = transport
         self.privateKeyBase64 = privateKeyBase64
         self.presharedKeyBase64 = presharedKeyBase64
         self.keepalive = UInt16(keepalive ?? 0)
@@ -53,39 +58,53 @@ public final class WireGuardAdapter: TunnelAdapter, @unchecked Sendable {
         }
         guard tunnel != nil else { return onFailure(.internalFailure) }
 
-        let host = NWEndpoint.Host(endpoint.host)
-        let port = NWEndpoint.Port(rawValue: endpoint.port)!
-        let params = NWParameters.udp
-        // Never let our own socket be captured by the tunnel we are creating.
-        params.prohibitedInterfaceTypes = [.other]
-        let conn = NWConnection(host: host, port: port, using: params)
-        connection = conn
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            switch state {
-            case .ready:
-                self.receiveLoop()
-                self.handshake()
-                self.startTimer()
-            case .failed, .cancelled:
-                self.onFailure?(.allRungsFailed)
-            default: break
-            }
-        }
-        conn.start(queue: queue)
+        transport.start(
+            onReady: { [weak self] in
+                guard let self else { return }
+                self.queue.async {
+                    self.handshake()
+                    self.startTimer()
+                }
+            },
+            onDatagram: { [weak self] data in
+                self?.queue.async { self?.handleInbound(data) }
+            },
+            onFailure: { [weak self] in
+                self?.onFailure?(.allRungsFailed)
+            })
     }
 
     public func stop() {
         timer?.cancel(); timer = nil
-        connection?.cancel(); connection = nil
+        transport.stop()
         if let t = tunnel { sweepwg_free(t) }
         tunnel = nil
         authenticated = false
     }
 
     public func reassert() {
-        authenticated = false
-        queue.async { [weak self] in self?.handshake() }
+        queue.async { [weak self] in
+            self?.authenticated = false
+            self?.handshake()
+        }
+    }
+
+    /// Install a new preshared key (the ML-KEM-768 hybrid PSK) and re-handshake.
+    public func applyPostQuantumPSK(_ pskBase64: String) {
+        queue.async { [weak self] in
+            guard let self, let t = self.tunnel else { return }
+            let ok = self.privateKeyBase64.withCString { sk in
+                self.server.publicKey.withCString { pk in
+                    pskBase64.withCString { psk in
+                        sweepwg_set_psk(t, sk, pk, psk, self.keepalive, 1)
+                    }
+                }
+            }
+            guard ok == SWEEPWG_DONE else { return }
+            self.presharedKeyBase64 = pskBase64
+            self.authenticated = false
+            self.handshake()
+        }
     }
 
     public var lastHandshakeAgeSeconds: Int64 {
@@ -109,28 +128,15 @@ public final class WireGuardAdapter: TunnelAdapter, @unchecked Sendable {
             for packet in packets {
                 var written = 0
                 let r = packet.withUnsafeBytes { src in
-                    sweepwg_encapsulate(t,
-                                        src.bindMemory(to: UInt8.self).baseAddress, packet.count,
+                    sweepwg_encapsulate(t, src.bindMemory(to: UInt8.self).baseAddress, packet.count,
                                         &out, out.count, &written)
                 }
                 if r == SWEEPWG_WRITE_TO_NETWORK, written > 0 {
-                    self.write(Data(out[0..<written]))
+                    self.transport.send(Data(out[0..<written]))
                 }
-                // Any other result (DONE / ERROR) means "drop" — never fall back
-                // to sending the plaintext packet anywhere.
+                // Any other result means "drop" — a packet is never forwarded
+                // outside the tunnel as a fallback.
             }
-        }
-    }
-
-    private func write(_ data: Data) {
-        connection?.send(content: data, completion: .contentProcessed { _ in })
-    }
-
-    private func receiveLoop() {
-        connection?.receiveMessage { [weak self] data, _, _, error in
-            guard let self else { return }
-            if let data, !data.isEmpty { self.handleInbound(data) }
-            if error == nil { self.receiveLoop() } else { self.onFailure?(.allRungsFailed) }
         }
     }
 
@@ -139,14 +145,12 @@ public final class WireGuardAdapter: TunnelAdapter, @unchecked Sendable {
         var out = [UInt8](repeating: 0, count: Self.bufferSize)
         var written = 0
         let r = data.withUnsafeBytes { src in
-            sweepwg_decapsulate(t,
-                                src.bindMemory(to: UInt8.self).baseAddress, data.count,
+            sweepwg_decapsulate(t, src.bindMemory(to: UInt8.self).baseAddress, data.count,
                                 &out, out.count, &written)
         }
         switch r {
         case SWEEPWG_WRITE_TO_NETWORK:
-            if written > 0 { write(Data(out[0..<written])) }
-            // boringtun asks for more writes while finishing the handshake.
+            if written > 0 { transport.send(Data(out[0..<written])) }
             drainNetworkQueue()
             noteAuthenticatedIfNeeded()
         case SWEEPWG_WRITE_TO_TUNNEL_V4:
@@ -156,12 +160,10 @@ public final class WireGuardAdapter: TunnelAdapter, @unchecked Sendable {
             noteAuthenticatedIfNeeded()
             if written > 0 { onInbound?([Data(out[0..<written])], [NSNumber(value: AF_INET6)]) }
         default:
-            // SWEEPWG_ERROR: forged, replayed or malformed — dropped silently.
-            break
+            break   // forged, replayed or malformed — dropped
         }
     }
 
-    /// After a decapsulate that produced a write, boringtun may have queued more.
     private func drainNetworkQueue() {
         guard let t = tunnel else { return }
         var out = [UInt8](repeating: 0, count: Self.bufferSize)
@@ -169,7 +171,7 @@ public final class WireGuardAdapter: TunnelAdapter, @unchecked Sendable {
             var written = 0
             let r = sweepwg_decapsulate(t, nil, 0, &out, out.count, &written)
             guard r == SWEEPWG_WRITE_TO_NETWORK, written > 0 else { return }
-            write(Data(out[0..<written]))
+            transport.send(Data(out[0..<written]))
         }
     }
 
@@ -183,14 +185,15 @@ public final class WireGuardAdapter: TunnelAdapter, @unchecked Sendable {
         guard let t = tunnel else { return }
         var out = [UInt8](repeating: 0, count: Self.bufferSize)
         var written = 0
-        if sweepwg_force_handshake(t, &out, out.count, &written)
-            == SWEEPWG_WRITE_TO_NETWORK, written > 0 {
-            write(Data(out[0..<written]))
+        if sweepwg_force_handshake(t, &out, out.count, &written) == SWEEPWG_WRITE_TO_NETWORK,
+           written > 0 {
+            transport.send(Data(out[0..<written]))
         }
     }
 
     /// One timer drives rekey, keepalive and handshake retry — no polling loops.
     private func startTimer() {
+        guard timer == nil else { return }
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + 1, repeating: 1.0, leeway: .milliseconds(250))
         t.setEventHandler { [weak self] in self?.tick() }
@@ -202,9 +205,8 @@ public final class WireGuardAdapter: TunnelAdapter, @unchecked Sendable {
         guard let t = tunnel else { return }
         var out = [UInt8](repeating: 0, count: Self.bufferSize)
         var written = 0
-        if sweepwg_tick(t, &out, out.count, &written) == SWEEPWG_WRITE_TO_NETWORK,
-           written > 0 {
-            write(Data(out[0..<written]))
+        if sweepwg_tick(t, &out, out.count, &written) == SWEEPWG_WRITE_TO_NETWORK, written > 0 {
+            transport.send(Data(out[0..<written]))
         }
     }
 }

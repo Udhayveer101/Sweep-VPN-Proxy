@@ -2,7 +2,7 @@ import Foundation
 import Network
 import SweepVPNCore
 
-/// One rung of the ladder. Implementations own their socket and their crypto
+/// One rung of the ladder. Implementations own their transport and their crypto
 /// state; the provider only sees packets and state changes.
 public protocol TunnelAdapter: AnyObject, Sendable {
     var rung: ProtocolRung { get }
@@ -25,31 +25,34 @@ public enum AdapterFactoryError: Error, Equatable {
     /// A researched-but-not-yet-implemented rung. Never silently substituted.
     case rungNotImplemented(ProtocolRung)
     case noEndpoint(ProtocolRung)
+    /// The rung needs a credential the signed bundle did not carry.
+    case missingCredential(ProtocolRung)
 }
 
 public enum AdapterFactory {
-    /// Rungs actually implemented in this build. Anything else must fail loudly:
-    /// a rung that cannot run is not allowed to look like a working tunnel.
-    public static let implementedRungs: Set<ProtocolRung> = [.wireGuardUDP, .ikev2]
+    /// Rungs that actually exist in this build. A rung that cannot run must fail
+    /// loudly rather than look like a working tunnel.
+    /// IKEv2 is real but runs as a kernel profile (`IKEv2Configurator`), not as
+    /// a packet-tunnel adapter, so it is not in this set.
+    public static let implementedRungs: Set<ProtocolRung> = [
+        .wireGuardUDP, .wireGuardUDP443, .wireGuardQUIC,
+        .wireGuardTLS, .shadowsocks2022, .wireGuardTCP,
+    ]
+
+    /// Rungs the app can offer at all, including the kernel one.
+    public static let availableRungs: Set<ProtocolRung> = implementedRungs.union([.ikev2])
 
     public static func make(rung: ProtocolRung, server: Server, privateKeyBase64: String,
-                           presharedKeyBase64: String?, keepalive: Int?) throws -> TunnelAdapter {
+                            presharedKeyBase64: String?, keepalive: Int?) throws -> TunnelAdapter {
         guard implementedRungs.contains(rung) else { throw AdapterFactoryError.rungNotImplemented(rung) }
         guard let endpoint = server.endpoints.first(where: { $0.rung == rung }) else {
             throw AdapterFactoryError.noEndpoint(rung)
         }
-        switch rung {
-        case .wireGuardUDP:
-            return WireGuardAdapter(server: server, endpoint: endpoint,
-                                    privateKeyBase64: privateKeyBase64,
-                                    presharedKeyBase64: presharedKeyBase64,
-                                    keepalive: keepalive)
-        case .ikev2:
-            // Rung 4 runs in the kernel via NEVPNProtocolIKEv2 and never uses a
-            // packet-tunnel adapter — see IKEv2Configurator.
-            throw AdapterFactoryError.rungNotImplemented(rung)
-        default:
-            throw AdapterFactoryError.rungNotImplemented(rung)
-        }
+        let transport = try TransportFactory.make(rung: rung, endpoint: endpoint,
+                                                  sni: endpoint.sni,
+                                                  secret: endpoint.secretData)
+        return WireGuardAdapter(rung: rung, server: server, endpoint: endpoint,
+                                transport: transport, privateKeyBase64: privateKeyBase64,
+                                presharedKeyBase64: presharedKeyBase64, keepalive: keepalive)
     }
 }
