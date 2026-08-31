@@ -1,7 +1,10 @@
-#if os(macOS)
+// FilterState below the #endif is shared with the iOS tunnel provider, so the
+// imports it needs must sit outside the macOS-only guard.
 import Foundation
 import NetworkExtension
 import SweepVPNCore
+
+#if os(macOS)
 
 /// macOS second kill-switch layer. Runs as a content-filter system extension and
 /// drops every flow that is not on the live tunnel interface, independently of
