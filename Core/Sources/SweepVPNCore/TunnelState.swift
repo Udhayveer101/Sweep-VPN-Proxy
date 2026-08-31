@@ -33,6 +33,7 @@ public enum DegradeReason: String, Equatable, Sendable, Codable {
 }
 
 public enum TunnelErrorKind: String, Equatable, Sendable, Codable {
+    case notConfigured             // no pinned key / no server list yet -> setup, not an attack
     case configurationInvalid      // signature / version / expiry failure -> fail closed
     case noServersAvailable
     case allRungsFailed

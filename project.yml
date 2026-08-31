@@ -6,7 +6,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    SWEEP_CONFIG_SIGNING_KEY: ""
+    SWEEP_CONFIG_SIGNING_KEY: "wVOJIuoa32ZZ5lSd8RmCaUOEFQIUYmidxFcK8bhYNYA="
     SWEEP_CONFIG_URL: ""
     CODE_SIGN_STYLE: Automatic
     ENABLE_USER_SCRIPT_SANDBOXING: NO
@@ -18,6 +18,9 @@ targets:
     type: application
     platform: iOS
     sources: [Apps/iOS, Apps/Shared]
+    resources:
+      - path: Apps/Shared/sweep-config.sig.json
+        optional: true
     entitlements: { path: Apps/iOS/App.entitlements }
     settings:
       base:
@@ -57,6 +60,11 @@ targets:
     type: application
     platform: macOS
     sources: [Apps/macOS, Apps/Shared]
+    # A personal build carries its own signed bundle instead of hosting one.
+    # `optional: true` keeps the build working before the first fleet is signed.
+    resources:
+      - path: Apps/Shared/sweep-config.sig.json
+        optional: true
     entitlements: { path: Apps/macOS/App.entitlements }
     settings:
       base:

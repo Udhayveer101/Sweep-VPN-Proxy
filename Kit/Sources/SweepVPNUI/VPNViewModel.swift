@@ -17,9 +17,14 @@ public final class VPNViewModel: ObservableObject {
     @Published public private(set) var pqHybridActive = false
     @Published public private(set) var rung: ProtocolRung?
     @Published public private(set) var isBusy = false
-    @Published public var showSettings = false
-    @Published public var showOnboarding = !UserDefaults.standard.bool(forKey: "sweep.onboarded")
-    @Published public var showServerPicker = false
+    /// One sheet at a time. SwiftUI silently misbehaves when several `.sheet`
+    /// modifiers sit on the same view — they fight, and the wrong one wins — so
+    /// there is a single presentation slot rather than a bool per screen.
+    public enum Sheet: String, Identifiable, Sendable {
+        case settings, serverPicker, setupGuide, onboarding
+        public var id: String { rawValue }
+    }
+    @Published public var activeSheet: Sheet?
     @Published public var lastError: String?
     /// Why the app has no usable configuration, shown to the user instead of a
     /// silent "not protected".
@@ -36,6 +41,11 @@ public final class VPNViewModel: ObservableObject {
     /// No verified, unexpired signed bundle => the app has nothing it is allowed
     /// to connect to, and says so instead of implying it is standing guard.
     @Published public private(set) var hasVerifiedConfig = false
+    /// Why there is no config: `.notConfigured` (never set up) reads very
+    /// differently to the user than `.configurationInvalid` (a bad signature),
+    /// so the two must not share one alarming screen.
+    @Published public private(set) var configFailureKind: TunnelErrorKind = .notConfigured
+
 
     /// Second line on the server pill: which server Automatic landed on, or the
     /// latency of the pinned one.
@@ -71,6 +81,7 @@ public final class VPNViewModel: ObservableObject {
         self.configurator = configurator
         self.presentation = Presentation.make(state: .disconnected, serverName: nil,
                                               killSwitchArmed: true, onDemandArmed: true, quality: nil)
+        if !UserDefaults.standard.bool(forKey: "sweep.onboarded") { activeSheet = .onboarding }
     }
 
     /// Test/preview seam: force a state without a running extension.
@@ -104,7 +115,7 @@ public final class VPNViewModel: ObservableObject {
     /// outside the Keychain — it is not a secret and not user data.
     public func completeOnboarding() {
         UserDefaults.standard.set(true, forKey: "sweep.onboarded")
-        showOnboarding = false
+        if activeSheet == .onboarding { activeSheet = nil }
     }
 
     public func refresh() async {
@@ -136,7 +147,7 @@ public final class VPNViewModel: ObservableObject {
         case .disconnecting: state = .reconnecting(attempt: 0)
         case .invalid: state = .error(.systemDenied)
         default:
-            if !hasVerifiedConfig { state = .error(.configurationInvalid) }
+            if !hasVerifiedConfig { state = .error(configFailureKind) }
             else { state = options.killSwitchEnabled ? .onDemandArmed : .disconnected }
         }
         recompute()
@@ -164,7 +175,13 @@ public final class VPNViewModel: ObservableObject {
             case .disconnect, .cancel:
                 try await configurator.stop()
             case .openSettings:
-                openSystemSettings()
+                // The same button means two different things: finish setup, or
+                // re-grant a VPN permission the user revoked.
+                if configFailureKind == .notConfigured && !hasVerifiedConfig {
+                    activeSheet = .setupGuide
+                } else {
+                    openSystemSettings()
+                }
             }
             await refresh()
         } catch {
@@ -209,8 +226,10 @@ public final class VPNViewModel: ObservableObject {
 
     /// Record a configuration problem — the app must never look idle-but-fine
     /// when it simply could not get a verified server list.
-    public func noteConfigurationFailure(_ description: String) {
+    public func noteConfigurationFailure(_ description: String,
+                                        kind: TunnelErrorKind = .configurationInvalid) {
         configStatus = description
+        configFailureKind = kind
         hasVerifiedConfig = false
         applySystemStatus()
     }
@@ -222,6 +241,7 @@ public final class VPNViewModel: ObservableObject {
     public func load(servers: [Server]) {
         self.servers = servers
         hasVerifiedConfig = !servers.isEmpty
+        if !servers.isEmpty { configFailureKind = .notConfigured }
         catalog.replaceServers(servers)
         rebuildList()
         applySystemStatus()

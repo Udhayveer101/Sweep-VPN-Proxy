@@ -13,24 +13,55 @@ public struct HomeView: View {
         ZStack {
             Backdrop(tint: model.presentation.tint, animate: !reduceMotion && model.animateBackdrop)
             VStack(spacing: 20) {
+                header
                 Spacer(minLength: 0)
                 statusPanel
                 serverPill
                 Spacer(minLength: 0)
+                if let error = model.lastError { errorRow(error) }
                 primaryButton
             }
             .padding(24)
         }
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button { model.showSettings = true } label: { Image(systemName: "gearshape") }
-                    .accessibilityLabel("Settings")
+        .sheet(item: $model.activeSheet) { sheet in
+            switch sheet {
+            case .settings:     SettingsView(model: model)
+            case .serverPicker: ServerPickerView(model: model)
+            case .setupGuide:   SetupGuideView(model: model)
+            case .onboarding:   OnboardingView(model: model).interactiveDismissDisabled()
             }
         }
-        .sheet(isPresented: $model.showSettings) { SettingsView(model: model) }
-        .sheet(isPresented: $model.showOnboarding) {
-            OnboardingView(model: model).interactiveDismissDisabled()
+    }
+
+    /// The gear lives in the layout, not in `.toolbar`: a toolbar item is
+    /// silently dropped by scenes that have no toolbar, which is how this
+    /// button went missing entirely.
+    private var header: some View {
+        HStack {
+            Text("Sweep VPN").font(.headline)
+            Spacer()
+            Button { model.activeSheet = .settings } label: {
+                Image(systemName: "gearshape").font(.title3)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Settings")
         }
+    }
+
+    /// A failed Connect/Retry used to set `lastError` that nothing rendered, so
+    /// the button looked inert. Show it, and let the user dismiss it.
+    private func errorRow(_ error: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            Text(error).font(.caption).multilineTextAlignment(.leading)
+            Spacer(minLength: 0)
+            Button { model.lastError = nil } label: { Image(systemName: "xmark") }
+                .buttonStyle(.plain).accessibilityLabel("Dismiss error")
+        }
+        .padding(12)
+        .frame(maxWidth: 420)
+        .background(.thinMaterial, in: .rect(cornerRadius: 12, style: .continuous))
+        .accessibilityElement(children: .combine)
     }
 
     private var statusPanel: some View {
@@ -64,12 +95,20 @@ public struct HomeView: View {
         .accessibilityLabel(model.presentation.voiceOver)
     }
 
+    /// With no signed bundle there is nothing to pick from, but the pill still
+    /// has to be reachable — its empty state is where the explanation lives.
+    private var pillTitle: String {
+        if model.servers.isEmpty { return "No servers configured" }
+        return model.isAutomaticSelected ? "Automatic" : (model.serverName ?? "No server selected")
+    }
+
     private var serverPill: some View {
-        Button { model.showServerPicker = true } label: {
+        Button { model.activeSheet = .serverPicker } label: {
             HStack(spacing: 8) {
-                Image(systemName: model.isAutomaticSelected ? "bolt.badge.automatic.fill" : "mappin.and.ellipse")
+                Image(systemName: model.servers.isEmpty ? "exclamationmark.circle"
+                        : (model.isAutomaticSelected ? "bolt.badge.automatic.fill" : "mappin.and.ellipse"))
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(model.isAutomaticSelected ? "Automatic" : (model.serverName ?? "No server selected"))
+                    Text(pillTitle)
                     if let subtitle = model.serverSubtitle {
                         Text(subtitle).font(.caption2).foregroundStyle(.secondary)
                     }
@@ -80,8 +119,8 @@ public struct HomeView: View {
             .background(.thinMaterial, in: Capsule())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Server: \(model.serverName ?? "none selected"). Double tap to change.")
-        .sheet(isPresented: $model.showServerPicker) { ServerPickerView(model: model) }
+        .opacity(model.servers.isEmpty ? 0.7 : 1)
+        .accessibilityLabel("Server: \(pillTitle). Double tap to change.")
     }
 
     private var primaryButton: some View {

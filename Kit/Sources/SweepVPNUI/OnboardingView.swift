@@ -28,10 +28,19 @@ public struct OnboardingView: View {
                       "The kill switch fails closed — nothing loads rather than leaking.")
                 point("arrow.triangle.branch", "It finds a route that works",
                       "If this network blocks WireGuard, Sweep falls back through QUIC, TLS and Shadowsocks automatically.")
+                // Both points are platform-specific: naming iOS on a Mac makes
+                // the app look like it does not know where it is running.
+                #if os(iOS)
                 point("gear.badge", "iOS will ask to add a VPN configuration",
                       "That system prompt is next. Sweep cannot connect without it.")
                 point("exclamationmark.triangle", "One honest limit",
                       "On iOS, some traffic to Apple's own services can leave outside the tunnel. No app can change that.")
+                #else
+                point("gear.badge", "macOS will ask to allow a system extension",
+                      "You will approve it once in System Settings. Sweep cannot connect without it.")
+                point("exclamationmark.triangle", "A second layer on Mac",
+                      "A network filter blocks traffic whenever the tunnel is not carrying it, so a crash cannot open a leak.")
+                #endif
             }
             .padding(20)
             .background(.ultraThinMaterial, in: .rect(cornerRadius: 20, style: .continuous))

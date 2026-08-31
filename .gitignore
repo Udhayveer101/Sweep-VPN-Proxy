@@ -4,3 +4,5 @@ DerivedData/
 *.xcodeproj/xcuserdata/
 DataPlane/sweepwg/fat/
 *.key
+fleet/
+Apps/Shared/sweep-config.sig.json

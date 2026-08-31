@@ -72,11 +72,26 @@ final class PresentationTests: XCTestCase {
 
     func testFailureNeverLooksLikeSafeToBrowse() {
         for state: TunnelState in [.killSwitchActive, .error(.allRungsFailed), .reconnecting(attempt: 1),
-                                   .reasserting] {
+                                   .reasserting, .error(.notConfigured), .error(.configurationInvalid)] {
             let pres = p(state)
             XCTAssertNotEqual(pres.tint, .good, "\(state) must not read as protected")
             XCTAssertNotEqual(pres.headline, "Protected")
         }
+    }
+
+    /// "Never set up" and "the signature failed" are both non-protected, but
+    /// only one of them is an incident. Showing the alarming copy for a fresh
+    /// install trains the user to ignore it when it matters.
+    func testNotConfiguredReadsAsSetupNotAsAnAttack() {
+        let fresh = p(.error(.notConfigured))
+        XCTAssertEqual(fresh.tint, .neutral)
+        XCTAssertFalse(fresh.headline.lowercased().contains("traffic blocked"))
+        XCTAssertFalse(fresh.detail.lowercased().contains("could not be verified"))
+        XCTAssertEqual(fresh.primaryAction, .openSettings)
+
+        let tampered = p(.error(.configurationInvalid))
+        XCTAssertEqual(tampered.tint, .danger)
+        XCTAssertTrue(tampered.detail.lowercased().contains("could not be verified"))
     }
 
     func testReconnectingSaysTrafficIsBlockedNotLeaking() {

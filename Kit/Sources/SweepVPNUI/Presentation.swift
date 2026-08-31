@@ -60,6 +60,13 @@ public struct Presentation: Equatable, Sendable {
                          tint: .danger, primaryAction: .retry, primaryActionTitle: "Retry",
                          showsQuality: false,
                          voiceOver: "Traffic blocked by the kill switch. Double tap to retry.")
+        case .error(.notConfigured):
+            // Not an incident: the app has simply never been given a server.
+            // Saying "traffic blocked" here would cry wolf.
+            return .init(headline: "Not set up yet",
+                         detail: message(for: .notConfigured), tint: .neutral,
+                         primaryAction: .openSettings, primaryActionTitle: "How to finish setup",
+                         showsQuality: false, voiceOver: message(for: .notConfigured))
         case .error(let kind):
             return .init(headline: "Not connected — traffic blocked",
                          detail: message(for: kind), tint: .danger,
@@ -72,6 +79,8 @@ public struct Presentation: Equatable, Sendable {
     /// Errors name a cause and an action — never a bare code.
     static func message(for kind: TunnelErrorKind) -> String {
         switch kind {
+        case .notConfigured:
+            return "Sweep has no server list yet. Add a signed configuration to finish setup."
         case .configurationInvalid:
             return "The signed configuration could not be verified, so the app refused to connect."
         case .noServersAvailable: return "No server in the signed list is reachable right now."

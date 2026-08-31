@@ -82,8 +82,9 @@ substituting a different transport.
    Group, and provisioning profiles must be created in the developer portal, and
    `DEVELOPMENT_TEAM` set in `project.yml`. Until then the tunnel cannot run on a
    device — the simulator cannot host a NetworkExtension at all.
-2. **A VPS.** Run `Server/install.sh <device-label>` on a Debian/Ubuntu host, then
-   put its public key + endpoint into a bundle JSON.
+2. **A VPS.** `./Tools/sweep-fleet.sh add <label> <user@host> <CC> [city]`
+   provisions the box, reads its keys back and re-signs the bundle in one step.
+   See `Server/FREE-SERVERS.md` for the free-tier options and their real limits.
 3. **Signing key.** `sweep-sign keygen sweep-config.key`, then set
    `SWEEP_CONFIG_SIGNING_KEY` in `project.yml` to the printed public key. With no
    key pinned the app refuses to connect by design.

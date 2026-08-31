@@ -3,8 +3,9 @@ import SweepVPNCore
 import SweepVPNKit
 import SweepVPNUI
 
-/// macOS surface: a menu-bar popover is the primary UI (vault 11-UX), with a
-/// window only for Settings/Diagnostics.
+/// macOS surface: a normal single-window app. The window is only a controller —
+/// protection itself is enforced by the packet-tunnel and filter extensions, so
+/// quitting it does not drop the kill switch.
 @main
 struct SweepVPNMacApp: App {
     @StateObject private var model = VPNViewModel(
@@ -12,33 +13,21 @@ struct SweepVPNMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
-        MenuBarExtra {
+        Window("Sweep VPN", id: "main") {
             HomeView(model: model)
-                .frame(width: 380, height: 460)
+                .frame(minWidth: 420, idealWidth: 460, minHeight: 620, idealHeight: 680)
                 .onAppear { model.onAppear() }
                 .onDisappear { model.onDisappear() }
-        } label: {
-            Image(systemName: model.state.forwardingAllowed ? "lock.shield.fill" : "shield.slash")
+                .task { await Self.refreshConfiguration(into: model) }
         }
-        .menuBarExtraStyle(.window)
-
-        Settings {
-            SettingsView(model: model)
-                .frame(width: 520, height: 620)
-        }
-    }
-
-    init() {
-        // MenuBarExtra content is lazy: without this the app would only load its
-        // configuration once the user opened the popover, so a Mac that boots
-        // with Sweep in the menu bar would sit there with no server list.
-        let model = self.model
-        Task { @MainActor in await Self.refreshConfiguration(into: model) }
+        .windowResizability(.contentMinSize)
+        .commands { CommandGroup(replacing: .newItem) {} }
     }
 
     static func refreshConfiguration(into model: VPNViewModel) async {
         guard let store = try? AppConfig.makeConfigStore() else {
-            model.noteConfigurationFailure("No signing key is pinned in this build.")
+            model.noteConfigurationFailure("No signing key is pinned in this build.",
+                                           kind: .notConfigured)
             return
         }
         let fetcher = ConfigFetcher(url: AppConfig.configURL, store: store)
@@ -50,14 +39,25 @@ struct SweepVPNMacApp: App {
             let refreshed = try await fetcher.refresh()
             model.load(servers: refreshed.servers)
             model.noteConfigurationLoaded(version: refreshed.version, servers: refreshed.servers.count)
+        } catch ConfigFetcher.FetchError.notConfigured {
+            // Nothing to fetch from and nothing bundled: this build simply has
+            // no server list yet. That is setup state, not a security event.
+            if !model.hasVerifiedConfig {
+                model.noteConfigurationFailure("No server list has been added to this build yet.",
+                                               kind: .notConfigured)
+            }
         } catch {
-            model.noteConfigurationFailure("Could not load a verified server list: \(error)")
+            model.noteConfigurationFailure("Could not load a verified server list: \(error)",
+                                           kind: model.hasVerifiedConfig ? .configurationInvalid : .notConfigured)
         }
     }
 }
 
-/// The app is a menu-bar agent: no Dock icon, and closing the popover must not
-/// terminate it, or the on-demand tunnel loses its controller.
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
 }

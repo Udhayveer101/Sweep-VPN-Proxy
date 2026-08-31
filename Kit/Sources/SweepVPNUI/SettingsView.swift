@@ -117,18 +117,40 @@ public struct ServerPickerView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(visibleEntries) { entry in
-                        row(for: entry)
-                            .padding(.horizontal, 16).padding(.vertical, 10)
-                        Divider().padding(.leading, 16)
+            if model.servers.isEmpty {
+                emptyState
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(visibleEntries) { entry in
+                            row(for: entry)
+                                .padding(.horizontal, 16).padding(.vertical, 10)
+                            Divider().padding(.leading, 16)
+                        }
+                        footer
                     }
-                    footer
                 }
             }
         }
         .frame(minWidth: 320)
+    }
+
+    /// An empty list here is not a loading glitch: Sweep will only ever offer
+    /// servers that came out of a signature-verified bundle, so "empty" means
+    /// "no bundle yet" and has to say so.
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "server.rack")
+                .font(.system(size: 34)).foregroundStyle(.secondary)
+            Text("No servers yet").font(.headline)
+            Text("Sweep only connects to servers from a configuration bundle signed with your own key. Nothing has been signed into this build yet.")
+                .font(.caption).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("How to finish setup") { model.activeSheet = .setupGuide }
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// The rows themselves, without the scroll container, so they can be
