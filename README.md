@@ -71,11 +71,13 @@ fastest to slowest**, re-evaluated on every measurement and on network change.
 - Keychain-only secrets (AfterFirstUnlock, ThisDeviceOnly, app-group).
 - Scrubbed diagnostics ring buffer (no IPs, domains or DNS names).
 
-## Not implemented (deliberately)
-Rungs 2/3/5 (QUIC, REALITY/Shadowsocks-2022, WG-over-TCP) are Tier 2 in the
-research roadmap. `AdapterFactory.implementedRungs` lists what actually exists;
-requesting any other rung throws `rungNotImplemented` rather than silently
-substituting a different transport.
+## Rung status
+All seven rungs exist: rungs 1–5 and 7 as packet-tunnel adapters over the
+boringtun core, rung 6 as a kernel IKEv2 profile.
+`AdapterFactory.implementedRungs` is the source of truth — requesting anything
+outside it throws `rungNotImplemented` rather than silently substituting a
+different transport. Rungs 3 and 4 additionally need a TLS certificate on the
+server before `sweepbridge` will serve them.
 
 ## Blockers that need a human
 1. **Apple Developer account.** The `packet-tunnel-provider` entitlement, an App
