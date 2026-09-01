@@ -43,6 +43,13 @@ public struct Server: Codable, Sendable, Equatable, Identifiable {
     /// Server operator, shown so the user knows whose hardware they are on.
     public var provider: String?
     public var cityName: String?
+    /// Device key issued by a commercial operator that registers keys per
+    /// config (Proton, for one), base64. Nil for your own machines, which all
+    /// share the device key generated on this device.
+    ///
+    /// A bundle carrying these must never be hosted — `sweep-sign` refuses to
+    /// sign one without `--local-only` for exactly that reason.
+    public var devicePrivateKey: String?
 
     public init(id: ServerID, name: String, countryCode: String, jurisdictionPenalty: Double = 0,
                 publicKey: String, endpoints: [ServerEndpoint], dnsServers: [String],
@@ -50,7 +57,7 @@ public struct Server: Codable, Sendable, Equatable, Identifiable {
                 ipv4Address: String, ipv6Address: String? = nil,
                 load: Double = 0, reliability: Double = 1,
                 requiresAccount: Bool = false, provider: String? = nil,
-                cityName: String? = nil) {
+                cityName: String? = nil, devicePrivateKey: String? = nil) {
         self.id = id; self.name = name; self.countryCode = countryCode
         self.jurisdictionPenalty = jurisdictionPenalty; self.publicKey = publicKey
         self.endpoints = endpoints; self.dnsServers = dnsServers
@@ -58,6 +65,7 @@ public struct Server: Codable, Sendable, Equatable, Identifiable {
         self.ipv4Address = ipv4Address; self.ipv6Address = ipv6Address
         self.load = load; self.reliability = reliability
         self.requiresAccount = requiresAccount; self.provider = provider
+        self.devicePrivateKey = devicePrivateKey
         self.cityName = cityName
     }
 

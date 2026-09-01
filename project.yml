@@ -22,10 +22,10 @@ targets:
     resources:
       - path: Apps/Shared/sweep-config.sig.json
         optional: true
-    entitlements: { path: Apps/iOS/App.entitlements }
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sweep.vpn.ios
+        CODE_SIGN_ENTITLEMENTS: Apps/iOS/App.entitlements
         INFOPLIST_FILE: Apps/iOS/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         MARKETING_VERSION: "1.0"
@@ -44,10 +44,10 @@ targets:
     type: app-extension
     platform: iOS
     sources: [Apps/iOSTunnel, Apps/Shared]
-    entitlements: { path: Apps/iOSTunnel/Tunnel.entitlements }
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sweep.vpn.ios.tunnel
+        CODE_SIGN_ENTITLEMENTS: Apps/iOSTunnel/Tunnel.entitlements
         INFOPLIST_FILE: Apps/iOSTunnel/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         MARKETING_VERSION: "1.0"
@@ -66,10 +66,10 @@ targets:
     resources:
       - path: Apps/Shared/sweep-config.sig.json
         optional: true
-    entitlements: { path: Apps/macOS/App.entitlements }
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sweep.vpn.mac
+        CODE_SIGN_ENTITLEMENTS: Apps/macOS/App.entitlements
         INFOPLIST_FILE: Apps/macOS/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         MARKETING_VERSION: "1.0"
@@ -89,10 +89,10 @@ targets:
     type: app-extension
     platform: macOS
     sources: [Apps/macOSFilter, Apps/Shared]
-    entitlements: { path: Apps/macOSFilter/Filter.entitlements }
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sweep.vpn.mac.filter
+        CODE_SIGN_ENTITLEMENTS: Apps/macOSFilter/Filter.entitlements
         INFOPLIST_FILE: Apps/macOSFilter/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         MARKETING_VERSION: "1.0"
@@ -107,10 +107,10 @@ targets:
     type: app-extension
     platform: macOS
     sources: [Apps/macOSTunnel, Apps/Shared]
-    entitlements: { path: Apps/macOSTunnel/Tunnel.entitlements }
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sweep.vpn.mac.tunnel
+        CODE_SIGN_ENTITLEMENTS: Apps/macOSTunnel/Tunnel.entitlements
         INFOPLIST_FILE: Apps/macOSTunnel/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         MARKETING_VERSION: "1.0"

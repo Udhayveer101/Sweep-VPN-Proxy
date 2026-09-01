@@ -132,7 +132,9 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         guard !enabled.isEmpty else { throw AdapterFactoryError.rungNotImplemented(.wireGuardUDP) }
         let engine = AutoModeEngine(preference: preference, enabledRungs: enabled)
 
-        let privateKey = try store.devicePrivateKey().rawRepresentation.base64EncodedString()
+        // Operators that register a key per config ship it in the bundle; our
+        // own machines all use the one key generated on this device.
+        let deviceKey = try store.devicePrivateKey().rawRepresentation.base64EncodedString()
         let signals = currentSignals()
         lastSignals = signals
         let keepalive = KeepalivePolicy.interval(isExpensive: signals.isExpensive,
@@ -142,7 +144,8 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         let coordinator = ConnectionCoordinator(
             engine: engine, catalog: catalog, memory: memory,
             build: { rung, server in
-                try AdapterFactory.make(rung: rung, server: server, privateKeyBase64: privateKey,
+                try AdapterFactory.make(rung: rung, server: server,
+                                        privateKeyBase64: server.devicePrivateKey ?? deviceKey,
                                         presharedKeyBase64: nil, keepalive: keepalive)
             },
             callbacks: .init(

@@ -159,6 +159,75 @@ func importMullvad(limit: Int?, countries: Set<String>, from path: String?) thro
     return servers
 }
 
+// MARK: - WireGuard .conf import (Proton VPN and anything else that emits one)
+
+/// Parse a standard WireGuard config. Operators like Proton hand these out per
+/// server, each with the device key they registered, so the key travels with
+/// the server rather than being generated on the device.
+func importWireGuardConf(_ path: String) throws -> Server {
+    let text = try String(contentsOfFile: path, encoding: .utf8)
+    var section = ""
+    var f: [String: String] = [:]
+    var peerName: String?
+
+    for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        if line.hasPrefix("[") {
+            section = line.lowercased()
+            continue
+        }
+        // Proton names the server in a comment above the peer: "# NL-FREE#1".
+        if line.hasPrefix("#") {
+            let comment = line.dropFirst().trimmingCharacters(in: .whitespaces)
+            if section.contains("peer"), peerName == nil, !comment.isEmpty,
+               !comment.lowercased().contains("=") {
+                peerName = comment
+            }
+            continue
+        }
+        guard let eq = line.firstIndex(of: "=") else { continue }
+        let key = line[..<eq].trimmingCharacters(in: .whitespaces).lowercased()
+        let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+        f[section.contains("peer") ? "peer.\(key)" : "iface.\(key)"] = value
+    }
+
+    guard let priv = f["iface.privatekey"], !priv.isEmpty else {
+        throw NSError(domain: "wg", code: 1, userInfo: [NSLocalizedDescriptionKey:
+            "\(path): no PrivateKey in [Interface]"])
+    }
+    guard let pub = f["peer.publickey"], let endpoint = f["peer.endpoint"] else {
+        throw NSError(domain: "wg", code: 2, userInfo: [NSLocalizedDescriptionKey:
+            "\(path): no PublicKey/Endpoint in [Peer]"])
+    }
+    // Endpoint is host:port; an IPv6 literal is bracketed.
+    guard let colon = endpoint.lastIndex(of: ":"),
+          let port = UInt16(endpoint[endpoint.index(after: colon)...]) else {
+        throw NSError(domain: "wg", code: 3, userInfo: [NSLocalizedDescriptionKey:
+            "\(path): could not parse Endpoint '\(endpoint)'"])
+    }
+    let host = String(endpoint[..<colon]).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+
+    let addresses = (f["iface.address"] ?? "").split(separator: ",").map {
+        $0.trimmingCharacters(in: .whitespaces)
+    }
+    let v4 = addresses.first { !$0.contains(":") }?.split(separator: "/").first.map(String.init)
+    let v6 = addresses.first { $0.contains(":") }?.split(separator: "/").first.map(String.init)
+    let dns = (f["iface.dns"] ?? "").split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+
+    let name = peerName ?? URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+    // Proton encodes the country in the peer name ("NL-FREE#1", "JP#12").
+    let cc = String(name.prefix(2)).uppercased()
+    let country = cc.allSatisfy { $0.isLetter } ? cc : "XX"
+
+    return Server(id: name, name: name, countryCode: country, publicKey: pub,
+                  endpoints: [.init(host: host, port: port, rung: .wireGuardUDP)],
+                  dnsServers: dns.isEmpty ? ["1.1.1.1"] : dns,
+                  ipv4Address: v4 ?? "10.2.0.2", ipv6Address: v6,
+                  provider: "Proton VPN", cityName: nil,
+                  devicePrivateKey: priv)
+}
+
 // MARK: - Commands
 
 let args = Array(CommandLine.arguments.dropFirst())
@@ -199,6 +268,30 @@ do {
         print("imported \(servers.count) relays across \(Set(servers.map(\.countryCode)).count) countries")
         print("NOTE: these are marked requiresAccount — they carry traffic only for a device key")
         print("      registered with that operator. Your own servers stay the default.")
+
+    case "import-wireguard":
+        guard args.count >= 3 else {
+            die("usage: sweep-catalog import-wireguard <out.json> <config.conf>…")
+        }
+        let confs = Array(args.dropFirst(2))
+        var servers: [Server] = []
+        var seen = Set<ServerID>()
+        for path in confs {
+            let s = try importWireGuardConf(path)
+            guard seen.insert(s.id).inserted else {
+                print("skipping duplicate \(s.id)"); continue
+            }
+            servers.append(s)
+        }
+        guard !servers.isEmpty else { die("no usable configs") }
+        let now = Date()
+        let out = ConfigBundle(version: UInt64(now.timeIntervalSince1970), issuedAt: now,
+                               expiresAt: now.addingTimeInterval(90 * 86_400),
+                               minimumAppBuild: 1, servers: servers,
+                               enabledRungs: ProtocolRung.allCases)
+        try encoder.encode(out).write(to: URL(fileURLWithPath: args[1]), options: .atomic)
+        print("imported \(servers.count) server(s) across \(Set(servers.map(\.countryCode)).count) countries")
+        print("NOTE: these carry per-config device keys — sign with --local-only and never host the bundle.")
 
     case "merge":
         guard args.count >= 3 else { die("usage: sweep-catalog merge <in.json>… <out.json>") }

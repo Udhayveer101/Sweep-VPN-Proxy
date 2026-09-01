@@ -39,12 +39,23 @@ case "pubkey":
     print(key.publicKey.rawRepresentation.base64EncodedString())
 
 case "sign":
-    guard args.count == 4 else { die("usage: sweep-sign sign <private.key> <in.json> <out.sig.json>") }
+    guard args.count >= 4 else { die("usage: sweep-sign sign <private.key> <in.json> <out.sig.json> [--local-only]") }
     let key = try Curve25519.Signing.PrivateKey(
         rawRepresentation: try Data(contentsOf: URL(fileURLWithPath: args[1])))
     let bundle = try ConfigVerifier.decoder()
         .decode(ConfigBundle.self, from: try Data(contentsOf: URL(fileURLWithPath: args[2])))
     guard !bundle.servers.isEmpty else { die("refusing to sign a bundle with no servers") }
+    // A bundle holding per-config device keys grants tunnel access to anyone who
+    // downloads it. Signing one is fine for a build that embeds it in the app;
+    // publishing it is not, so the intent has to be stated.
+    let withKeys = bundle.servers.filter { $0.devicePrivateKey != nil }
+    if !withKeys.isEmpty && !args.contains("--local-only") {
+        die("""
+            refusing to sign: \(withKeys.count) server(s) carry a device private key.
+            Such a bundle must be embedded in the app, never hosted at SWEEP_CONFIG_URL.
+            Re-run with --local-only if you are embedding it.
+            """)
+    }
     guard bundle.expiresAt > Date() else { die("refusing to sign an already-expired bundle") }
     let signed = try ConfigVerifier.sign(bundle, with: key)
     try IPCCodec.encode(signed).write(to: URL(fileURLWithPath: args[3]), options: [.atomic])
