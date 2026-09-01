@@ -15,7 +15,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FLEET_DIR="$ROOT/fleet"
 FLEET="$FLEET_DIR/fleet.json"
 SIGNING_KEY="$ROOT/sweep-config.key"
-SIGNED="$ROOT/Apps/Shared/sweep-config.sig.json"
+SIGNED="$ROOT/Config/sweep-config.sig.json"
 
 die() { echo "error: $*" >&2; exit 1; }
 

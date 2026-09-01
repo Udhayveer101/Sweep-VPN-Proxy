@@ -18,10 +18,21 @@ targets:
   SweepVPN-iOS:
     type: application
     platform: iOS
-    sources: [Apps/iOS, Apps/Shared]
-    resources:
-      - path: Apps/Shared/sweep-config.sig.json
-        optional: true
+    sources:
+      - Apps/iOS
+      - Apps/Shared
+    postBuildScripts:
+      - name: Embed signed config bundle if one exists
+        basedOnDependencyAnalysis: false
+        script: |
+          SRC="$SRCROOT/Config/sweep-config.sig.json"
+          DEST="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+          if [ -f "$SRC" ]; then
+            mkdir -p "$DEST" && cp "$SRC" "$DEST/"
+            echo "embedded signed config bundle"
+          else
+            echo "no signed bundle yet - app will show the setup guide"
+          fi
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sweep.vpn.ios
@@ -60,12 +71,23 @@ targets:
   SweepVPN-macOS:
     type: application
     platform: macOS
-    sources: [Apps/macOS, Apps/Shared]
     # A personal build carries its own signed bundle instead of hosting one.
-    # `optional: true` keeps the build working before the first fleet is signed.
-    resources:
-      - path: Apps/Shared/sweep-config.sig.json
-        optional: true
+    # `optional` keeps a fresh clone building before any bundle is signed.
+    sources:
+      - Apps/macOS
+      - Apps/Shared
+    postBuildScripts:
+      - name: Embed signed config bundle if one exists
+        basedOnDependencyAnalysis: false
+        script: |
+          SRC="$SRCROOT/Config/sweep-config.sig.json"
+          DEST="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+          if [ -f "$SRC" ]; then
+            mkdir -p "$DEST" && cp "$SRC" "$DEST/"
+            echo "embedded signed config bundle"
+          else
+            echo "no signed bundle yet - app will show the setup guide"
+          fi
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sweep.vpn.mac

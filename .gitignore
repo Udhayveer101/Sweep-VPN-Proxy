@@ -5,4 +5,4 @@ DerivedData/
 DataPlane/sweepwg/fat/
 *.key
 fleet/
-Apps/Shared/sweep-config.sig.json
+Config/sweep-config.sig.json
