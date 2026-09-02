@@ -3,9 +3,13 @@ import XCTest
 
 final class ProtocolLadderTests: XCTestCase {
     func testLadderIsOrderedAndComplete() {
-        XCTAssertEqual(ProtocolRung.allCases.map(\.rawValue), Array(1...7))
+        XCTAssertEqual(ProtocolRung.allCases.map(\.rawValue), Array(1...9))
         XCTAssertEqual(ProtocolRung.allCases.first, .wireGuardUDP)
-        XCTAssertEqual(ProtocolRung.allCases.last, .wireGuardTCP)
+        XCTAssertEqual(ProtocolRung.allCases.last, .openVPNTCP)
+        // The ladder proper — what Automatic will walk — is the WireGuard rungs.
+        // The two OpenVPN rungs sit below it and are opt-in only.
+        XCTAssertEqual(ProtocolRung.allCases.filter(\.isOwnWireGuardTunnel).map(\.rawValue),
+                       Array(1...7))
     }
 
     func testEveryNetworkFailureModeHasAnAnswer() {
@@ -73,8 +77,10 @@ final class ProtocolLadderTests: XCTestCase {
             rung = next
             seen.append(next)
         }
-        XCTAssertEqual(seen.count, ProtocolRung.allCases.count,
-                       "every rung should be tried before the ladder bottoms out: \(seen)")
+        XCTAssertEqual(seen.count, ProtocolRung.allCases.filter(\.isOwnWireGuardTunnel).count,
+                       "every own-tunnel rung should be tried before the ladder bottoms out, "
+                       + "and no third-party relay rung should ever be walked onto: \(seen)")
+        XCTAssertTrue(seen.allSatisfy(\.isOwnWireGuardTunnel))
         XCTAssertEqual(seen.last, .wireGuardTCP)
     }
 }

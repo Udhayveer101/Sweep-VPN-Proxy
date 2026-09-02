@@ -6,3 +6,4 @@ DataPlane/sweepwg/fat/
 *.key
 fleet/
 Config/sweep-config.sig.json
+Config/*.bak

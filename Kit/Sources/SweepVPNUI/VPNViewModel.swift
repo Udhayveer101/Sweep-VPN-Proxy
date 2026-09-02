@@ -29,7 +29,7 @@ public final class VPNViewModel: ObservableObject {
     /// modifiers sit on the same view — they fight, and the wrong one wins — so
     /// there is a single presentation slot rather than a bool per screen.
     public enum Sheet: String, Identifiable, Sendable {
-        case settings, serverPicker, setupGuide, onboarding
+        case settings, serverPicker, publicRelays, setupGuide, onboarding
         public var id: String { rawValue }
     }
     @Published public var activeSheet: Sheet?
@@ -46,6 +46,27 @@ public final class VPNViewModel: ObservableObject {
     @Published public private(set) var selectedServerID: ServerID?
     /// Servers that need an operator account are hidden until the user opts in.
     @Published public var showAccountOnlyServers = false
+
+    // MARK: - VPN Gate public relays
+
+    /// Third-party OpenVPN relays from the VPN Gate public list. Kept in their
+    /// own property, not merged into `servers`, because they come from a
+    /// different trust world: unsigned, volunteer-run, and not something
+    /// `Automatic` will ever select. The user opts in to seeing them.
+    @Published public private(set) var relays: [Server] = []
+    @Published public var showPublicRelays = false
+    @Published public private(set) var relaysFetchedAt: Date?
+    @Published public private(set) var relayStatus: String?
+    @Published public private(set) var isRefreshingRelays = false
+    @Published public private(set) var isProbingRelays = false
+    /// Measured RTT per relay, filled in by `probeRelays`.
+    @Published public private(set) var relayProbes: [ServerID: ServerProbe] = [:]
+
+    /// Optional user-supplied mirror for the relay list, for networks whose
+    /// filter blocks vpngate.net by category (an Indian residential ISP returns
+    /// a 403 block page for it).
+    @Published public var relaySourceURL: String = UserDefaults.standard
+        .string(forKey: "sweep.relaySource") ?? ""
 
     #if os(macOS)
     @Published public private(set) var torState: TorController.State = .stopped
@@ -392,6 +413,79 @@ public final class VPNViewModel: ObservableObject {
             serverName = catalog.fastest(includeAccountRequired: showAccountOnlyServers)?.name
         }
         recompute()
+    }
+
+    // MARK: - Public relays
+
+    /// Relays ordered the way the user asked for: fastest measured first, then
+    /// everything unmeasured. Reuses `ServerCatalog` so relays are scored by
+    /// exactly the same rules as our own servers.
+    public var rankedRelays: [(Server, ServerProbe?)] {
+        ServerCatalog(servers: relays, probes: relayProbes,
+                      rungs: [.openVPNUDP, .openVPNTCP]).ranked()
+    }
+
+    /// Countries present in the fetched list, for the picker's filter.
+    public var relayCountries: [String] {
+        Array(Set(relays.map(\.countryCode))).sorted()
+    }
+
+    public func loadCachedRelays() {
+        let fetcher = VPNGateFetcher(customSource: customRelaySource())
+        guard let cache = fetcher.cache() else { return }
+        relays = cache.servers
+        relaysFetchedAt = cache.fetchedAt
+    }
+
+    private func customRelaySource() -> URL? {
+        let trimmed = relaySourceURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return URL(string: trimmed)
+    }
+
+    public func refreshRelays() async {
+        guard !isRefreshingRelays else { return }
+        isRefreshingRelays = true
+        relayStatus = nil
+        UserDefaults.standard.set(relaySourceURL, forKey: "sweep.relaySource")
+        defer { isRefreshingRelays = false }
+
+        let fetcher = VPNGateFetcher(customSource: customRelaySource())
+        do {
+            let fetched = try await fetcher.refresh()
+            relays = fetched
+            relaysFetchedAt = fetcher.cache()?.fetchedAt ?? Date()
+            relayStatus = "\(fetched.count) relays in \(Set(fetched.map(\.countryCode)).count) countries"
+        } catch VPNGateFetcher.FetchError.allSourcesFailed(let status) {
+            // Naming the block page explicitly, because "couldn't connect" sends
+            // the user looking for the wrong problem.
+            relayStatus = status == 403
+                ? "Blocked on this network (HTTP 403). Set a mirror URL below and try again."
+                : "Could not reach the VPN Gate list. Set a mirror URL below and try again."
+        } catch {
+            relayStatus = "Could not read the relay list: \(error)"
+        }
+    }
+
+    /// Measure every relay so "fastest" means measured-fastest rather than
+    /// advertised-fastest. The probe is a connect to the relay's own port —
+    /// nothing is sent to any third-party latency service.
+    public func probeRelays(limit: Int = 80) async {
+        guard !isProbingRelays, !relays.isEmpty else { return }
+        isProbingRelays = true
+        defer { isProbingRelays = false }
+
+        // Probing several hundred hosts at once is what makes a network stack
+        // start dropping connections and report healthy servers as dead, so
+        // this takes the most promising slice rather than the whole list.
+        let targets = Array(rankedRelays.map(\.0).prefix(limit))
+        let prober = ServerProber(timeout: 2.0, samples: 2)
+        let results: [ServerProber.Result] = await withCheckedContinuation { continuation in
+            prober.probe(targets, rungs: [.openVPNUDP, .openVPNTCP]) { continuation.resume(returning: $0) }
+        }
+        for result in results { relayProbes[result.id] = result.probe }
+        let reachable = results.filter { $0.probe.lossFraction < 1 }.count
+        relayStatus = "Measured \(results.count) relays — \(reachable) answered"
     }
 
     public let automaticID: ServerID = "__automatic__"

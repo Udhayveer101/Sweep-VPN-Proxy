@@ -37,6 +37,12 @@ public enum TransportFactory {
             return ShadowsocksTransport(host: host, port: port, key: secret)
         case .ikev2:
             throw AdapterFactoryError.rungNotImplemented(.ikev2)   // kernel profile, not a transport
+        case .openVPNUDP, .openVPNTCP:
+            // OpenVPN is not a transport carrying our WireGuard tunnel — it is
+            // its own protocol and needs its own client. Until that data plane
+            // exists, the rung fails loudly here rather than quietly resolving
+            // to something that is not OpenVPN.
+            throw AdapterFactoryError.rungNotImplemented(rung)
         }
     }
 

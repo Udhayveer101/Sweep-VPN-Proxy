@@ -206,6 +206,12 @@ public struct ServerPickerView: View {
                 .multilineTextAlignment(.center)
             Button("How to finish setup") { model.activeSheet = .setupGuide }
                 .buttonStyle(.borderedProminent)
+            Button("Browse public relays") { model.activeSheet = .publicRelays }
+                .buttonStyle(.bordered)
+            Text("Public relays are volunteer-run and can log you. They are a way around a "
+                 + "blocked site, not a substitute for a server of your own.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
         }
         .padding(28)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -246,6 +252,13 @@ public struct ServerPickerView: View {
                 .font(.callout)
             Text("Imported public relay lists are measurable but only carry traffic once this device's key is registered with that operator.")
                 .font(.caption).foregroundStyle(.secondary)
+            Divider()
+            Button {
+                model.activeSheet = .publicRelays
+            } label: {
+                Label("Browse public relays (VPN Gate)", systemImage: "antenna.radiowaves.left.and.right")
+            }
+            .buttonStyle(.bordered)
         }
         .padding(16)
     }

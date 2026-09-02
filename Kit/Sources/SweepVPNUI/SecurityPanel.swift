@@ -60,6 +60,14 @@ public struct SecurityPanel: View {
             return ("Diffie-Hellman group 20 (ECP-384)",
                     "AES-256-GCM",
                     "Certificate, mutual")
+        case .openVPNUDP, .openVPNTCP:
+            // The one rung with real cipher agility, and the weakest: the relay
+            // picks, and a VPN Gate profile typically asks for AES-128-CBC with
+            // SHA1. The client cert is shared by every VPN Gate user, so it
+            // authenticates the relay to you and nothing about you to it.
+            return ("TLS, relay's choice of parameters",
+                    "Negotiated by the relay (VPN Gate profiles ask for AES-128-CBC)",
+                    "Shared VPN Gate client certificate — not unique to you")
         }
     }
 

@@ -27,10 +27,20 @@ public final class ServerProber: @unchecked Sendable {
     /// Probe several servers concurrently; completion carries whatever finished.
     public func probe(_ servers: [Server], rung: ProtocolRung,
                       completion: @escaping @Sendable ([Result]) -> Void) {
+        probe(servers, rungs: [rung], completion: completion)
+    }
+
+    /// Probe each server on whichever of `rungs` it actually offers. A mixed
+    /// list — our own WireGuard peers next to OpenVPN relays — has no single
+    /// rung to measure on, and measuring a relay on a port it does not listen
+    /// on would score it as dead rather than slow.
+    public func probe(_ servers: [Server], rungs: Set<ProtocolRung>,
+                      completion: @escaping @Sendable ([Result]) -> Void) {
         let group = DispatchGroup()
         let collector = Collector()
         for server in servers {
-            guard let endpoint = server.endpoints.first(where: { $0.rung == rung })
+            let preferred = server.bestRung(in: rungs)
+            guard let endpoint = server.endpoints.first(where: { $0.rung == preferred })
                     ?? server.endpoints.first else { continue }
             group.enter()
             measure(endpoint: endpoint) { probe in

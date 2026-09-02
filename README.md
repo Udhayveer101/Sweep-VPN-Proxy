@@ -42,11 +42,20 @@ xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-iOS -sdk iphonesimulator
 | 5 | Shadowsocks-2022, TCP | active probing (no plaintext handshake) |
 | 6 | IKEv2 (kernel) | low power, no extension process |
 | 7 | WireGuard over TCP :443 | last resort |
+| 8 | OpenVPN / UDP | reaching a VPN Gate public relay |
+| 9 | OpenVPN / TCP :443 | same, on UDP-blocked networks |
 
-Every rung carries the *same* unmodified WireGuard tunnel — a fallback changes
+Rungs 1–7 carry the *same* unmodified WireGuard tunnel — a fallback changes
 the envelope, never the cryptography. `Automatic` races a diverse set (preferred
 + UDP-block survivor + web-shaped), commits only once a peer authenticates, walks
 down on failure and remembers per network what worked.
+
+Rungs 8–9 are **not** part of that ladder. OpenVPN is a different protocol with
+different crypto, terminating on a volunteer's machine whose key is not ours, so
+`Automatic` filters them out entirely (`ProtocolRung.isOwnWireGuardTunnel`) and
+they are reachable only by picking a relay by hand. The data plane for them is
+not built yet: `AdapterFactory.implementedRungs` excludes them, so selecting one
+fails loudly rather than pretending.
 
 Server side: `Server/sweepbridge` (Rust) terminates TCP/TLS/QUIC and relays to
 wg0; rung 5 needs only a stock `ssserver`.
@@ -56,6 +65,29 @@ wg0; rung 5 needs only a stock `ssserver`.
 import of a public relay list (marked `requiresAccount`). The app measures RTT
 itself and orders the list **Automatic → fastest server (pinned) → the rest,
 fastest to slowest**, re-evaluated on every measurement and on network change.
+
+## Public relays (VPN Gate)
+
+`VPNGate.parseCSV` reads the public list at `vpngate.net/api/iphone/` — a few
+hundred volunteer-run OpenVPN relays — and `PublicRelayPickerView` measures them
+from this device and orders them fastest first. They are kept out of the signed
+bundle on purpose: that list is vouched for by your offline key, and a
+third-party CSV cannot be. See the header comment in `VPNGateFetcher` for why
+they get their own cache instead.
+
+Two things to know before relying on them:
+
+- **The operator sees your traffic.** A relay terminates it in plaintext, and
+  the `LogType` column is that operator's own unverifiable claim about what they
+  keep. The picker shows it per row.
+- **You cannot connect to one yet.** The OpenVPN data plane is not built, so the
+  list is browsable and measurable but selecting a relay reports
+  `rungNotImplemented`. That is deliberate — see the ladder note above.
+
+If your ISP blocks `vpngate.net` by category (Indian residential ISPs return a
+403 block page), set a mirror URL in the picker. A Cloudflare Worker that
+fetches the CSV and returns it is about fifteen lines and is reachable from a
+domain no category filter knows.
 
 ## What ships (Tier 1)
 - Rungs 1–5 and 7 in the packet tunnel (boringtun core), rung 6 as a kernel profile.

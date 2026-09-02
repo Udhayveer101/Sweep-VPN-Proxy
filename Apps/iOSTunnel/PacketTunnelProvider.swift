@@ -11,4 +11,10 @@ final class PacketTunnelProvider: SweepPacketTunnelProvider {
     override var configStore: ConfigStore? { try? AppConfig.makeConfigStore() }
 
     override var appBuild: Int { AppConfig.appBuild }
+
+    /// Shared with the app so the failed-start streak survives this process
+    /// being torn down and restarted by on-demand.
+    override var backoffStore: StartBackoffStore? {
+        StartBackoffStore(appGroup: AppConfig.appGroup)
+    }
 }

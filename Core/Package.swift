@@ -7,6 +7,7 @@ let package = Package(
     products: [.library(name: "SweepVPNCore", targets: ["SweepVPNCore"])],
     targets: [
         .target(name: "SweepVPNCore"),
-        .testTarget(name: "SweepVPNCoreTests", dependencies: ["SweepVPNCore"]),
+        .testTarget(name: "SweepVPNCoreTests", dependencies: ["SweepVPNCore"],
+                    resources: [.copy("Fixtures")]),
     ]
 )

@@ -361,11 +361,14 @@ final class PostQuantumTests: XCTestCase {
     }
 
     /// Every WireGuard rung carries the same tunnel, so the hybrid PSK applies
-    /// to all of them; only the kernel IKEv2 rung has no PQ story.
+    /// to all of them; the kernel IKEv2 rung has no PQ story, and the OpenVPN
+    /// rungs are not our tunnel at all — their crypto is the relay's, not ours.
     func testEveryWireGuardRungCarriesPQAndIKEv2DoesNot() {
-        for rung in ProtocolRung.allCases where rung != .ikev2 {
+        for rung in ProtocolRung.allCases where rung != .ikev2 && rung.isOwnWireGuardTunnel {
             XCTAssertTrue(rung.supportsHybridPQ, "\(rung) should carry the hybrid PSK")
         }
         XCTAssertFalse(ProtocolRung.ikev2.supportsHybridPQ)
+        XCTAssertFalse(ProtocolRung.openVPNUDP.supportsHybridPQ)
+        XCTAssertFalse(ProtocolRung.openVPNTCP.supportsHybridPQ)
     }
 }

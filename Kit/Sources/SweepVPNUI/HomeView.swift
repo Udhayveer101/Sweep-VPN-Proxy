@@ -27,6 +27,7 @@ public struct HomeView: View {
             switch sheet {
             case .settings:     SettingsView(model: model)
             case .serverPicker: ServerPickerView(model: model)
+            case .publicRelays: PublicRelayPickerView(model: model)
             case .setupGuide:   SetupGuideView(model: model)
             case .onboarding:   OnboardingView(model: model).interactiveDismissDisabled()
             }

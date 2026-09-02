@@ -23,6 +23,18 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
     case ikev2 = 6
     /// Last resort: WireGuard framed on plain TCP/443, TCP-over-TCP accepted.
     case wireGuardTCP = 7
+    /// OpenVPN over UDP. Unlike every rung above, this is *not* our WireGuard
+    /// tunnel in a different envelope — it is a different protocol with different
+    /// crypto, reachable on third-party relays (VPN Gate) whose keys we do not
+    /// control. Ranked last because of that, never because it is slow.
+    case openVPNUDP = 8
+    /// OpenVPN over TCP, usually :443. Same caveat as `openVPNUDP`.
+    case openVPNTCP = 9
+
+    /// Rungs that carry our own WireGuard tunnel to a peer whose key we hold.
+    /// Everything outside this set is a third-party relay: the operator can see
+    /// plaintext where our own servers cannot.
+    public var isOwnWireGuardTunnel: Bool { self != .openVPNUDP && self != .openVPNTCP }
 
     public static func < (a: ProtocolRung, b: ProtocolRung) -> Bool { a.rawValue < b.rawValue }
 
@@ -31,7 +43,7 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
 
     public var isUDP: Bool {
         switch self {
-        case .wireGuardUDP, .wireGuardUDP443, .wireGuardQUIC, .ikev2: return true
+        case .wireGuardUDP, .wireGuardUDP443, .wireGuardQUIC, .ikev2, .openVPNUDP: return true
         default: return false
         }
     }
@@ -47,7 +59,7 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
 
     /// Only the WireGuard rungs can carry the ML-KEM-768 hybrid PSK; IKEv2 has
     /// no PQ story on Apple's stack.
-    public var supportsHybridPQ: Bool { self != .ikev2 }
+    public var supportsHybridPQ: Bool { isOwnWireGuardTunnel && self != .ikev2 }
 
     /// Rough cost ranking used for battery-aware tie-breaks (1 = cheapest).
     public var overheadRank: Int {
@@ -58,6 +70,8 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
         case .shadowsocks2022: return 4
         case .wireGuardTLS: return 5
         case .wireGuardTCP: return 6
+        case .openVPNUDP: return 4
+        case .openVPNTCP: return 6
         }
     }
 
@@ -70,6 +84,8 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
         case .shadowsocks2022: return "Shadowsocks 2022"
         case .ikev2: return "IKEv2 (low power)"
         case .wireGuardTCP: return "WireGuard over TCP"
+        case .openVPNUDP: return "OpenVPN (UDP)"
+        case .openVPNTCP: return "OpenVPN (TCP)"
         }
     }
 
@@ -82,6 +98,8 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
         case .shadowsocks2022: return "SS2022"
         case .ikev2: return "IKEv2"
         case .wireGuardTCP: return "WG/TCP"
+        case .openVPNUDP: return "OVPN/UDP"
+        case .openVPNTCP: return "OVPN/TCP"
         }
     }
 }
@@ -99,7 +117,10 @@ public enum ProtocolPreference: Equatable, Hashable, Codable, Sendable {
     public func permittedRungs(enabledTiers: Set<ProtocolRung>) -> [ProtocolRung] {
         let all = ProtocolRung.allCases.filter(enabledTiers.contains)
         switch self {
-        case .automatic: return all
+        // Automatic walks our own tunnel only. An OpenVPN relay is somebody
+        // else's machine terminating your plaintext, so it is never something
+        // the ladder falls onto on its own — it takes an explicit choice.
+        case .automatic: return all.filter(\.isOwnWireGuardTunnel)
         case .fast: return all.filter { $0 == .wireGuardUDP || $0 == .wireGuardUDP443 }
         case .stealth: return all.filter(\.looksLikeWeb)
         case .lowPower: return all.filter { $0 == .ikev2 }

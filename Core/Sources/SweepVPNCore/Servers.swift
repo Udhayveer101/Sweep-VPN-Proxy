@@ -55,6 +55,11 @@ public struct Server: Codable, Sendable, Equatable, Identifiable {
     /// A bundle carrying these must never be hosted — `sweep-sign` refuses to
     /// sign one without `--local-only` for exactly that reason.
     public var devicePrivateKey: String?
+    /// The operator's own declaration of what they log, where they publish one
+    /// (VPN Gate relays do). Unverifiable and shown as a claim, never as a
+    /// guarantee — but a relay that admits to two weeks of logs is something
+    /// the user is entitled to see before picking it.
+    public var logPolicy: String?
 
     public init(id: ServerID, name: String, countryCode: String, jurisdictionPenalty: Double = 0,
                 publicKey: String, endpoints: [ServerEndpoint], dnsServers: [String],
@@ -62,7 +67,8 @@ public struct Server: Codable, Sendable, Equatable, Identifiable {
                 ipv4Address: String, ipv6Address: String? = nil,
                 load: Double = 0, reliability: Double = 1,
                 requiresAccount: Bool = false, provider: String? = nil,
-                cityName: String? = nil, devicePrivateKey: String? = nil) {
+                cityName: String? = nil, devicePrivateKey: String? = nil,
+                logPolicy: String? = nil) {
         self.id = id; self.name = name; self.countryCode = countryCode
         self.jurisdictionPenalty = jurisdictionPenalty; self.publicKey = publicKey
         self.endpoints = endpoints; self.dnsServers = dnsServers
@@ -72,9 +78,22 @@ public struct Server: Codable, Sendable, Equatable, Identifiable {
         self.requiresAccount = requiresAccount; self.provider = provider
         self.devicePrivateKey = devicePrivateKey
         self.cityName = cityName
+        self.logPolicy = logPolicy
+    }
+
+    /// True when this is a third-party relay rather than a peer whose key we
+    /// hold. Drives the trust badge in the list.
+    public var isThirdPartyRelay: Bool {
+        !endpoints.isEmpty && endpoints.allSatisfy { !$0.rung.isOwnWireGuardTunnel }
     }
 
     public func supports(_ rung: ProtocolRung) -> Bool { endpoints.contains { $0.rung == rung } }
+
+    /// The most-preferred rung this server offers out of `rungs`, or nil if it
+    /// offers none of them. Preference is the ladder's own order.
+    public func bestRung(in rungs: Set<ProtocolRung>) -> ProtocolRung? {
+        endpoints.map(\.rung).filter(rungs.contains).min()
+    }
 }
 
 public struct ServerProbe: Sendable, Equatable {
@@ -126,7 +145,14 @@ public enum ServerScoring {
 
     /// Hard gates run before scoring — a gated server is never selected.
     public static func isEligible(_ s: Server, _ p: ServerProbe, rung: ProtocolRung) -> Bool {
-        guard s.supports(rung) else { return false }
+        isEligible(s, p, rungs: [rung])
+    }
+
+    /// The catalog ranks against every rung the user currently has available,
+    /// not just the live one: a relay that only speaks OpenVPN still belongs in
+    /// the list the user is choosing from.
+    public static func isEligible(_ s: Server, _ p: ServerProbe, rungs: Set<ProtocolRung>) -> Bool {
+        guard s.bestRung(in: rungs) != nil else { return false }
         guard s.jurisdictionPenalty.isFinite else { return false }
         guard p.lossFraction <= maxLoss, p.rttMs <= maxRttMs else { return false }
         return true
@@ -190,15 +216,27 @@ public enum ServerListEntry: Equatable, Sendable, Identifiable {
 public struct ServerCatalog: Sendable, Equatable {
     public private(set) var servers: [Server]
     public private(set) var probes: [ServerID: ServerProbe]
-    /// Rung the ranking is for — a server that cannot serve the active rung is
+    /// Rungs the ranking is for — a server that can serve none of them is
     /// ineligible however fast it pings.
-    public var rung: ProtocolRung
+    public var rungs: Set<ProtocolRung>
+
+    /// The most-preferred rung in scope. Kept for callers that still think in
+    /// terms of a single live rung.
+    public var rung: ProtocolRung {
+        get { rungs.min() ?? .wireGuardUDP }
+        set { rungs = [newValue] }
+    }
 
     public init(servers: [Server] = [], probes: [ServerID: ServerProbe] = [:],
                 rung: ProtocolRung = .wireGuardUDP) {
+        self.init(servers: servers, probes: probes, rungs: [rung])
+    }
+
+    public init(servers: [Server] = [], probes: [ServerID: ServerProbe] = [:],
+                rungs: Set<ProtocolRung>) {
         self.servers = servers
         self.probes = probes
-        self.rung = rung
+        self.rungs = rungs
     }
 
     public mutating func replaceServers(_ servers: [Server]) {
@@ -213,10 +251,10 @@ public struct ServerCatalog: Sendable, Equatable {
     /// Every server that could actually be used right now, best first.
     public func ranked(includeAccountRequired: Bool = true) -> [(Server, ServerProbe?)] {
         let usable = servers.filter { server in
-            (includeAccountRequired || !server.requiresAccount) && server.supports(rung)
+            (includeAccountRequired || !server.requiresAccount) && server.bestRung(in: rungs) != nil
         }
         let measured = usable.compactMap { s -> (Server, ServerProbe)? in
-            guard let p = probes[s.id], ServerScoring.isEligible(s, p, rung: rung) else { return nil }
+            guard let p = probes[s.id], ServerScoring.isEligible(s, p, rungs: rungs) else { return nil }
             return (s, p)
         }.sorted { ServerScoring.score($0.0, $0.1) < ServerScoring.score($1.0, $1.1) }
 

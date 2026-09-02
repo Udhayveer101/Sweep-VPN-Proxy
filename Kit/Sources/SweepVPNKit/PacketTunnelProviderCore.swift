@@ -42,6 +42,9 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     private let prober = ServerProber()
     private var handshakeDeadline: DispatchWorkItem?
     private var lastSignals = NetworkSignals()
+    /// Slows the fail -> on-demand-restart -> fail cycle when nothing will
+    /// authenticate. See `StartBackoff`.
+    private var backoff = StartBackoff()
 
     /// If no peer authenticates in this long we fail closed with a named error
     /// rather than sitting blocked and silent.
@@ -58,6 +61,9 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// reason to bring up an unauthenticated tunnel.
     open var configStore: ConfigStore? { nil }
     open var appBuild: Int { 1 }
+    /// Where the failed-start streak is kept between extension launches.
+    /// Platform targets point this at the shared app group.
+    open var backoffStore: StartBackoffStore? { nil }
 
     // MARK: - Lifecycle
 
@@ -65,6 +71,8 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
                                    completionHandler: @escaping (Error?) -> Void) {
         startCompletion = completionHandler
         diagnostics.record("startTunnel")
+        // Inherit the streak from the previous (now dead) extension process.
+        backoff = (backoffStore?.load() ?? StartBackoff()).effective()
 
         let queue = stateQueue
         // 1. Fail closed first, always.
@@ -192,6 +200,10 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
                 ?? server.endpoints.first else { return }
         handshakeDeadline?.cancel(); handshakeDeadline = nil
         diagnostics.record("authenticated", adapter.rung.shortName)
+        // A tunnel that came up clears the streak: the next failure, whenever
+        // it comes, gets a fast retry again.
+        backoff = backoff.recordingSuccess()
+        backoffStore?.save(backoff)
 
         let queue = stateQueue
         applyPlan(policy.connectedPlan(server: server, endpoint: endpoint)) { [weak self] error in
@@ -250,8 +262,20 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         publishFilterState(up: false, server: coordinator?.activeServer)
         machine.transition(to: .error(kind))
         persistNetworkMemory()
-        completion?(error ?? NSError(domain: "vpn.sweep", code: 1))
         startCompletion = nil
+
+        let resolved = error ?? NSError(domain: "vpn.sweep", code: 1)
+        guard let completion else { return }
+
+        // The blackhole stays installed while we hold here, so nothing leaks —
+        // we are only declining to hand on-demand an instant restart.
+        backoff = backoff.recordingFailure()
+        backoffStore?.save(backoff)
+        let delay = backoff.delay()
+        guard delay > 0 else { return completion(resolved) }
+
+        diagnostics.record("startBackoff", "\(Int(delay))s after \(backoff.consecutiveFailures) failures")
+        stateQueue.asyncAfter(deadline: .now() + delay) { completion(resolved) }
     }
 
     // MARK: - Health and measurement
