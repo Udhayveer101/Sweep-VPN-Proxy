@@ -129,6 +129,11 @@ static void on_tun(void *ctx, const char *json)
             g_dns[e - d] = 0;
         }
     }
+    // Some relays push an internal resolver that does not answer; SWEEP_DNS
+    // aims the probe at a public one they also push, so a silent resolver is
+    // not mistaken for a dead tunnel.
+    const char *override = getenv("SWEEP_DNS");
+    if (override && strlen(override) < sizeof(g_dns)) snprintf(g_dns, sizeof(g_dns), "%s", override);
     printf("  local=%s dns=%s\n", g_local, g_dns);
 }
 
