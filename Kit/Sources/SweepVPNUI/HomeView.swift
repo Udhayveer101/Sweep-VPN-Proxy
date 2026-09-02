@@ -18,6 +18,7 @@ public struct HomeView: View {
                 statusPanel
                 serverPill
                 Spacer(minLength: 0)
+                if let note = model.protocolSwitchNote { protocolSwitchRow(note) }
                 if let error = model.lastError { errorRow(error) }
                 primaryButton
             }
@@ -62,6 +63,21 @@ public struct HomeView: View {
         .padding(12)
         .frame(maxWidth: 420)
         .background(.thinMaterial, in: .rect(cornerRadius: 12, style: .continuous))
+        .accessibilityElement(children: .combine)
+    }
+
+    /// Auto-mode fell back to another transport. Shown briefly so a protocol
+    /// switch reads as the app working, not the connection breaking.
+    private func protocolSwitchRow(_ note: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(.blue)
+            Text(note).font(.caption).multilineTextAlignment(.leading)
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(maxWidth: 420)
+        .background(.thinMaterial, in: .rect(cornerRadius: 12, style: .continuous))
+        .transition(.opacity)
         .accessibilityElement(children: .combine)
     }
 

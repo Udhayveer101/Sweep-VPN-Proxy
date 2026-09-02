@@ -33,7 +33,17 @@ public final class VPNGateFetcher: Sendable {
     /// `custom` exists for exactly that case: point it at a small proxy you run
     /// — a Cloudflare Worker that fetches the CSV and returns it is ~15 lines —
     /// and the app reaches the list from a domain no category filter knows.
+    /// Built-in mirror, tried before the official domain. It is a stateless
+    /// Cloudflare Worker (`Tools/relay-mirror/`) that refetches the same public
+    /// CSV and serves it from `*.workers.dev` — a domain the residential ISPs
+    /// that 403 `vpngate.net` do not categorise. Shipping it as a default means
+    /// the relay list works on those networks with nothing to paste. A
+    /// user-supplied mirror still overrides it.
+    public static let bundledMirror =
+        URL(string: "https://relay-worker.example.workers.dev/")!
+
     public static let officialSources: [URL] = [
+        bundledMirror,
         URL(string: "https://www.vpngate.net/api/iphone/")!,
         URL(string: "http://www.vpngate.net/api/iphone/")!,
     ]

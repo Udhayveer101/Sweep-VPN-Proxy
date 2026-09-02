@@ -24,6 +24,12 @@ public final class VPNViewModel: ObservableObject {
     /// compare it against the key they generated. Set by the app at startup.
     @Published public var signingKeyFingerprint: String?
     @Published public private(set) var rung: ProtocolRung?
+    /// Transient note shown when Automatic walks the ladder to a different
+    /// transport, so a fallback reads as a deliberate switch rather than the
+    /// connection misbehaving. Cleared a few seconds after it is set.
+    @Published public private(set) var protocolSwitchNote: String?
+    private var lastSeenRung: ProtocolRung?
+    private var protocolNoteClearTask: Task<Void, Never>?
     @Published public private(set) var isBusy = false
     /// One sheet at a time. SwiftUI silently misbehaves when several `.sheet`
     /// modifiers sit on the same view — they fight, and the wrong one wins — so
@@ -257,6 +263,7 @@ public final class VPNViewModel: ObservableObject {
             handshakeAgeSeconds = s.handshakeAgeSeconds
             bytesSent = s.bytesSent
             bytesReceived = s.bytesReceived
+            noteRungChange(to: s.rung, connected: s.state.forwardingAllowed)
             rung = s.rung
             quality = s.rttMs.map { Presentation.Quality.from(rttMs: $0, lossFraction: 0) }
             recompute()
@@ -304,6 +311,21 @@ public final class VPNViewModel: ObservableObject {
         recompute()
     }
 
+    /// Raise a short-lived banner when the live transport changes under a
+    /// connected tunnel. Only a real switch between two known rungs counts —
+    /// the first rung after connecting, or losing the rung on disconnect, is
+    /// not a "switch".
+    private func noteRungChange(to newRung: ProtocolRung?, connected: Bool) {
+        defer { lastSeenRung = connected ? newRung : nil }
+        guard connected, let newRung, let old = lastSeenRung, old != newRung else { return }
+        protocolSwitchNote = "Switched to \(newRung.displayName) — the previous route stopped getting through."
+        protocolNoteClearTask?.cancel()
+        protocolNoteClearTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(6))
+            await MainActor.run { self?.protocolSwitchNote = nil }
+        }
+    }
+
     private func recompute() {
         presentation = Presentation.make(state: state, serverName: serverName,
                                          killSwitchArmed: killSwitchArmed,
@@ -324,7 +346,9 @@ public final class VPNViewModel: ObservableObject {
                                                serverDescription: serverName ?? "Sweep VPN")
                 try await configurator.start()
             case .disconnect, .cancel:
-                try await configurator.stop()
+                // Explicit user action: disarm on-demand so the OS does not
+                // immediately restart the tunnel (the connect/disconnect loop).
+                try await configurator.stop(userInitiated: true)
             case .openSettings:
                 // The same button means two different things: finish setup, or
                 // re-grant a VPN permission the user revoked.

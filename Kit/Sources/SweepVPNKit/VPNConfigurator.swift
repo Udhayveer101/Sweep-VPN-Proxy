@@ -89,8 +89,25 @@ public final class VPNConfigurator: @unchecked Sendable {
         try manager.connection.startVPNTunnel()
     }
 
-    public func stop() async throws {
+    /// `userInitiated: true` is an explicit "Disconnect"/"Cancel" from the UI.
+    ///
+    /// On-demand + a catch-all connect rule is the kill switch: while it is
+    /// armed the OS restarts the extension the instant anything wants the
+    /// network. That is correct for auto-connect, but it also means a plain
+    /// `stopVPNTunnel()` is undone within a second — the user taps Cancel and
+    /// the tunnel immediately comes back, connecting/disconnecting forever.
+    /// An explicit disconnect therefore disarms on-demand first; the next
+    /// explicit Connect (`install`) re-arms it. Nothing leaks in between
+    /// because with the tunnel down and no rule, traffic simply uses the
+    /// physical interface — which is what the user asked for by disconnecting.
+    public func stop(userInitiated: Bool = false) async throws {
         let manager = try await loadManager()
+        if userInitiated, manager.isOnDemandEnabled {
+            manager.isOnDemandEnabled = false
+            manager.onDemandRules = []
+            try? await manager.saveToPreferences()
+            try? await manager.loadFromPreferences()
+        }
         manager.connection.stopVPNTunnel()
     }
 
