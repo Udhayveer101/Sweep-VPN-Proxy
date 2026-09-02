@@ -8,3 +8,6 @@ fleet/
 Config/sweep-config.sig.json
 Config/*.bak
 Tools/relay-mirror/.wrangler/
+DataPlane/openvpn/openvpn3/
+DataPlane/openvpn/mbedtls/
+DataPlane/sweepovpn/build-mac/
