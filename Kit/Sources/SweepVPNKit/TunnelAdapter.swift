@@ -39,8 +39,15 @@ public enum AdapterFactory {
         .wireGuardTLS, .shadowsocks2022, .wireGuardTCP,
     ]
 
-    /// Rungs the app can offer at all, including the kernel one.
-    public static let availableRungs: Set<ProtocolRung> = implementedRungs.union([.ikev2])
+    /// Rungs the app can offer at all.
+    ///
+    /// IKEv2 is deliberately absent. `IKEv2Configurator` exists but no code path
+    /// calls it, so offering the rung in the picker promised a fallback that
+    /// could never engage. It also installs into `NEVPNManager.shared()` — the
+    /// single system-wide personal-VPN slot — which would clobber any IKEv2
+    /// profile the user already has. Re-add it only once it is actually wired
+    /// into the ladder and that clobbering is handled.
+    public static let availableRungs: Set<ProtocolRung> = implementedRungs
 
     public static func make(rung: ProtocolRung, server: Server, privateKeyBase64: String,
                             presharedKeyBase64: String?, keepalive: Int?) throws -> TunnelAdapter {

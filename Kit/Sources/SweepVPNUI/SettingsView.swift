@@ -49,10 +49,51 @@ public struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 #if os(macOS)
+                Section("Tor and proxy") {
+                    Toggle("Tor over VPN", isOn: Binding(
+                        get: { model.options.torEnabled },
+                        set: { model.setTor(enabled: $0) }))
+                    if let progress = model.torProgressText {
+                        Text(progress).font(.footnote).foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    Text("Runs Tor inside Sweep and sends its circuits through the VPN, so the exit relay sees the VPN server rather than your connection. Connect the VPN first: on networks that block Tor outright, a direct bootstrap never finishes.")
+                        .font(.footnote).foregroundStyle(.secondary)
+
+                    Toggle("Local proxy", isOn: Binding(
+                        get: { model.options.localProxyEnabled },
+                        set: { model.setLocalProxy(enabled: $0) }))
+                    if case .listening(let port) = model.proxyState {
+                        Text("SOCKS5 and HTTP CONNECT on 127.0.0.1:\(port)\(model.options.torEnabled ? " → Tor" : " → VPN")")
+                            .font(.footnote).foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    } else if case .failed(let why) = model.proxyState {
+                        Text(why).font(.footnote).foregroundStyle(.red)
+                    }
+                    Text("Point an individual app at this proxy to send only that app through the tunnel — or through Tor when Tor is on. It listens on this Mac only.")
+                        .font(.footnote).foregroundStyle(.secondary)
+
+                    TextField("Bridge lines (one per line, optional)",
+                              text: Binding(
+                                get: { model.options.torBridges.joined(separator: "\n") },
+                                set: {
+                                    var o = model.options
+                                    o.torBridges = $0.split(separator: "\n")
+                                        .map { String($0).trimmingCharacters(in: .whitespaces) }
+                                        .filter { !$0.isEmpty }
+                                    model.apply(options: o)
+                                }),
+                              axis: .vertical)
+                        .lineLimit(2...6)
+                        .font(.system(.footnote, design: .monospaced))
+                    Text("Only needed if Tor is blocked and the VPN is not carrying it. Get bridges from bridges.torproject.org — the bridges shipped with Tor Browser are public and widely blocked.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 MacSettingsSection(model: model,
                                    tunnelExtensionID: model.tunnelExtensionID,
                                    filterExtensionID: model.filterExtensionID)
                 #endif
+                SecurityPanel(model: model, signingKeyFingerprint: model.signingKeyFingerprint)
                 Section("Configuration") {
                     Text(model.configStatus ?? "No configuration loaded yet.")
                         .font(.footnote).foregroundStyle(.secondary)

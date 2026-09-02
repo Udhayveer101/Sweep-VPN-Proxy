@@ -15,6 +15,14 @@ public final class VPNViewModel: ObservableObject {
     @Published public private(set) var killSwitchArmed = true
     @Published public private(set) var onDemandArmed = true
     @Published public private(set) var pqHybridActive = false
+    /// Live data-plane figures behind the Security panel. Nil handshake age means
+    /// no handshake has completed, which is not the same as "0 seconds ago".
+    @Published public private(set) var handshakeAgeSeconds: Int64?
+    @Published public private(set) var bytesSent: UInt64 = 0
+    @Published public private(set) var bytesReceived: UInt64 = 0
+    /// Short fingerprint of the pinned config-signing key, shown so the user can
+    /// compare it against the key they generated. Set by the app at startup.
+    @Published public var signingKeyFingerprint: String?
     @Published public private(set) var rung: ProtocolRung?
     @Published public private(set) var isBusy = false
     /// One sheet at a time. SwiftUI silently misbehaves when several `.sheet`
@@ -38,6 +46,86 @@ public final class VPNViewModel: ObservableObject {
     @Published public private(set) var selectedServerID: ServerID?
     /// Servers that need an operator account are hidden until the user opts in.
     @Published public var showAccountOnlyServers = false
+
+    #if os(macOS)
+    @Published public private(set) var torState: TorController.State = .stopped
+    @Published public private(set) var proxyState: LocalProxy.State = .stopped
+    private var tor: TorController?
+    private var proxy: LocalProxy?
+
+    /// Tor bootstrap is a foreground concern: on a network that blocks Tor it can
+    /// sit at 14% indefinitely, and a spinner with no number reads as a hang.
+    public var torProgressText: String? {
+        switch torState {
+        case .stopped: return nil
+        case .starting(let pct, let summary): return "Tor \(pct)% — \(summary)"
+        case .running: return "Tor ready on 127.0.0.1:\(tor?.socksPort ?? 9150)"
+        case .failed(let why): return why
+        }
+    }
+
+    public func setTor(enabled: Bool) {
+        var o = options
+        o.torEnabled = enabled
+        apply(options: o)
+        guard enabled else {
+            tor?.stop()
+            tor = nil
+            torState = .stopped
+            syncProxyUpstream()
+            return
+        }
+        guard let controller = TorController() else {
+            torState = .failed("This build has no bundled Tor. Run `make bundle-tor`.")
+            return
+        }
+        tor = controller
+        let bridges = options.torBridges
+        controller.start(reachability: bridges.isEmpty ? .direct : .bridges(bridges)) { [weak self] st in
+            Task { @MainActor in
+                self?.torState = st
+                // The proxy's upstream depends on whether Tor is actually ready;
+                // pointing at a half-bootstrapped Tor would fail every connection.
+                self?.syncProxyUpstream()
+            }
+        }
+    }
+
+    public func setLocalProxy(enabled: Bool) {
+        var o = options
+        o.localProxyEnabled = enabled
+        apply(options: o)
+        guard enabled else {
+            proxy?.stop()
+            proxy = nil
+            proxyState = .stopped
+            return
+        }
+        guard let listener = LocalProxy(port: options.localProxyPort,
+                                        upstream: currentUpstream()) else {
+            proxyState = .failed("Port \(options.localProxyPort) is not usable.")
+            return
+        }
+        proxy = listener
+        listener.start(upstream: currentUpstream()) { [weak self] st in
+            Task { @MainActor in self?.proxyState = st }
+        }
+    }
+
+    private func currentUpstream() -> LocalProxy.Upstream {
+        if options.torEnabled, torState == .running, let port = tor?.socksPort {
+            return .socks5(host: "127.0.0.1", port: port)
+        }
+        return .direct
+    }
+
+    private func syncProxyUpstream() {
+        guard options.localProxyEnabled, let proxy else { return }
+        proxy.start(upstream: currentUpstream()) { [weak self] st in
+            Task { @MainActor in self?.proxyState = st }
+        }
+    }
+    #endif
     /// No verified, unexpired signed bundle => the app has nothing it is allowed
     /// to connect to, and says so instead of implying it is standing guard.
     @Published public private(set) var hasVerifiedConfig = false
@@ -140,6 +228,9 @@ public final class VPNViewModel: ObservableObject {
             killSwitchArmed = s.killSwitchArmed
             onDemandArmed = configurator.profileOnDemandEnabled
             pqHybridActive = s.pqHybridActive
+            handshakeAgeSeconds = s.handshakeAgeSeconds
+            bytesSent = s.bytesSent
+            bytesReceived = s.bytesReceived
             rung = s.rung
             quality = s.rttMs.map { Presentation.Quality.from(rttMs: $0, lossFraction: 0) }
             recompute()

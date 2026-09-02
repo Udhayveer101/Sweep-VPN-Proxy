@@ -92,6 +92,28 @@ public enum ServerScoring {
     public static let maxLoss = 0.05
     public static let maxRttMs = 800.0
 
+    /// Small nudge toward regions that are close to the user, used only to break
+    /// ties. Measured RTT already dominates the score and is the honest signal;
+    /// this exists because a freshly-seen server has no probe history yet, and
+    /// because two servers with equal RTT today will not stay equal.
+    ///
+    /// Home region is India, so the ordering is India, then South-East Asia, then
+    /// East Asia and the Gulf, then everywhere else. Weight is 0.15 points per
+    /// unit against RTT's 1.0 per millisecond: worth about 8 ms at most, so it
+    /// can never override a genuinely faster server.
+    public static func proximityPenalty(_ countryCode: String,
+                                        home: String = "IN") -> Double {
+        let cc = countryCode.uppercased()
+        if cc == home.uppercased() { return 0 }
+        switch cc {
+        case "SG", "LK", "BD", "NP", "TH", "MY": return 20   // South & South-East Asia
+        case "HK", "JP", "KR", "TW", "AE", "ID", "VN", "PH": return 35
+        case "AU", "TR", "IL", "SA", "QA": return 45
+        case "DE", "NL", "GB", "FR", "CH", "SE", "PL", "RO": return 60   // Europe
+        default: return 75                                              // Americas and beyond
+        }
+    }
+
     public static func score(_ s: Server, _ p: ServerProbe) -> Double {
         1.0 * p.rttMs
             + 8.0 * (p.lossFraction * 100)               // 8 points per percent of loss
@@ -99,6 +121,7 @@ public enum ServerScoring {
             + 0.4 * s.load * 100
             + 0.6 * (1 - s.reliability) * 100
             + 1.0 * s.jurisdictionPenalty
+            + 0.15 * proximityPenalty(s.countryCode)
     }
 
     /// Hard gates run before scoring — a gated server is never selected.

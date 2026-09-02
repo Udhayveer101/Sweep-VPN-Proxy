@@ -31,6 +31,11 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     private var pathMonitor: NWPathMonitor?
     private var startCompletion: ((Error?) -> Void)?
     private var readingPackets = false
+    /// Always false today, and correctly so. `PostQuantum.Exchange` and
+    /// `WireGuardAdapter.applyPostQuantumPSK` both exist, but nothing performs the
+    /// in-tunnel ML-KEM exchange that would produce the PSK — and the third-party
+    /// relays currently in the catalog could not answer it anyway. Flipping this
+    /// to true would put a post-quantum glyph on a tunnel that has no PQ material.
     private var pqActive = false
     private var healthTimer: DispatchSourceTimer?
     private var probeTimer: DispatchSourceTimer?
@@ -412,7 +417,13 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
                               connectedSince: connectedSince,
                               rttMs: server.flatMap { catalog.probes[$0.id]?.rttMs },
                               killSwitchArmed: policy.includeAllNetworks,
-                              pqHybridActive: pqActive)
+                              pqHybridActive: pqActive,
+                              // -1 means "never handshaked"; keep that distinct
+                              // from "handshaked 0 seconds ago".
+                              handshakeAgeSeconds: coordinator.map { $0.handshakeAgeSeconds }
+                                  .flatMap { $0 >= 0 ? $0 : nil },
+                              bytesSent: coordinator?.transferred.tx ?? 0,
+                              bytesReceived: coordinator?.transferred.rx ?? 0)
     }
 }
 

@@ -20,11 +20,23 @@ public struct ProviderStatus: Codable, Sendable, Equatable {
     public var rttMs: Double?
     public var killSwitchArmed: Bool
     public var pqHybridActive: Bool
+    /// Seconds since the last completed WireGuard handshake, or nil when there
+    /// has never been one. The Security panel shows this because it is the one
+    /// value that proves the tunnel is live rather than merely configured — a
+    /// stale handshake age is how a silently dead tunnel looks.
+    public var handshakeAgeSeconds: Int64?
+    public var bytesSent: UInt64
+    public var bytesReceived: UInt64
+
     public init(state: TunnelState, serverName: String?, rung: ProtocolRung?, connectedSince: Date?,
-                rttMs: Double?, killSwitchArmed: Bool, pqHybridActive: Bool) {
+                rttMs: Double?, killSwitchArmed: Bool, pqHybridActive: Bool,
+                handshakeAgeSeconds: Int64? = nil,
+                bytesSent: UInt64 = 0, bytesReceived: UInt64 = 0) {
         self.state = state; self.serverName = serverName; self.rung = rung
         self.connectedSince = connectedSince; self.rttMs = rttMs
         self.killSwitchArmed = killSwitchArmed; self.pqHybridActive = pqHybridActive
+        self.handshakeAgeSeconds = handshakeAgeSeconds
+        self.bytesSent = bytesSent; self.bytesReceived = bytesReceived
     }
 }
 

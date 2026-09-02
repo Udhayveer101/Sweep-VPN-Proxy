@@ -60,7 +60,13 @@ final class AdapterFactoryTests: XCTestCase {
                         .wireGuardTLS, .shadowsocks2022, .wireGuardTCP])
         XCTAssertFalse(AdapterFactory.implementedRungs.contains(.ikev2),
                        "IKEv2 is a kernel profile, not a packet-tunnel adapter")
-        XCTAssertTrue(AdapterFactory.availableRungs.contains(.ikev2))
+        // IKEv2 is no longer offered at all. IKEv2Configurator exists but nothing
+        // calls it, so listing the rung promised a fallback that could never
+        // engage — and installing it would overwrite NEVPNManager.shared(), the
+        // one system-wide personal-VPN slot. Re-add only once it is truly wired.
+        XCTAssertFalse(AdapterFactory.availableRungs.contains(.ikev2),
+                       "an unreachable rung must not be offered in the picker")
+        XCTAssertEqual(AdapterFactory.availableRungs, AdapterFactory.implementedRungs)
     }
 }
 

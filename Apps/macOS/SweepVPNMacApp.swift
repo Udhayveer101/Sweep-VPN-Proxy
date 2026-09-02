@@ -25,6 +25,14 @@ struct SweepVPNMacApp: App {
     }
 
     static func refreshConfiguration(into model: VPNViewModel) async {
+        // Short fingerprint of the pinned key, so the Security panel can show the
+        // user which key this build trusts without exposing the whole value.
+        if let key = try? AppConfig.pinnedSigningKey() {
+            let raw = key.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+            model.signingKeyFingerprint = stride(from: 0, to: min(raw.count, 16), by: 4)
+                .map { String(raw.dropFirst($0).prefix(4)) }
+                .joined(separator: " ")
+        }
         guard let store = try? AppConfig.makeConfigStore() else {
             model.noteConfigurationFailure("No signing key is pinned in this build.",
                                            kind: .notConfigured)
