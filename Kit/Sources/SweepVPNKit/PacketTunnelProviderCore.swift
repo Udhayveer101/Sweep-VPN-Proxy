@@ -206,7 +206,14 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         backoffStore?.save(backoff)
 
         let queue = stateQueue
-        applyPlan(policy.connectedPlan(server: server, endpoint: endpoint)) { [weak self] error in
+        // OpenVPN assigns the address, resolvers and routes in PUSH_REPLY, so
+        // for those rungs the plan comes from what the relay sent rather than
+        // from the server record, which carries none of it.
+        let plan = adapter.pushedSettings.map {
+            policy.connectedPlan(server: server, endpoint: endpoint, pushed: $0)
+        } ?? policy.connectedPlan(server: server, endpoint: endpoint)
+
+        applyPlan(plan) { [weak self] error in
             queue.async {
                 guard let self else { return }
                 if let error { return self.fail(.internalFailure, error, self.startCompletion) }

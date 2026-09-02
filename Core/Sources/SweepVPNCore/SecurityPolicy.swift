@@ -100,6 +100,45 @@ public struct SecurityPolicy: Sendable {
             forwardingEnabled: true)
     }
 
+    /// The same plan, built from what an OpenVPN relay pushed rather than from
+    /// the `Server` record — which for a public relay carries no address at all,
+    /// because none exists until PUSH_REPLY.
+    ///
+    /// The IPv6 rule is unchanged and matters more here, not less: VPN Gate
+    /// relays are IPv4-only, so without blackholing v6 every AAAA-reachable site
+    /// would quietly bypass the tunnel over the physical interface.
+    public func connectedPlan(server: Server,
+                              endpoint: ServerEndpoint,
+                              pushed: PushedTunnelSettings) -> TunnelPlan {
+        let v4 = pushed.ipv4Address
+        let v6 = pushed.ipv6Address
+        let hasV6 = v6 != nil
+
+        let pushedRoutes = pushed.routes.filter { !$0.exclude && !$0.ipv6 }
+            .map { TunnelPlan.Route($0.address, $0.prefix) }
+        let excluded = pushed.routes.filter { $0.exclude && !$0.ipv6 }
+            .map { TunnelPlan.Route($0.address, $0.prefix) }
+
+        return TunnelPlan(
+            tunnelRemoteAddress: endpoint.host,
+            ipv4Address: v4?.address ?? "",
+            // redirect-gateway means the relay wants everything; otherwise honour
+            // exactly the routes it asked for and nothing wider.
+            ipv4Routes: pushed.redirectGatewayV4 ? [.init("0.0.0.0", 0)] : pushedRoutes,
+            ipv4ExcludedRoutes: excluded,
+            ipv6Address: v6?.address,
+            ipv6Routes: (hasV6 || options.blockIPv6WhenUnavailable) ? [.init("::", 0)] : [],
+            ipv6Blocked: !hasV6 && options.blockIPv6WhenUnavailable,
+            // The relay chose these resolvers. We cannot make that private, but
+            // an empty push must not silently fall back to the device's own
+            // resolver, which would leak every lookup outside the tunnel.
+            dnsServers: pushed.dns,
+            dnsMatchDomains: [""],
+            splitDNSDomains: options.lanSuffixes,
+            mtu: pushed.effectiveMTU,
+            forwardingEnabled: true)
+    }
+
     /// Whether a packet read from the tunnel interface may be forwarded.
     public func mayForward(state: TunnelState) -> Bool { state.forwardingAllowed }
 

@@ -43,22 +43,19 @@ find_package(fmt REQUIRED)
 # OpenSSL contribute objects we have to link.
 find_path(ASIO_INCLUDE_DIR asio.hpp REQUIRED)
 find_path(XXHASH_INCLUDE_DIR xxhash.h REQUIRED)
-pkg_check_modules(JSONCPP REQUIRED jsoncpp)
 
 target_include_directories(sweepovpn PRIVATE
     ${LZ4_INCLUDE_DIRS}
     ${ASIO_INCLUDE_DIR}
     ${XXHASH_INCLUDE_DIR}
-    ${JSONCPP_INCLUDE_DIRS}
 )
 # pkg-config hands back bare -l flags, which the linker cannot resolve without
 # the matching search paths.
-target_link_directories(sweepovpn PUBLIC ${LZ4_LIBRARY_DIRS} ${JSONCPP_LIBRARY_DIRS})
+target_link_directories(sweepovpn PUBLIC ${LZ4_LIBRARY_DIRS})
 
 target_link_libraries(sweepovpn PUBLIC
     OpenSSL::SSL OpenSSL::Crypto
     ${LZ4_LIBRARIES}
-    ${JSONCPP_LIBRARIES}
     fmt::fmt
 )
 

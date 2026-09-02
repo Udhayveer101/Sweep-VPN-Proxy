@@ -19,6 +19,14 @@ public protocol TunnelAdapter: AnyObject, Sendable {
     func reassert()
     var lastHandshakeAgeSeconds: Int64 { get }
     var transferred: (tx: UInt64, rx: UInt64) { get }
+    /// Settings the peer assigned at connect time. Nil for every WireGuard
+    /// rung, where the address comes from the signed bundle before the tunnel
+    /// starts; set for OpenVPN, where it arrives in PUSH_REPLY.
+    var pushedSettings: PushedTunnelSettings? { get }
+}
+
+public extension TunnelAdapter {
+    var pushedSettings: PushedTunnelSettings? { nil }
 }
 
 public enum AdapterFactoryError: Error, Equatable {
@@ -34,10 +42,19 @@ public enum AdapterFactory {
     /// loudly rather than look like a working tunnel.
     /// IKEv2 is real but runs as a kernel profile (`IKEv2Configurator`), not as
     /// a packet-tunnel adapter, so it is not in this set.
-    public static let implementedRungs: Set<ProtocolRung> = [
-        .wireGuardUDP, .wireGuardUDP443, .wireGuardQUIC,
-        .wireGuardTLS, .shadowsocks2022, .wireGuardTCP,
-    ]
+    public static let implementedRungs: Set<ProtocolRung> = {
+        var rungs: Set<ProtocolRung> = [
+            .wireGuardUDP, .wireGuardUDP443, .wireGuardQUIC,
+            .wireGuardTLS, .shadowsocks2022, .wireGuardTCP,
+        ]
+        #if os(macOS)
+        // OpenVPN 3 is linked on macOS only so far — the iOS slice still needs
+        // its static dependencies cross-compiled. Listing the rungs where they
+        // do not exist would offer the user a relay they cannot reach.
+        rungs.formUnion([.openVPNUDP, .openVPNTCP])
+        #endif
+        return rungs
+    }()
 
     /// Rungs the app can offer at all.
     ///
@@ -55,6 +72,21 @@ public enum AdapterFactory {
         guard let endpoint = server.endpoints.first(where: { $0.rung == rung }) else {
             throw AdapterFactoryError.noEndpoint(rung)
         }
+
+        // OpenVPN is its own protocol, not our WireGuard tunnel in another
+        // envelope, so it does not go through TransportFactory at all.
+        if !rung.isOwnWireGuardTunnel {
+            #if os(macOS)
+            guard let adapter = OpenVPNTunnelAdapter(rung: rung, server: server,
+                                                     endpoint: endpoint) else {
+                throw AdapterFactoryError.missingCredential(rung)
+            }
+            return adapter
+            #else
+            throw AdapterFactoryError.rungNotImplemented(rung)
+            #endif
+        }
+
         let transport = try TransportFactory.make(rung: rung, endpoint: endpoint,
                                                   sni: endpoint.sni,
                                                   secret: endpoint.secretData)

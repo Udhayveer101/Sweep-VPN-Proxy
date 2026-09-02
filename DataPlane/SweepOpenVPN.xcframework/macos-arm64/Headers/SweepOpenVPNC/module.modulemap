@@ -1,0 +1,4 @@
+module SweepOpenVPNC {
+    header "sweepovpn.h"
+    export *
+}

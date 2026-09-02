@@ -55,9 +55,20 @@ final class AdapterFactoryTests: XCTestCase {
     }
 
     func testShippedRungsCoverEveryFailureModeAndExcludeTheKernelOne() {
-        XCTAssertEqual(AdapterFactory.implementedRungs,
-                       [.wireGuardUDP, .wireGuardUDP443, .wireGuardQUIC,
-                        .wireGuardTLS, .shadowsocks2022, .wireGuardTCP])
+        // The WireGuard ladder is the same on every platform.
+        XCTAssertEqual(Set(AdapterFactory.implementedRungs.filter(\.isOwnWireGuardTunnel)),
+                       Set([.wireGuardUDP, .wireGuardUDP443, .wireGuardQUIC,
+                            .wireGuardTLS, .shadowsocks2022, .wireGuardTCP]))
+
+        // OpenVPN 3 is linked on macOS only so far, so the OpenVPN rungs must
+        // be offered there and must NOT be offered anywhere they cannot run —
+        // a listed rung the user cannot reach is exactly the kind of promise
+        // this suite exists to prevent.
+        #if os(macOS)
+        XCTAssertTrue(AdapterFactory.implementedRungs.isSuperset(of: [.openVPNUDP, .openVPNTCP]))
+        #else
+        XCTAssertTrue(AdapterFactory.implementedRungs.isDisjoint(with: [.openVPNUDP, .openVPNTCP]))
+        #endif
         XCTAssertFalse(AdapterFactory.implementedRungs.contains(.ikev2),
                        "IKEv2 is a kernel profile, not a packet-tunnel adapter")
         // IKEv2 is no longer offered at all. IKEv2Configurator exists but nothing

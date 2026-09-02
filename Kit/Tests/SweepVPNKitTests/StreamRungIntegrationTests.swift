@@ -148,13 +148,30 @@ final class StreamRungIntegrationTests: XCTestCase {
 
     func testEveryImplementedRungCanBuildATransport() throws {
         let psk = Data(repeating: 7, count: 32).base64EncodedString()
-        for rung in AdapterFactory.implementedRungs {
+        // Only the WireGuard rungs are transports carrying our tunnel. OpenVPN
+        // brings its own transport inside OpenVPN 3 and deliberately never
+        // reaches TransportFactory, which is why it is excluded here rather
+        // than given a stub.
+        for rung in AdapterFactory.implementedRungs.filter(\.isOwnWireGuardTunnel) {
             let endpoint = ServerEndpoint(host: "127.0.0.1", port: 443, rung: rung,
                                           sni: "www.example.com", secret: psk)
             let transport = try TransportFactory.make(rung: rung, endpoint: endpoint,
                                                       sni: endpoint.sni, secret: endpoint.secretData)
             XCTAssertEqual(transport.rung, rung)
             transport.stop()
+        }
+    }
+
+    /// The other half of that rule: asking TransportFactory for an OpenVPN rung
+    /// must fail loudly rather than quietly hand back something that is not
+    /// OpenVPN.
+    func testOpenVPNRungsAreNotTransports() {
+        for rung in [ProtocolRung.openVPNUDP, .openVPNTCP] {
+            let endpoint = ServerEndpoint(host: "127.0.0.1", port: 443, rung: rung)
+            XCTAssertThrowsError(try TransportFactory.make(rung: rung, endpoint: endpoint,
+                                                           sni: nil, secret: nil)) {
+                XCTAssertEqual($0 as? AdapterFactoryError, .rungNotImplemented(rung))
+            }
         }
     }
 }
