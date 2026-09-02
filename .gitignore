@@ -7,3 +7,4 @@ DataPlane/sweepwg/fat/
 fleet/
 Config/sweep-config.sig.json
 Config/*.bak
+Tools/relay-mirror/.wrangler/
