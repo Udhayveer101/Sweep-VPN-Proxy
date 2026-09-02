@@ -4,7 +4,7 @@ TEAM   := P66SB4MX92
 CRATE  := DataPlane/sweepwg
 TARGETS := aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
 
-.PHONY: dataplane test project ios macos install-macos
+.PHONY: dataplane test project ios macos install-macos bundle-tor
 
 dataplane:
 	cd $(CRATE) && $(RUSTUP) $(foreach t,$(TARGETS),cargo build --release --target $(t) &&) true
@@ -41,7 +41,17 @@ macos: project
 
 # Install where OSSystemExtensionManager will accept it. Activation requests
 # from an app outside /Applications are rejected before they reach the daemon.
-install-macos: macos
+# Tor ships inside the app; see Tools/bundle-tor.sh for why the dylibs must be
+# rewritten. Signed with the development identity so the bundle stays valid.
+SIGN_ID := Apple Development: udhay2009@icloud.com (T377427WD2)
+
+bundle-tor:
+	@APP=$$(xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-macOS \
+	    -destination 'platform=macOS' -showBuildSettings 2>/dev/null \
+	    | awk -F' = ' '/ BUILT_PRODUCTS_DIR /{d=$$2} / FULL_PRODUCT_NAME /{n=$$2} END{print d"/"n}'); \
+	  ./Tools/bundle-tor.sh "$$APP" "$(SIGN_ID)"
+
+install-macos: macos bundle-tor
 	@APP=$$(xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-macOS \
 	    -destination 'platform=macOS' -showBuildSettings 2>/dev/null \
 	    | awk -F' = ' '/ BUILT_PRODUCTS_DIR /{d=$$2} / FULL_PRODUCT_NAME /{n=$$2} END{print d"/"n}'); \

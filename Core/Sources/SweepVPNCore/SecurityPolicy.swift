@@ -34,6 +34,19 @@ public struct SecurityPolicyOptions: Sendable, Equatable, Codable {
     /// (Proton-NetShield / Mullvad-DNS class, vault What-Leading-VPNs-Do-Best).
     /// It selects a different resolver address on the same VPS — no third party.
     public var dnsFilteringEnabled: Bool = false
+
+    /// Route app traffic through Tor *on top of* the tunnel. Tor runs in the app,
+    /// not the extension, so its circuits are built through the VPN — which is
+    /// what makes the ordering "Tor over VPN" rather than "Tor beside VPN".
+    public var torEnabled: Bool = false
+    /// Bridge lines from https://bridges.torproject.org. Only needed when the
+    /// network blocks Tor and the VPN is not carrying it; empty means direct.
+    public var torBridges: [String] = []
+    /// Local SOCKS5 / HTTP-CONNECT listener for apps that should use the tunnel
+    /// (or Tor) without the whole system being routed through it.
+    public var localProxyEnabled: Bool = false
+    public var localProxyPort: Int = 1080
+
     public init() {}
 }
 
