@@ -9,18 +9,43 @@ public final class VPNConfigurator: @unchecked Sendable {
     public let bundleIdentifier: String   // the packet-tunnel extension's bundle id
     public let displayName: String
     private var manager: NETunnelProviderManager?
+    /// True only once we have located (or saved) a profile whose provider is *ours*.
+    /// Without this we cannot tell "Sweep is disconnected" from "some other VPN owns
+    /// the system slot", and the UI ends up reporting a foreign tunnel as our own.
+    private var ownsProfile = false
 
     public init(bundleIdentifier: String, displayName: String = "Sweep VPN") {
         self.bundleIdentifier = bundleIdentifier
         self.displayName = displayName
     }
 
+    /// Returns *our* profile, never someone else's.
+    ///
+    /// `loadAllFromPreferences()` returns every packet-tunnel profile on the device.
+    /// Adopting `.first` meant we read an unrelated VPN's status as ours and — far
+    /// worse — `install()` would overwrite that unrelated VPN's configuration.
+    /// Identity is the provider bundle id; nothing else is a safe discriminator.
     public func loadManager() async throws -> NETunnelProviderManager {
         if let manager { return manager }
         let existing = try await NETunnelProviderManager.loadAllFromPreferences()
-        let m = existing.first ?? NETunnelProviderManager()
+        let ours = existing.first {
+            ($0.protocolConfiguration as? NETunnelProviderProtocol)?
+                .providerBundleIdentifier == bundleIdentifier
+        }
+        let m = ours ?? NETunnelProviderManager()
+        ownsProfile = (ours != nil)
         manager = m
         return m
+    }
+
+    /// Whether a Sweep profile actually exists in system preferences.
+    /// Callers must treat `false` as "not configured", not as "disconnected".
+    public var hasInstalledProfile: Bool { ownsProfile }
+
+    /// The connection object for *our* profile, for scoping `NEVPNStatusDidChange`
+    /// observation. Observing with `object: nil` delivers every VPN's transitions.
+    public var ourConnection: NEVPNConnection? {
+        ownsProfile ? manager?.connection : nil
     }
 
     /// Applies the researched kill-switch construction:
@@ -46,6 +71,7 @@ public final class VPNConfigurator: @unchecked Sendable {
 
         try await manager.saveToPreferences()
         try await manager.loadFromPreferences()
+        ownsProfile = true
     }
 
     public func start() async throws {
@@ -63,6 +89,7 @@ public final class VPNConfigurator: @unchecked Sendable {
         let manager = try await loadManager()
         try await manager.removeFromPreferences()
         self.manager = nil
+        ownsProfile = false
     }
 
     public func send(_ message: AppToProvider) async throws -> ProviderToApp? {
@@ -81,8 +108,17 @@ public final class VPNConfigurator: @unchecked Sendable {
         }
     }
 
+    /// Whether *the saved profile* actually carries an on-demand rule. The UI must
+    /// not show "Standing by" off a local toggle that was never written to a profile.
+    public var profileOnDemandEnabled: Bool {
+        guard ownsProfile, let manager else { return false }
+        return manager.isOnDemandEnabled && !(manager.onDemandRules ?? []).isEmpty
+    }
+
+    /// `.invalid` unless the profile we are reading is provably ours.
     public var connectionStatus: NEVPNStatus {
-        manager?.connection.status ?? .invalid
+        guard ownsProfile, let manager else { return .invalid }
+        return manager.connection.status
     }
 }
 

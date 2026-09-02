@@ -96,9 +96,17 @@ public final class VPNViewModel: ObservableObject {
     public func onAppear() {
         // Status is event-driven off NEVPNStatusDidChange; the timer is only a
         // slow safety net so we never poll hard in the background.
-        NotificationCenter.default.addObserver(forName: .NEVPNStatusDidChange, object: nil,
-                                               queue: .main) { [weak self] _ in
-            Task { @MainActor in await self?.refresh() }
+        // Scope the observation to *our* connection. With `object: nil` every VPN
+        // on the machine — including unrelated ones — drove this refresh, which is
+        // how an unrelated tunnel ended up rendering as "Protected".
+        Task { [weak self] in
+            guard let self else { return }
+            _ = try? await self.configurator.loadManager()
+            NotificationCenter.default.addObserver(forName: .NEVPNStatusDidChange,
+                                                   object: self.configurator.ourConnection,
+                                                   queue: .main) { [weak self] _ in
+                Task { @MainActor in await self?.refresh() }
+            }
         }
         pollTask?.cancel()
         pollTask = Task { [weak self] in
@@ -130,7 +138,7 @@ public final class VPNViewModel: ObservableObject {
             state = s.state
             serverName = s.serverName
             killSwitchArmed = s.killSwitchArmed
-            onDemandArmed = options.killSwitchEnabled
+            onDemandArmed = configurator.profileOnDemandEnabled
             pqHybridActive = s.pqHybridActive
             rung = s.rung
             quality = s.rttMs.map { Presentation.Quality.from(rttMs: $0, lossFraction: 0) }
@@ -138,17 +146,40 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
-    /// If the extension is not running we still must not show "off" when the
-    /// system says the tunnel is in a failed state.
+    /// Fallback used only when the provider did not answer over IPC.
+    ///
+    /// `configurator.connectionStatus` is now guaranteed to describe *our* profile
+    /// or nothing at all, so it is safe to render — but it carries no rung and no
+    /// server name, and we must not invent either.
     private func applySystemStatus() {
+        // No Sweep profile in system preferences at all. This is "not set up",
+        // never "disconnected", and certainly never some other VPN's status.
+        guard configurator.hasInstalledProfile else {
+            state = hasVerifiedConfig ? .error(.notConfigured) : .error(configFailureKind)
+            serverName = nil
+            rung = nil
+            recompute()
+            return
+        }
         switch configurator.connectionStatus {
-        case .connected: state = .connected(rung: .wireGuardUDP, server: serverName ?? "")
-        case .connecting, .reasserting: state = .connecting(rung: .wireGuardUDP)
-        case .disconnecting: state = .reconnecting(attempt: 0)
-        case .invalid: state = .error(.systemDenied)
+        case .connected:
+            // Up, but unattributed until IPC confirms. See TunnelState.verifying.
+            state = .verifying
+            rung = nil
+        case .connecting, .reasserting:
+            state = .reconnecting(attempt: 0)
+            rung = nil
+        case .disconnecting:
+            state = .reconnecting(attempt: 0)
+        case .invalid:
+            state = .error(.systemDenied)
         default:
+            // `.disconnected`. On-demand only counts as armed if the profile
+            // actually carries an on-demand rule; the local toggle alone showed
+            // "Standing by" with nothing armed behind it.
             if !hasVerifiedConfig { state = .error(configFailureKind) }
-            else { state = options.killSwitchEnabled ? .onDemandArmed : .disconnected }
+            onDemandArmed = configurator.profileOnDemandEnabled
+            if onDemandArmed { state = .onDemandArmed } else { state = .disconnected }
         }
         recompute()
     }

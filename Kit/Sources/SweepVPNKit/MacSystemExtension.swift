@@ -27,8 +27,31 @@ public final class MacSystemExtensionInstaller: NSObject, OSSystemExtensionReque
         self.identifier = extensionIdentifier
     }
 
+    /// Reasons activation is refused before it ever reaches the daemon.
+    /// These are the overwhelmingly common causes of the generic
+    /// "permission denied" a user sees, and none of them are tunnel bugs.
+    public static func preflightFailure(bundle: Bundle = .main) -> String? {
+        let path = bundle.bundlePath
+        // `OSSystemExtensionManager` only accepts requests from an app inside
+        // /Applications. Running straight out of DerivedData always fails.
+        if !path.hasPrefix("/Applications/") {
+            return """
+            Sweep must be in /Applications to install its network extension. \
+            It is currently running from:
+            \(path)
+
+            Move Sweep.app to /Applications and reopen it.
+            """
+        }
+        return nil
+    }
+
     public func activate(onStatus: @escaping @Sendable (Status) -> Void) {
         self.onStatus = onStatus
+        if let reason = Self.preflightFailure() {
+            onStatus(.failed(reason))
+            return
+        }
         onStatus(.installing)
         let request = OSSystemExtensionRequest.activationRequest(forExtensionWithIdentifier: identifier,
                                                                  queue: .main)
@@ -65,7 +88,47 @@ public final class MacSystemExtensionInstaller: NSObject, OSSystemExtensionReque
     }
 
     public func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) {
-        onStatus?(.failed(error.localizedDescription))
+        onStatus?(.failed(Self.explain(error)))
+    }
+
+    /// `OSSystemExtensionError`'s `localizedDescription` is uniformly unhelpful
+    /// ("The operation couldn't be completed"), which is why activation failures
+    /// read as an unexplained "permission denied". Map the code to the thing the
+    /// user or developer actually has to change.
+    static func explain(_ error: Error) -> String {
+        let ns = error as NSError
+        guard ns.domain == OSSystemExtensionErrorDomain,
+              let code = OSSystemExtensionError.Code(rawValue: ns.code) else {
+            return error.localizedDescription
+        }
+        switch code {
+        case .validationFailed:
+            return """
+            The extension's signature or entitlements were rejected.
+            Check that the app and the extension are both signed with the same \
+            Developer ID team and carry com.apple.developer.networking.networkextension. \
+            For local development run: systemextensionsctl developer on
+            """
+        case .authorizationRequired:
+            return "Approve Sweep in System Settings ▸ General ▸ Login Items & Extensions ▸ Network Extensions."
+        case .extensionNotFound:
+            return "The extension is missing from the app bundle. Rebuild with `make macos`."
+        case .missingEntitlement:
+            return "The app is missing the System Extension entitlement. Check Apps/macOS/App.entitlements."
+        case .unsupportedParentBundleLocation:
+            return "Sweep must be launched from /Applications to install a system extension."
+        case .codeSignatureInvalid:
+            return """
+            Invalid code signature. A build made with CODE_SIGNING_REQUIRED=NO cannot \
+            install a system extension — sign with the real Developer ID identity.
+            """
+        case .duplicateExtensionIdentifer:
+            return "Another copy of Sweep is already installed. Remove it, then retry."
+        case .requestCanceled, .requestSuperseded:
+            return "The install request was superseded. Try again."
+        default:
+            return "System extension error \(ns.code): \(error.localizedDescription)"
+        }
     }
 }
 

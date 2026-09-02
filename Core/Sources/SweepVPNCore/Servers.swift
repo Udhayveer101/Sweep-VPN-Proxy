@@ -12,11 +12,16 @@ public struct ServerEndpoint: Codable, Sendable, Equatable, Hashable {
     /// Base64 credential the rung needs (the Shadowsocks-2022 PSK). Carried in
     /// the *signed* bundle and stored only in the Keychain.
     public var secret: String?
+    /// Full `.ovpn` text for the OpenVPN rungs, carrying the relay's inline
+    /// CA/cert/key. Nil for every WireGuard rung.
+    public var openVPNProfile: String?
 
     public init(host: String, port: UInt16, rung: ProtocolRung,
-                sni: String? = nil, secret: String? = nil) {
+                sni: String? = nil, secret: String? = nil,
+                openVPNProfile: String? = nil) {
         self.host = host; self.port = port; self.rung = rung
         self.sni = sni; self.secret = secret
+        self.openVPNProfile = openVPNProfile
     }
 
     public var secretData: Data? { secret.flatMap { Data(base64Encoded: $0) } }

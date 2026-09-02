@@ -9,6 +9,11 @@ public enum TunnelState: Equatable, Sendable, Codable {
     case connecting(rung: ProtocolRung)
     case handshaking(rung: ProtocolRung)
     case connected(rung: ProtocolRung, server: ServerID)
+    /// The system reports our tunnel up, but the provider has not yet answered
+    /// over IPC, so we do not know the rung or the server. Never guess them:
+    /// a fabricated "Protected via X on WireGuard" is a security claim we
+    /// cannot substantiate. Forwarding is not asserted in this state.
+    case verifying
     case reasserting          // network changed, forwarding suspended
     case reconnecting(attempt: Int)
     case degraded(rung: ProtocolRung, reason: DegradeReason)

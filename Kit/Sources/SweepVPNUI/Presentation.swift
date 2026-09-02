@@ -38,6 +38,12 @@ public struct Presentation: Equatable, Sendable {
             return .init(headline: "Connecting…", detail: "Verifying the server",
                          tint: .neutral, primaryAction: .cancel, primaryActionTitle: "Cancel",
                          showsQuality: false, voiceOver: "Verifying the server.")
+        case .verifying:
+            return .init(headline: "Connected — confirming…",
+                         detail: "The tunnel is up. Waiting on the extension to report which server and protocol.",
+                         tint: .neutral, primaryAction: .disconnect, primaryActionTitle: "Disconnect",
+                         showsQuality: false,
+                         voiceOver: "Connected. Confirming the server and protocol.")
         case .connected:
             return .init(headline: "Protected", detail: serverName ?? "Connected",
                          tint: .good, primaryAction: .disconnect, primaryActionTitle: "Disconnect",
