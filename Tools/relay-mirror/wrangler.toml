@@ -1,3 +1,4 @@
 name = "sweep-relay-mirror"
-main = "worker.js"
+main = "tunnel.js"
 compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
