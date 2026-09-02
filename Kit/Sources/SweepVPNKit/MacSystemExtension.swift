@@ -30,6 +30,17 @@ public final class MacSystemExtensionInstaller: NSObject, OSSystemExtensionReque
     /// Reasons activation is refused before it ever reaches the daemon.
     /// These are the overwhelmingly common causes of the generic
     /// "permission denied" a user sees, and none of them are tunnel bugs.
+    /// True when the providers ship as `.systemextension` (Developer ID packaging).
+    /// When they ship as `.appex` in `Contents/PlugIns` instead, NetworkExtension
+    /// loads them directly and `OSSystemExtensionManager` has nothing to activate —
+    /// asking it to would fail with `extensionNotFound` and read to the user as a
+    /// permission problem that does not exist.
+    public static func usesSystemExtensionPackaging(bundle: Bundle = .main) -> Bool {
+        let dir = bundle.bundleURL.appendingPathComponent("Contents/Library/SystemExtensions")
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        return contents.contains { $0.hasSuffix(".systemextension") }
+    }
+
     public static func preflightFailure(bundle: Bundle = .main) -> String? {
         let path = bundle.bundlePath
         // `OSSystemExtensionManager` only accepts requests from an app inside
@@ -48,6 +59,11 @@ public final class MacSystemExtensionInstaller: NSObject, OSSystemExtensionReque
 
     public func activate(onStatus: @escaping @Sendable (Status) -> Void) {
         self.onStatus = onStatus
+        // App-extension packaging needs no activation step at all.
+        guard Self.usesSystemExtensionPackaging() else {
+            onStatus(.active)
+            return
+        }
         if let reason = Self.preflightFailure() {
             onStatus(.failed(reason))
             return

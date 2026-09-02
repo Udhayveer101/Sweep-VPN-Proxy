@@ -28,14 +28,24 @@ public final class VPNConfigurator: @unchecked Sendable {
     public func loadManager() async throws -> NETunnelProviderManager {
         if let manager { return manager }
         let existing = try await NETunnelProviderManager.loadAllFromPreferences()
-        let ours = existing.first {
-            ($0.protocolConfiguration as? NETunnelProviderProtocol)?
-                .providerBundleIdentifier == bundleIdentifier
-        }
+        let ours = Self.selectOurs(from: existing, bundleIdentifier: bundleIdentifier)
         let m = ours ?? NETunnelProviderManager()
         ownsProfile = (ours != nil)
         manager = m
         return m
+    }
+
+    /// Picks the profile whose provider is `bundleIdentifier`, or nil.
+    ///
+    /// Split out from `loadManager()` so it can be tested without touching system
+    /// preferences. A typical Mac carries several unrelated VPN profiles, and the
+    /// old `.first` returned whichever the OS listed first.
+    static func selectOurs(from managers: [NEVPNManager],
+                           bundleIdentifier: String) -> NETunnelProviderManager? {
+        managers.lazy.compactMap { $0 as? NETunnelProviderManager }.first {
+            ($0.protocolConfiguration as? NETunnelProviderProtocol)?
+                .providerBundleIdentifier == bundleIdentifier
+        }
     }
 
     /// Whether a Sweep profile actually exists in system preferences.
