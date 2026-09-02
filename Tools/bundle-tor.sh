@@ -54,14 +54,20 @@ done
 # copying. Without it Tor cannot use bridges, and on networks that block Tor
 # outright (observed: CONNECTRESET at 14% bootstrap from an Indian ISP) a direct
 # connection never completes.
-OBFS4="$(command -v obfs4proxy || echo /opt/homebrew/bin/obfs4proxy)"
-if [ -x "$OBFS4" ]; then
-  cp -f "$OBFS4" "$DEST/obfs4proxy"
-  chmod u+w "$DEST/obfs4proxy"
-  codesign --force --timestamp=none --options runtime --sign "$IDENTITY" "$DEST/obfs4proxy"
-else
-  echo "warning: obfs4proxy not found; bridges will be unavailable (brew install obfs4proxy)" >&2
-fi
+# obfs4proxy handles both obfs4 and meek_lite; snowflake-client is separate.
+# All are static Go binaries with no non-system dylibs, so they only need
+# copying. Each is a step in the fallback chain: on networks that block Tor
+# outright a direct bootstrap never completes.
+for T in obfs4proxy snowflake-client meek-client; do
+  SRC_T="$(command -v "$T" || echo "/opt/homebrew/bin/$T")"
+  if [ -x "$SRC_T" ]; then
+    cp -f "$SRC_T" "$DEST/$T"
+    chmod u+w "$DEST/$T"
+    codesign --force --timestamp=none --options runtime --sign "$IDENTITY" "$DEST/$T"
+  else
+    echo "warning: $T not found; that transport is unavailable (brew install $T)" >&2
+  fi
+done
 
 # Sign inside-out: dylibs first, then the executable that loads them.
 for F in "$DEST"/*.dylib; do

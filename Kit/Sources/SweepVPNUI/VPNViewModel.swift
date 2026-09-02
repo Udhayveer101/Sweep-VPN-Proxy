@@ -80,8 +80,7 @@ public final class VPNViewModel: ObservableObject {
             return
         }
         tor = controller
-        let bridges = options.torBridges
-        controller.start(reachability: bridges.isEmpty ? .direct : .bridges(bridges)) { [weak self] st in
+        controller.start(userBridges: options.torBridges) { [weak self] st in
             Task { @MainActor in
                 self?.torState = st
                 // The proxy's upstream depends on whether Tor is actually ready;

@@ -74,7 +74,7 @@ public struct SettingsView: View {
                         Text(progress).font(.footnote).foregroundStyle(.secondary)
                             .textSelection(.enabled)
                     }
-                    Text("Runs Tor inside Sweep and sends its circuits through the VPN, so the exit relay sees the VPN server rather than your connection. Connect the VPN first: on networks that block Tor outright, a direct bootstrap never finishes.")
+                    Text("Runs Tor inside Sweep and sends its circuits through the VPN, so the exit relay sees the VPN server rather than your connection. Connect the VPN first — your ISP blocks Tor directly, and with the VPN up it only sees WireGuard traffic. Without the VPN, Sweep still tries bridges, Snowflake and meek in turn, but none of them completed on this network.")
                         .font(.footnote).foregroundStyle(.secondary)
 
                     Toggle("Local proxy", isOn: Binding(

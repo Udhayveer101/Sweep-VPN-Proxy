@@ -36,5 +36,37 @@ final class TorControllerTests: XCTestCase {
         tor.ingest(log: "[notice] Bootstrapped 100% (done): Done\n")
         XCTAssertEqual(tor.state, .running)
     }
+
+    // MARK: - Transport chain
+
+    func testChainTriesCheapTransportsBeforeExpensiveOnes() {
+        let chain = TorController.Reachability.chain(userBridges: [])
+        XCTAssertEqual(chain.first, .direct, "direct is free and works over the VPN")
+        XCTAssertEqual(chain.last, .meek, "meek is slowest, so it goes last")
+        XCTAssertTrue(chain.contains(.snowflake))
+        // Snowflake must be tried before meek: it is far faster when it works.
+        let snowflakeIndex = try? XCTUnwrap(chain.firstIndex(of: .snowflake))
+        let meekIndex = try? XCTUnwrap(chain.firstIndex(of: .meek))
+        XCTAssertLessThan(snowflakeIndex ?? 99, meekIndex ?? 0)
+    }
+
+    /// A user who pasted their own bridges got them from bridges.torproject.org
+    /// for this network specifically, so they must be tried before the public
+    /// defaults that are already widely blocked.
+    func testUserSuppliedBridgesArePreferredOverPublicDefaults() {
+        let mine = ["obfs4 1.2.3.4:443 AAAA cert=x iat-mode=0"]
+        let chain = TorController.Reachability.chain(userBridges: mine)
+        let mineIndex = chain.firstIndex(of: .bridges(mine))
+        let defaultsIndex = chain.firstIndex(of: .bridges(TorController.Reachability.defaultBridgeLines))
+        XCTAssertNotNil(mineIndex)
+        XCTAssertNotNil(defaultsIndex)
+        XCTAssertLessThan(mineIndex ?? 99, defaultsIndex ?? 0)
+    }
+
+    func testEveryChainStepIsDistinct() {
+        let chain = TorController.Reachability.chain(userBridges: ["obfs4 9.9.9.9:1 B cert=y"])
+        XCTAssertEqual(chain.count, Set(chain.map(String.init(describing:))).count,
+                       "a repeated step wastes a whole stall timeout")
+    }
 }
 #endif

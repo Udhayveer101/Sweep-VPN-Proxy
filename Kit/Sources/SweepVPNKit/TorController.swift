@@ -32,24 +32,55 @@ public final class TorController: @unchecked Sendable {
 
     /// How Tor should reach the network.
     public enum Reachability: Equatable, Sendable {
-        /// Connect straight to relays. Fine over the VPN, or on an unfiltered network.
+        /// Connect straight to relays. This is the path that works once the VPN
+        /// is up, because the ISP then sees only WireGuard to the exit server.
         case direct
-        /// Connect through obfs4 bridges. Needed where Tor itself is blocked —
-        /// which is the observed behaviour on Indian consumer ISPs, where a direct
-        /// bootstrap stalls at 14% with CONNECTRESET.
+        /// obfs4 bridges: relays disguised as random bytes.
         case bridges([String])
+        /// Snowflake: rendezvous with volunteer proxies over a domain-fronted
+        /// broker, then WebRTC. Beats IP blocking of bridges.
+        case snowflake
+        /// meek: every byte tunnelled inside HTTPS to a big CDN. Slowest, but
+        /// the hardest to block without blocking the CDN itself.
+        case meek
 
-        /// Tor Project's published default obfs4 bridges, the same set Tor Browser
-        /// ships. They are public by design, but they are also widely blocked, so
-        /// they are a fallback and not a substitute for bridges requested from
+        /// Tor Project's published default obfs4 bridges, the same set Tor
+        /// Browser ships. Public by design and therefore widely blocked, so they
+        /// are a step in the chain, not a substitute for bridges requested from
         /// https://bridges.torproject.org for a specific network.
-        public static var defaultBridges: Reachability {
-            .bridges([
-                "obfs4 192.95.36.142:443 CDF2E852BF539B82BD10E27E9115A31734E378C2 cert=qUVQ0srL1JI/vO6V6m/24anYXiJD3QP2HgzUKQtQ7GRqqUvs7P+tG43RtAqdhLOALP7DJQ iat-mode=1",
-                "obfs4 37.218.245.14:38224 D9A82D2F9C2F65A18407B1D2B764F130847F8B5D cert=bjRaMrr1BRiAW8IE9U5z27fQaYgOhX1UCmOpg2pFpoMvo6ZgQMzLsaTzzQNTlm7hNcb+Sg iat-mode=0",
-                "obfs4 85.31.186.98:443 011F2599C0E9B27EE74B353155E244813763C3E5 cert=ayq0XzCwhpdysn5o0EyDUbmSOx3X/oTEbzDMvczHOdBJKlvIdHHLJGkZARtT4dcBFArPPg iat-mode=0",
-                "obfs4 85.31.186.26:443 91A6354697E6B02A386312F68D82CF86824D3606 cert=PBwr+S8JTVZo6MPdHnkTwXJPILWADLqfMGoVvhZClMq/Urndyd42BwX9YFJHZnBB3H0XCw iat-mode=0",
-            ])
+        static let defaultBridgeLines = [
+            "obfs4 192.95.36.142:443 CDF2E852BF539B82BD10E27E9115A31734E378C2 cert=qUVQ0srL1JI/vO6V6m/24anYXiJD3QP2HgzUKQtQ7GRqqUvs7P+tG43RtAqdhLOALP7DJQ iat-mode=1",
+            "obfs4 37.218.245.14:38224 D9A82D2F9C2F65A18407B1D2B764F130847F8B5D cert=bjRaMrr1BRiAW8IE9U5z27fQaYgOhX1UCmOpg2pFpoMvo6ZgQMzLsaTzzQNTlm7hNcb+Sg iat-mode=0",
+            "obfs4 85.31.186.98:443 011F2599C0E9B27EE74B353155E244813763C3E5 cert=ayq0XzCwhpdysn5o0EyDUbmSOx3X/oTEbzDMvczHOdBJKlvIdHHLJGkZARtT4dcBFArPPg iat-mode=0",
+            "obfs4 85.31.186.26:443 91A6354697E6B02A386312F68D82CF86824D3606 cert=PBwr+S8JTVZo6MPdHnkTwXJPILWADLqfMGoVvhZClMq/Urndyd42BwX9YFJHZnBB3H0XCw iat-mode=0",
+        ]
+
+        public static var defaultBridges: Reachability { .bridges(defaultBridgeLines) }
+
+        /// Ordered from fastest to most evasive. Each step costs a stall timeout,
+        /// so the cheap options come first. Measured on an Indian consumer ISP:
+        /// direct stalls at 14% (CONNECTRESET), the public obfs4 bridges are
+        /// blocked, snowflake reaches its broker but its WebRTC data channel
+        /// times out, and meek reaches a relay but does not finish either. On
+        /// that network only Tor-over-VPN completes — which is why the app tells
+        /// the user to connect the VPN rather than pretending a transport will
+        /// save them.
+        static func chain(userBridges: [String]) -> [Reachability] {
+            var steps: [Reachability] = [.direct]
+            if !userBridges.isEmpty { steps.append(.bridges(userBridges)) }
+            steps.append(.bridges(defaultBridgeLines))
+            steps.append(.snowflake)
+            steps.append(.meek)
+            return steps
+        }
+
+        var label: String {
+            switch self {
+            case .direct:    return "Starting Tor"
+            case .bridges:   return "Trying Tor bridges"
+            case .snowflake: return "Trying Snowflake"
+            case .meek:      return "Trying meek (slow)"
+            }
         }
     }
 
@@ -65,22 +96,45 @@ public final class TorController: @unchecked Sendable {
         return FileManager.default.isExecutableFile(atPath: url.path) ? url : nil
     }
 
+    /// Any bundled pluggable-transport binary, by filename.
+    private static func bundledTransport(_ name: String, bundle: Bundle = .main) -> URL? {
+        let url = bundle.bundleURL.appendingPathComponent("Contents/Resources/tor/\(name)")
+        return FileManager.default.isExecutableFile(atPath: url.path) ? url : nil
+    }
+
     private let obfs4: URL?
+    private let snowflake: URL?
+    private let meek: URL?
     private var reachability: Reachability = .direct
-    /// Set once we have already retried with bridges, so we do not loop.
-    private var triedBridges = false
+    /// Remaining steps of the transport chain, consumed on each stall.
+    private var remainingSteps: [Reachability] = []
+    /// True while we are tearing down one transport to start the next.
+    private var advancing = false
     private var stallTimer: DispatchSourceTimer?
 
     public init?(socksPort: Int = 9150, bundle: Bundle = .main) {
         guard let exe = Self.bundledExecutable(bundle: bundle) else { return nil }
         self.executable = exe
         self.obfs4 = Self.bundledObfs4(bundle: bundle)
+        self.snowflake = Self.bundledTransport("snowflake-client", bundle: bundle)
+        self.meek = Self.bundledTransport("meek-client", bundle: bundle)
         self.socksPort = socksPort
         // Application Support inside the sandbox container: writable, and it
         // persists the consensus so restarts do not re-download the directory.
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
                                             in: .userDomainMask).first!
         self.dataDirectory = base.appendingPathComponent("SweepVPN/tor", isDirectory: true)
+    }
+
+    /// Walks the whole transport chain, most-preferred first.
+    public func start(userBridges: [String] = [],
+                      onState: @escaping @Sendable (State) -> Void) {
+        var steps = Reachability.chain(userBridges: userBridges)
+        let first = steps.removeFirst()
+        lock.lock()
+        remainingSteps = steps
+        lock.unlock()
+        start(reachability: first, onState: onState)
     }
 
     public func start(reachability: Reachability = .direct,
@@ -119,15 +173,7 @@ public final class TorController: @unchecked Sendable {
             "--Log", "notice stdout",
         ]
 
-        if case .bridges(let lines) = reachability, let obfs4, !lines.isEmpty {
-            p.arguments?.append(contentsOf: [
-                "--UseBridges", "1",
-                "--ClientTransportPlugin", "obfs4 exec \(obfs4.path)",
-            ])
-            for line in lines {
-                p.arguments?.append(contentsOf: ["--Bridge", line])
-            }
-        }
+        p.arguments?.append(contentsOf: bridgeArguments(for: reachability))
 
         let pipe = Pipe()
         p.standardOutput = pipe
@@ -139,7 +185,15 @@ public final class TorController: @unchecked Sendable {
         }
         p.terminationHandler = { [weak self] proc in
             guard let self else { return }
-            self.lock.lock(); self.process = nil; self.lock.unlock()
+            self.lock.lock()
+            self.process = nil
+            // We killed this one on purpose to try the next transport; the
+            // successor has already published its own state, so reporting
+            // "stopped" here would clobber it.
+            let deliberate = self.advancing
+            self.advancing = false
+            self.lock.unlock()
+            if deliberate { return }
             if case .running = self.state {
                 self.state = .failed("Tor exited unexpectedly (status \(proc.terminationStatus)).")
             } else if case .failed = self.state {
@@ -152,11 +206,24 @@ public final class TorController: @unchecked Sendable {
         do {
             try p.run()
             process = p
-            state = .starting(percent: 0, summary: bridgeSummary())
+            state = .starting(percent: 0, summary: reachability.label)
             armStallWatchdog()
         } catch {
             state = .failed("Could not launch Tor: \(error.localizedDescription)")
         }
+    }
+
+    /// Kill the current tor without discarding the remaining chain, so the next
+    /// transport can be tried. `stop()` is the user-facing teardown and clears it.
+    private func stopProcessOnly() {
+        lock.lock()
+        let p = process
+        process = nil
+        advancing = (p != nil)
+        stallTimer?.cancel()
+        stallTimer = nil
+        lock.unlock()
+        p?.terminate()
     }
 
     public func stop() {
@@ -165,44 +232,86 @@ public final class TorController: @unchecked Sendable {
         process = nil
         stallTimer?.cancel()
         stallTimer = nil
-        triedBridges = false
+        remainingSteps = []
         lock.unlock()
         p?.terminate()
         state = .stopped
     }
 
-    private func bridgeSummary() -> String {
-        if case .bridges = reachability { return "Starting Tor via bridges" }
-        return "Starting Tor"
+    /// Tor is configured entirely on the command line: a transport plugin plus
+    /// the bridge lines that name it. A transport whose binary is missing
+    /// contributes nothing rather than producing a half-configured tor that
+    /// would fail in a confusing way.
+    private func bridgeArguments(for reachability: Reachability) -> [String] {
+        switch reachability {
+        case .direct:
+            return []
+
+        case .bridges(let lines):
+            guard let obfs4, !lines.isEmpty else { return [] }
+            var args = ["--UseBridges", "1",
+                        "--ClientTransportPlugin", "obfs4 exec \(obfs4.path)"]
+            for line in lines { args += ["--Bridge", line] }
+            return args
+
+        case .snowflake:
+            guard let snowflake else { return [] }
+            // The address is a placeholder by design: snowflake rendezvouses
+            // through the broker named in `url`, fronted behind `fronts`, and
+            // never dials this IP.
+            let bridge = "snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 "
+                + "fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 "
+                + "url=https://1098762253.rsc.cdn77.org/ "
+                + "fronts=www.cdn77.com,www.phpmyadmin.net "
+                + "ice=stun:stun.l.google.com:19302,stun:stun.antisip.com:3478 "
+                + "utls-imitate=hellorandomizedalpn"
+            return ["--UseBridges", "1",
+                    "--ClientTransportPlugin", "snowflake exec \(snowflake.path)",
+                    "--Bridge", bridge]
+
+        case .meek:
+            guard let meek else { return [] }
+            let bridge = "meek_lite 192.0.2.20:80 97700DFE9F483596DDA6264C4D7DF7641E1E39CE "
+                + "url=https://1314488750.rsc.cdn77.org/ front=www.phpmyadmin.net "
+                + "utls=HelloRandomizedALPN"
+            return ["--UseBridges", "1",
+                    "--ClientTransportPlugin", "meek_lite exec \(meek.path)",
+                    "--Bridge", bridge]
+        }
     }
 
     /// A blocked network does not fail — it stalls. Tor keeps retrying relays it
-    /// can never reach, so without a deadline the UI sits at 14% forever. If a
-    /// direct bootstrap has not completed in time, retry once over bridges.
-    private func armStallWatchdog(seconds: Int = 45) {
+    /// can never reach, so without a deadline the UI sits at a low percentage
+    /// forever. On each stall, move to the next transport in the chain.
+    ///
+    /// meek gets longer: it tunnels through a CDN and is genuinely slow rather
+    /// than stuck, so the deadline that catches a block would also kill a
+    /// connection that was going to succeed.
+    private func armStallWatchdog(seconds: Int? = nil) {
         stallTimer?.cancel()
+        let deadline = seconds ?? (reachability == .meek ? 120 : 45)
         let timer = DispatchSource.makeTimerSource(queue: .global())
-        timer.schedule(deadline: .now() + .seconds(seconds))
+        timer.schedule(deadline: .now() + .seconds(deadline))
         timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            guard self.state != .running else { return }
+            guard let self, self.state != .running else { return }
+
             self.lock.lock()
-            let shouldFallBack = !self.triedBridges && self.obfs4 != nil
-            self.triedBridges = true
+            let next = self.remainingSteps.isEmpty ? nil : self.remainingSteps.removeFirst()
+            let onState = self.onState
             self.lock.unlock()
 
-            guard shouldFallBack, let onState = self.onState else {
-                if self.state != .running {
-                    self.state = .failed("""
-                    Tor could not connect. This network appears to block it. \
-                    Connect the VPN first and try again, or request bridges from \
-                    https://bridges.torproject.org
-                    """)
-                }
+            guard let next, let onState else {
+                self.state = .failed("""
+                Tor could not connect on this network — every transport was \
+                blocked, including bridges, Snowflake and meek. Connect the VPN \
+                first: Tor then builds its circuits from the VPN exit, where it \
+                is not blocked. You can also add bridges from \
+                https://bridges.torproject.org.
+                """)
                 return
             }
-            self.stop()
-            self.start(reachability: .defaultBridges, onState: onState)
+            self.stopProcessOnly()
+            self.start(reachability: next, onState: onState)
         }
         timer.resume()
         stallTimer = timer
