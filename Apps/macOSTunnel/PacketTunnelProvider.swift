@@ -23,4 +23,10 @@ final class PacketTunnelProvider: SweepPacketTunnelProvider {
     override var backoffStore: StartBackoffStore? {
         StartBackoffStore(appGroup: AppConfig.appGroup)
     }
+
+    /// macOS is the only platform where the OpenVPN rungs are built, so it is
+    /// the only one that can act on a chosen public relay.
+    override var relayStore: RelaySelectionStore? {
+        RelaySelectionStore(appGroup: AppConfig.appGroup)
+    }
 }

@@ -6,7 +6,8 @@ import SweepVPNUI
 @main
 struct SweepVPNApp: App {
     @StateObject private var model = VPNViewModel(
-        configurator: VPNConfigurator(bundleIdentifier: AppConfig.tunnelBundleID))
+        configurator: VPNConfigurator(bundleIdentifier: AppConfig.tunnelBundleID),
+        appGroup: AppConfig.appGroup)
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {

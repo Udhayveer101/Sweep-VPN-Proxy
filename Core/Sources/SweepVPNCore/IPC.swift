@@ -10,6 +10,10 @@ public enum AppToProvider: Codable, Sendable, Equatable {
     case exportDiagnostics
     case getServers
     case selectServer(ServerID)
+    /// The app changed which public relay is selected, in the shared store.
+    /// The relay itself does not travel here — it is too big for a message and
+    /// has to survive the extension restarting anyway.
+    case relaySelectionChanged
 }
 
 public struct ProviderStatus: Codable, Sendable, Equatable {

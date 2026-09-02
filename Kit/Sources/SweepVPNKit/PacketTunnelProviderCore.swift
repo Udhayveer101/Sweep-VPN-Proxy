@@ -64,6 +64,9 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// Where the failed-start streak is kept between extension launches.
     /// Platform targets point this at the shared app group.
     open var backoffStore: StartBackoffStore? { nil }
+    /// Where the user's chosen public relay is kept, if the platform target
+    /// supports the OpenVPN rungs.
+    open var relayStore: RelaySelectionStore? { nil }
 
     // MARK: - Lifecycle
 
@@ -132,22 +135,46 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
 
     private func beginConnection() throws {
         guard let store = configStore else { throw ConfigError.badSignature }
-        guard let bundle = try store.loadBundle() else { throw ConfigError.noServers }
 
-        catalog = ServerCatalog(servers: bundle.servers, rung: .wireGuardUDP)
+        // A chosen public relay is its own mode. There is no signed bundle
+        // behind it — that is the whole point of the separation — so it must
+        // not be gated on one, and it pins exactly the relay the user picked
+        // rather than racing a ladder the relay is not part of.
+        let relay = relayStore?.load()
+        let bundle = try store.loadBundle()
+        guard bundle != nil || relay != nil else { throw ConfigError.noServers }
+
+        catalog = relay.map { ServerCatalog(servers: [$0], rungs: Set($0.endpoints.map(\.rung))) }
+            ?? ServerCatalog(servers: bundle?.servers ?? [], rung: .wireGuardUDP)
         let memoryStore = NetworkMemoryStore(store: store.store)
         self.memoryStore = memoryStore
         let fingerprint = currentFingerprint(store: store)
         self.fingerprint = fingerprint
         let memory = fingerprint.map { memoryStore.memory(for: $0) } ?? NetworkMemory()
 
-        let enabled = Set(bundle.enabledRungs).intersection(AdapterFactory.implementedRungs)
+        let enabled: Set<ProtocolRung>
+        let activePreference: ProtocolPreference
+        if let relay {
+            // Only the rungs this relay actually offers, and forced, because
+            // Automatic deliberately will not select an OpenVPN rung.
+            enabled = Set(relay.endpoints.map(\.rung))
+                .intersection(AdapterFactory.implementedRungs)
+            activePreference = enabled.min().map { ProtocolPreference.forced($0) } ?? preference
+        } else {
+            enabled = Set(bundle?.enabledRungs ?? []).intersection(AdapterFactory.implementedRungs)
+            activePreference = preference
+        }
         guard !enabled.isEmpty else { throw AdapterFactoryError.rungNotImplemented(.wireGuardUDP) }
-        let engine = AutoModeEngine(preference: preference, enabledRungs: enabled)
+        let engine = AutoModeEngine(preference: activePreference, enabledRungs: enabled)
 
         // Operators that register a key per config ship it in the bundle; our
         // own machines all use the one key generated on this device.
-        let deviceKey = try store.devicePrivateKey().rawRepresentation.base64EncodedString()
+        // OpenVPN relays authenticate with the profile's own certificate, so
+        // there is no device key involved; only the WireGuard rungs need one.
+        let deviceKey = relay == nil
+            ? try store.devicePrivateKey().rawRepresentation.base64EncodedString()
+            : ""
+
         let signals = currentSignals()
         lastSignals = signals
         let keepalive = KeepalivePolicy.interval(isExpensive: signals.isExpensive,
@@ -434,6 +461,16 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             case .selectServer(let id):
                 self.diagnostics.record("serverSelected", id)
                 self.coordinator?.reassert()
+                completionHandler?(try? IPCCodec.encode(ProviderToApp.status(self.status())))
+            case .relaySelectionChanged:
+                // The app wrote a new relay to the shared store. Rebuild the
+                // connection against it rather than reasserting the old one,
+                // which would keep the previous relay's session alive.
+                self.diagnostics.record("relaySelectionChanged")
+                self.teardown()
+                self.machine.transition(to: .reasserting)
+                do { try self.beginConnection() }
+                catch { self.fail(.noServersAvailable, error, nil) }
                 completionHandler?(try? IPCCodec.encode(ProviderToApp.status(self.status())))
             }
         }

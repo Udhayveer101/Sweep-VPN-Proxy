@@ -9,7 +9,8 @@ import SweepVPNUI
 @main
 struct SweepVPNMacApp: App {
     @StateObject private var model = VPNViewModel(
-        configurator: VPNConfigurator(bundleIdentifier: AppConfig.tunnelBundleID))
+        configurator: VPNConfigurator(bundleIdentifier: AppConfig.tunnelBundleID),
+        appGroup: AppConfig.appGroup)
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {

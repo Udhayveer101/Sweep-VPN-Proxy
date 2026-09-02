@@ -185,8 +185,14 @@ public final class VPNViewModel: ObservableObject {
     private var catalog = ServerCatalog()
     private var pollTask: Task<Void, Never>?
 
-    public init(configurator: VPNConfigurator) {
+    /// App group shared with the extension. `AppConfig` owns the real value but
+    /// lives in the app targets, which this package cannot import, so the app
+    /// passes it in.
+    private let appGroup: String
+
+    public init(configurator: VPNConfigurator, appGroup: String = "group.com.sweep.vpn") {
         self.configurator = configurator
+        self.appGroup = appGroup
         self.presentation = Presentation.make(state: .disconnected, serverName: nil,
                                               killSwitchArmed: true, onDemandArmed: true, quality: nil)
         if !UserDefaults.standard.bool(forKey: "sweep.onboarded") { activeSheet = .onboarding }
@@ -492,7 +498,16 @@ public final class VPNViewModel: ObservableObject {
 
     public var isAutomaticSelected: Bool { selectedServerID == nil || selectedServerID == automaticID }
 
+    /// Drop back to our own servers, clearing any pinned relay.
+    public func clearRelaySelection() {
+        #if os(macOS)
+        RelaySelectionStore(appGroup: appGroup).clear()
+        Task { _ = try? await configurator.send(.relaySelectionChanged) }
+        #endif
+    }
+
     public func selectAutomatic() {
+        clearRelaySelection()
         selectedServerID = automaticID
         serverName = catalog.fastest(includeAccountRequired: showAccountOnlyServers)?.name
         recompute()
@@ -503,7 +518,20 @@ public final class VPNViewModel: ObservableObject {
         selectedServerID = server.id
         serverName = server.name
         recompute()
-        Task { _ = try? await configurator.send(.selectServer(server.id)) }
+
+        // A public relay is not in the provider's signed catalog and never will
+        // be, so it is handed over through the shared store instead — which is
+        // also what lets it survive the extension being restarted.
+        guard server.isThirdPartyRelay else {
+            Task { _ = try? await configurator.send(.selectServer(server.id)) }
+            return
+        }
+        #if os(macOS)
+        RelaySelectionStore(appGroup: appGroup).save(server)
+        Task { _ = try? await configurator.send(.relaySelectionChanged) }
+        #else
+        lastError = "Public relays need the OpenVPN rung, which this build only has on macOS."
+        #endif
     }
 
     public func setShowAccountOnlyServers(_ show: Bool) {
