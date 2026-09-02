@@ -53,9 +53,13 @@ down on failure and remembers per network what worked.
 Rungs 8–9 are **not** part of that ladder. OpenVPN is a different protocol with
 different crypto, terminating on a volunteer's machine whose key is not ours, so
 `Automatic` filters them out entirely (`ProtocolRung.isOwnWireGuardTunnel`) and
-they are reachable only by picking a relay by hand. The data plane for them is
-not built yet: `AdapterFactory.implementedRungs` excludes them, so selecting one
-fails loudly rather than pretending.
+they are reachable only by picking a relay by hand.
+
+They run on **macOS only** so far. `DataPlane/sweepovpn` is a C ABI over
+OpenVPN 3 — the same core OpenVPN Connect ships — and its xcframework carries
+OpenSSL, lz4 and fmt statically; those still need cross-compiling for the iOS
+slices. `AdapterFactory.implementedRungs` reflects that, so the rungs are not
+offered where they cannot run.
 
 Server side: `Server/sweepbridge` (Rust) terminates TCP/TLS/QUIC and relays to
 wg0; rung 5 needs only a stock `ssserver`.
@@ -80,9 +84,23 @@ Two things to know before relying on them:
 - **The operator sees your traffic.** A relay terminates it in plaintext, and
   the `LogType` column is that operator's own unverifiable claim about what they
   keep. The picker shows it per row.
-- **You cannot connect to one yet.** The OpenVPN data plane is not built, so the
-  list is browsable and measurable but selecting a relay reports
-  `rungNotImplemented`. That is deliberate — see the ladder note above.
+- **Roughly a third of them are dead at any moment.** They are volunteer boxes.
+  A sample of ten picked at random carried real traffic on seven; the other
+  three had gone away. The list is measured from the device for that reason —
+  advertised speed is a guess, a probe is not.
+- **macOS only.** Selecting a relay on iOS says so rather than silently failing.
+
+How the packets move: OpenVPN 3 wants a tun file descriptor and an extension
+has `packetFlow` instead, so `tun_builder_establish()` hands it one end of a
+`SOCK_DGRAM` socketpair and pumps the other. OpenVPN 3 also treats that
+descriptor as an Apple utun and frames every packet with a 4-byte address
+family, which `packetFlow` does not use — the shim adds and strips it. The
+address, resolvers and routes arrive in `PUSH_REPLY`, so they are validated
+(`PushedTunnelSettings`) before they reach the network settings.
+
+`DataPlane/sweepovpn/test/harness.c` proves the whole path outside the app: it
+connects to a relay, pushes a real IPv4/UDP DNS query through the tunnel and
+waits for the reply.
 
 If your ISP blocks `vpngate.net` by category (Indian residential ISPs return a
 403 block page), set a mirror URL in the picker. A Cloudflare Worker that

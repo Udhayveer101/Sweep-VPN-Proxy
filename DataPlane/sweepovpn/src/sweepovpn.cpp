@@ -476,6 +476,16 @@ SweepOvpnClient *sweep_ovpn_new(const char *profile,
         return nullptr;
     }
 
+    // VPN Gate's published credential. Some relays carry no auth-user-pass in
+    // their profile yet still demand a login and answer AUTH_FAILED without one
+    // — 219.100.37.128 is one such. This is the documented public value from
+    // vpngate.net, identical for every user; it authenticates nobody and is not
+    // a secret, it is just the handshake those relays insist on.
+    ClientAPI::ProvideCreds creds;
+    creds.username = "vpn";
+    creds.password = "vpn";
+    handle->client->provide_creds(creds);
+
     return handle.release();
 }
 
