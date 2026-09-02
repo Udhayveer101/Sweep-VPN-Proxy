@@ -11,4 +11,8 @@
     <string>packet-tunnel-provider</string>
     <string>content-filter-provider</string>
   </array>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)group.com.sweep.vpn</string>
+	</array>
 </dict></plist>

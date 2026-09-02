@@ -26,6 +26,25 @@ final class StatusHonestyTests: XCTestCase {
         XCTAssertTrue(TunnelState.verifying.isBlocking)
     }
 
+    /// First run: a verified server list exists but no VPN profile has been
+    /// created yet. The button must offer Connect, because installing the
+    /// profile is what makes macOS show its approval prompt. Reporting
+    /// .notConfigured here turns the button into "How to finish setup", which
+    /// opens System Settings — and the user never sees a prompt at all.
+    func testFirstRunOffersConnectRatherThanSetup() {
+        let p = Presentation.make(state: .disconnected, serverName: nil,
+                                  killSwitchArmed: true, onDemandArmed: false, quality: nil)
+        XCTAssertEqual(p.primaryAction, .connect,
+                       "with no profile yet the primary action must create one")
+    }
+
+    /// The genuine not-configured case still routes to setup.
+    func testMissingServerListRoutesToSetup() {
+        let p = Presentation.make(state: .error(.notConfigured), serverName: nil,
+                                  killSwitchArmed: true, onDemandArmed: false, quality: nil)
+        XCTAssertEqual(p.primaryAction, .openSettings)
+    }
+
     /// The connected case is still allowed to make the claim — that path is fed
     /// only by the provider's own IPC status, which is authoritative.
     func testConnectedStillReportsProtected() {

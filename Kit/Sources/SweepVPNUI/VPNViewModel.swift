@@ -243,11 +243,14 @@ public final class VPNViewModel: ObservableObject {
     /// or nothing at all, so it is safe to render — but it carries no rung and no
     /// server name, and we must not invent either.
     private func applySystemStatus() {
-        // No Sweep profile in system preferences at all. This is "not set up",
-        // never "disconnected", and certainly never some other VPN's status.
+        // No Sweep profile in system preferences yet. That is the ordinary
+        // first-run state, NOT an error: `install()` is what creates the profile,
+        // and creating it is exactly what makes macOS show the approval prompt.
+        // Reporting .notConfigured here made the button "How to finish setup",
+        // which opens System Settings — so the prompt could never be reached.
+        // The only real "not configured" case is having no verified server list.
         guard configurator.hasInstalledProfile else {
-            state = hasVerifiedConfig ? .error(.notConfigured) : .error(configFailureKind)
-            serverName = nil
+            state = hasVerifiedConfig ? .disconnected : .error(configFailureKind)
             rung = nil
             recompute()
             return
