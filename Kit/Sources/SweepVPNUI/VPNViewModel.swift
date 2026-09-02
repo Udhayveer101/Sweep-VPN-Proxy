@@ -450,9 +450,17 @@ public final class VPNViewModel: ObservableObject {
     /// Relays ordered the way the user asked for: fastest measured first, then
     /// everything unmeasured. Reuses `ServerCatalog` so relays are scored by
     /// exactly the same rules as our own servers.
+    ///
+    /// TCP relays only. They are reached through the Worker tunnel, whose
+    /// `connect()` is a TCP socket, so a UDP relay has nothing to travel over —
+    /// and on this network a direct UDP relay is dead anyway. The relay's own
+    /// port no longer matters: the gateway sees a WSS session to Cloudflare and
+    /// never learns which port the Worker dialled, so this is not narrowed to
+    /// 443 and keeps most of the list rather than a handful of it.
     public var rankedRelays: [(Server, ServerProbe?)] {
-        ServerCatalog(servers: relays, probes: relayProbes,
-                      rungs: [.openVPNUDP, .openVPNTCP]).ranked()
+        let tcpOnly = relays.filter { $0.supports(.openVPNTCP) }
+        return ServerCatalog(servers: tcpOnly, probes: relayProbes,
+                             rungs: [.openVPNTCP]).ranked()
     }
 
     /// Countries present in the fetched list, for the picker's filter.
@@ -511,7 +519,7 @@ public final class VPNViewModel: ObservableObject {
         let targets = Array(rankedRelays.map(\.0).prefix(limit))
         let prober = ServerProber(timeout: 2.0, samples: 2)
         let results: [ServerProber.Result] = await withCheckedContinuation { continuation in
-            prober.probe(targets, rungs: [.openVPNUDP, .openVPNTCP]) { continuation.resume(returning: $0) }
+            prober.probe(targets, rungs: [.openVPNTCP]) { continuation.resume(returning: $0) }
         }
         for result in results { relayProbes[result.id] = result.probe }
         let reachable = results.filter { $0.probe.lossFraction < 1 }.count

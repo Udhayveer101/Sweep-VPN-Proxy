@@ -8,6 +8,10 @@ settings:
     SWIFT_VERSION: "6.0"
     SWEEP_CONFIG_SIGNING_KEY: "wVOJIuoa32ZZ5lSd8RmCaUOEFQIUYmidxFcK8bhYNYA="
     SWEEP_CONFIG_URL: ""
+    # Worker that carries a relay's TCP stream inside WSS, so the gateway's
+    # App Control has no plaintext OpenVPN handshake to fingerprint.
+    SWEEP_TUNNEL_URL: "https://relay-worker.example.workers.dev"
+    SWEEP_TUNNEL_TOKEN: "REDACTED-ROTATE-ME"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: P66SB4MX92
     ENABLE_USER_SCRIPT_SANDBOXING: NO

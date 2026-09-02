@@ -26,6 +26,17 @@ public enum AppConfig {
             .flatMap(URL.init(string:))
     }
 
+    /// Worker that carries a relay's TCP stream inside WSS. Injected at build
+    /// time so the token is not a literal in the source tree.
+    public static var tunnelURL: URL? {
+        (Bundle.main.object(forInfoDictionaryKey: "SweepTunnelURL") as? String)
+            .flatMap(URL.init(string:))
+    }
+
+    public static var tunnelToken: String {
+        (Bundle.main.object(forInfoDictionaryKey: "SweepTunnelToken") as? String) ?? ""
+    }
+
     public static var appBuild: Int {
         Int(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1") ?? 1
     }

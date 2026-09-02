@@ -11,3 +11,7 @@ Tools/relay-mirror/.wrangler/
 DataPlane/openvpn/openvpn3/
 DataPlane/openvpn/mbedtls/
 DataPlane/sweepovpn/build-mac/
+
+# Personal Worker token lives in project.yml as a build setting; keep local
+# override files out of the tree.
+/tmp/tunnel_token

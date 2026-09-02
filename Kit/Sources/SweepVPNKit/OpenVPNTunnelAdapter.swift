@@ -26,6 +26,12 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     private let server: Server
     private let profile: String
     private let queue = DispatchQueue(label: "vpn.sweep.ovpn", qos: .userInitiated)
+    /// Held for the adapter's lifetime when the relay is reached through the
+    /// Worker: it owns the loopback listener the OpenVPN core dials.
+    private var transport: WebSocketTransport?
+    private let appGroup: String
+    private let endpointHost: String
+    private let endpointPort: UInt16
 
     private var handle: OpaquePointer?
 
@@ -44,11 +50,51 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         return _pushed
     }
 
-    public init?(rung: ProtocolRung, server: Server, endpoint: ServerEndpoint) {
+    public init?(rung: ProtocolRung, server: Server, endpoint: ServerEndpoint,
+                 appGroup: String = "group.com.sweep.vpn") {
         guard let profile = endpoint.openVPNProfile, !profile.isEmpty else { return nil }
         self.rung = rung
         self.server = server
         self.profile = profile
+        self.appGroup = appGroup
+        self.endpointHost = endpoint.host
+        self.endpointPort = endpoint.port
+    }
+
+    /// Rewrite the profile so the OpenVPN core dials our loopback listener
+    /// instead of the relay, and return it. On any failure the original profile
+    /// is returned: a direct attempt that the gateway resets is a better outcome
+    /// than refusing to try at all.
+    ///
+    /// Only the TCP rung is tunneled. The Worker's `connect()` is a TCP socket,
+    /// so there is nothing to carry a UDP relay over.
+    private func profileThroughWorker() -> String {
+        let settings = RelayTunnelSettings.load(appGroup: appGroup)
+        guard settings.enabled, !settings.token.isEmpty, rung == .openVPNTCP else { return profile }
+
+        let transport = WebSocketTransport(workerURL: settings.workerURL, token: settings.token,
+                                           host: endpointHost, port: endpointPort)
+        guard let localPort = try? transport.start() else { return profile }
+        self.transport = transport
+
+        // Replace every `remote` line with the loopback one. Profiles often
+        // list several relays; leaving any of them pointing outward would let
+        // OpenVPN fail over to a direct connection the gateway kills.
+        var rewritten: [String] = []
+        var inserted = false
+        for raw in profile.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.lowercased().hasPrefix("remote ") {
+                if !inserted {
+                    rewritten.append("remote 127.0.0.1 \(localPort)")
+                    inserted = true
+                }
+                continue
+            }
+            rewritten.append(String(raw))
+        }
+        guard inserted else { return profile }
+        return rewritten.joined(separator: "\n")
     }
 
     deinit {
@@ -66,7 +112,7 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
 
         let ctx = Unmanaged.passUnretained(self).toOpaque()
 
-        let created = profile.withCString { cProfile in
+        let created = profileThroughWorker().withCString { cProfile in
             sweep_ovpn_new(cProfile,
                            { ctx, data, len, family in
                                guard let ctx, let data else { return }
@@ -119,6 +165,8 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     }
 
     public func stop() {
+        transport?.stop()
+        transport = nil
         guard let handle else { return }
         sweep_ovpn_stop(handle)
     }

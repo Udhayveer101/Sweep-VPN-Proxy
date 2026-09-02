@@ -28,5 +28,9 @@
 	<string>$(SWEEP_CONFIG_SIGNING_KEY)</string>
 	<key>SweepConfigURL</key>
 	<string>$(SWEEP_CONFIG_URL)</string>
+	<key>SweepTunnelURL</key>
+	<string>$(SWEEP_TUNNEL_URL)</string>
+	<key>SweepTunnelToken</key>
+	<string>$(SWEEP_TUNNEL_TOKEN)</string>
 </dict>
 </plist>

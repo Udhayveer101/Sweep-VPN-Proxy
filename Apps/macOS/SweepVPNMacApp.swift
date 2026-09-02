@@ -26,6 +26,14 @@ struct SweepVPNMacApp: App {
     }
 
     static func refreshConfiguration(into model: VPNViewModel) async {
+        // The extension cannot read the app's Info.plist, so the tunnel's Worker
+        // URL and token are copied into the shared group where it can. Done on
+        // every launch so a rebuilt Worker takes effect without extra steps.
+        if let url = AppConfig.tunnelURL, !AppConfig.tunnelToken.isEmpty {
+            RelayTunnelSettings(enabled: true, workerURL: url, token: AppConfig.tunnelToken)
+                .save(appGroup: AppConfig.appGroup)
+        }
+
         // Short fingerprint of the pinned key, so the Security panel can show the
         // user which key this build trusts without exposing the whole value.
         if let key = try? AppConfig.pinnedSigningKey() {
