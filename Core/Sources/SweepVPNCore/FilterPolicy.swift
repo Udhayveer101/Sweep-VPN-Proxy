@@ -56,9 +56,18 @@ public struct FilterPolicy: Sendable, Equatable {
     }
 
     public func verdict(for flow: Flow) -> Verdict {
+        if flow.isLoopback { return .allow }
+
+        // The blocklist is checked before every other rule, including the kill
+        // switch. A domain the user has blocked must stay blocked when the VPN
+        // is off — that is the whole point of it, and an in-tunnel DNS filter
+        // cannot do it because with the tunnel down there is no in-tunnel DNS.
+        if let host = flow.remoteAddress, Self.isBlocked(host, by: options.blockedDomains) {
+            return .drop
+        }
+
         // With the kill switch off the filter is not an enforcement point.
         guard options.killSwitchEnabled else { return .allow }
-        if flow.isLoopback { return .allow }
 
         // The tunnel's own packets to the server must always get out, or there
         // is no way back up from a blocked state.
@@ -79,6 +88,21 @@ public struct FilterPolicy: Sendable, Equatable {
             return .drop
         }
         return .allow
+    }
+
+    /// Suffix match on domain-label boundaries. Plain `hasSuffix` would let
+    /// "notevil.com" be blocked by a rule for "evil.com", and — worse — would
+    /// let "evil.com.attacker.net" slip past a rule for "evil.com".
+    public static func isBlocked(_ host: String, by blocked: [String]) -> Bool {
+        guard !blocked.isEmpty else { return false }
+        let h = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        for rule in blocked {
+            let r = rule.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+            guard !r.isEmpty else { continue }
+            if h == r { return true }
+            if h.hasSuffix("." + r) { return true }
+        }
+        return false
     }
 
     /// RFC1918 / link-local / unique-local ranges — the only addresses that may

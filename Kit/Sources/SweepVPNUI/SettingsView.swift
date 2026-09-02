@@ -49,6 +49,23 @@ public struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 #if os(macOS)
+                Section("Blocked sites") {
+                    TextField("One domain per line", text: Binding(
+                        get: { model.options.blockedDomains.joined(separator: "\n") },
+                        set: {
+                            var o = model.options
+                            o.blockedDomains = $0.split(separator: "\n")
+                                .map { String($0).trimmingCharacters(in: .whitespaces) }
+                                .filter { !$0.isEmpty }
+                            model.apply(options: o)
+                        }), axis: .vertical)
+                        .lineLimit(3...10)
+                        .font(.system(.footnote, design: .monospaced))
+                    Text("Blocked at the connection, not just in DNS, so it holds even when the VPN is off. Subdomains are included. Needs the second kill-switch layer below to be on.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                #endif
+                #if os(macOS)
                 Section("Tor and proxy") {
                     Toggle("Tor over VPN", isOn: Binding(
                         get: { model.options.torEnabled },

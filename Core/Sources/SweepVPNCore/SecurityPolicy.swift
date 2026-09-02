@@ -47,6 +47,12 @@ public struct SecurityPolicyOptions: Sendable, Equatable, Codable {
     public var localProxyEnabled: Bool = false
     public var localProxyPort: Int = 1080
 
+    /// Domains the macOS content filter drops outright. Unlike DNS-based
+    /// blocking this applies to the connection itself, so it holds *even when
+    /// the tunnel is off* — the "non-VPN protection" case. Matching is by
+    /// suffix, so "ads.example.com" blocks "x.ads.example.com" too.
+    public var blockedDomains: [String] = []
+
     public init() {}
 }
 
