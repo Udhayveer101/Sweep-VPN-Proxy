@@ -180,15 +180,32 @@ public struct RelayTunnelSettings: Sendable {
         self.token = token
     }
 
+    /// Build-time value baked into whichever bundle is asking. Inside the
+    /// extension `Bundle.main` is the extension, which is the whole point.
+    private static func baked(_ key: String) -> String? {
+        (Bundle.main.object(forInfoDictionaryKey: key) as? String)
+            .flatMap { $0.isEmpty ? nil : $0 }
+    }
+
     public static func load(appGroup: String) -> RelayTunnelSettings {
         let defaults = UserDefaults(suiteName: appGroup)
+        // The app group is the primary source so a redeployed Worker takes
+        // effect without a rebuild. It falls back to the value baked into this
+        // bundle because the group is only ever populated by the app window's
+        // launch task: an extension started on demand — at boot, or before the
+        // window has been opened since install — would otherwise read an empty
+        // token, skip the tunnel, and put OpenVPN on the wire in plaintext,
+        // which is precisely what the gateway resets.
         let url = (defaults?.string(forKey: urlKey)).flatMap(URL.init(string:))
+            ?? baked("SweepTunnelURL").flatMap(URL.init(string:))
             ?? WebSocketTransport.defaultWorkerURL
         // Default ON: on this network a direct relay connection cannot work, and
         // an off-by-default bypass is one the user has to discover.
         let enabled = defaults?.object(forKey: enabledKey) as? Bool ?? true
-        return RelayTunnelSettings(enabled: enabled, workerURL: url,
-                                   token: defaults?.string(forKey: tokenKey) ?? "")
+        let token = defaults?.string(forKey: tokenKey).flatMap { $0.isEmpty ? nil : $0 }
+            ?? baked("SweepTunnelToken")
+            ?? ""
+        return RelayTunnelSettings(enabled: enabled, workerURL: url, token: token)
     }
 
     /// Addresses the Worker currently resolves to.

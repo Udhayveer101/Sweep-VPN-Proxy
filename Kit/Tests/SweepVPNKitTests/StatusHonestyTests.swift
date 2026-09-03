@@ -1,5 +1,6 @@
 import XCTest
 import SweepVPNCore
+@testable import SweepVPNKit
 @testable import SweepVPNUI
 
 /// Guards the fix for "app shows Protected while an unrelated VPN is running".
@@ -44,6 +45,34 @@ final class StatusHonestyTests: XCTestCase {
                                   killSwitchArmed: true, onDemandArmed: false, quality: nil)
         XCTAssertEqual(p.primaryAction, .openSettings)
     }
+
+    #if os(macOS)
+    /// macOS ships no signed bundle, so `hasVerifiedConfig` is false on every
+    /// run — but it has a public-relay fallback, so that is not a dead end.
+    /// Gating the button on the bundle made "How to finish setup" the only
+    /// reachable action: `.connect` was never dispatched, `install()` was never
+    /// called, so no VPN profile ever existed to un-gate the button. The whole
+    /// relay path — and the Worker bypass behind it — was unreachable.
+    @MainActor
+    func testNoSignedBundleStillOffersConnectOnMac() {
+        let model = VPNViewModel(
+            configurator: VPNConfigurator(bundleIdentifier: "com.sweep.vpn.mac.tunnel"))
+        model.noteConfigurationFailure("no bundle ships in this build",
+                                       kind: .notConfigured)
+        XCTAssertEqual(model.presentation.primaryAction, .connect,
+                       "with a relay fallback available the button must offer Connect")
+    }
+
+    /// The rungs offered must be ones with somewhere to connect to. With no
+    /// servers and no relays loaded there is nothing honest to offer.
+    @MainActor
+    func testNoInventoryOffersNoRungs() {
+        let model = VPNViewModel(
+            configurator: VPNConfigurator(bundleIdentifier: "com.sweep.vpn.mac.tunnel"))
+        XCTAssertTrue(model.selectableRungs.isEmpty,
+                      "a rung with no endpoint is a dead end, not a choice")
+    }
+    #endif
 
     /// The connected case is still allowed to make the claim — that path is fed
     /// only by the provider's own IPC status, which is authoritative.

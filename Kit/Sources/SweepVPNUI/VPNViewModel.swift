@@ -160,6 +160,24 @@ public final class VPNViewModel: ObservableObject {
     /// so the two must not share one alarming screen.
     @Published public private(set) var configFailureKind: TunnelErrorKind = .notConfigured
 
+    /// Whether pressing the button could plausibly start a tunnel.
+    ///
+    /// macOS is never a dead end without a signed bundle: `ensureConnectable()`
+    /// fetches, probes and pins a public VPN Gate relay on demand, and reports
+    /// its own failure if even that fails. Gating on `hasVerifiedConfig` — which
+    /// no shipping build ever sets, because `Config/` carries no bundle — made
+    /// "How to finish setup" the only reachable action. `.connect` was never
+    /// dispatched, so `install()` never ran, so no profile ever existed to
+    /// un-gate the button. The relay path and the Worker bypass behind it were
+    /// unreachable code.
+    private var canAttemptConnection: Bool {
+        #if os(macOS)
+        return true
+        #else
+        return hasVerifiedConfig
+        #endif
+    }
+
 
     /// Second line on the server pill: which server Automatic landed on, or the
     /// latency of the pinned one.
@@ -283,7 +301,7 @@ public final class VPNViewModel: ObservableObject {
         // which opens System Settings — so the prompt could never be reached.
         // The only real "not configured" case is having no verified server list.
         guard configurator.hasInstalledProfile else {
-            state = hasVerifiedConfig ? .disconnected : .error(configFailureKind)
+            state = canAttemptConnection ? .disconnected : .error(configFailureKind)
             rung = nil
             recompute()
             return
@@ -304,7 +322,7 @@ public final class VPNViewModel: ObservableObject {
             // `.disconnected`. On-demand only counts as armed if the profile
             // actually carries an on-demand rule; the local toggle alone showed
             // "Standing by" with nothing armed behind it.
-            if !hasVerifiedConfig { state = .error(configFailureKind) }
+            if !canAttemptConnection { state = .error(configFailureKind) }
             onDemandArmed = configurator.profileOnDemandEnabled
             if onDemandArmed { state = .onDemandArmed } else { state = .disconnected }
         }
@@ -420,9 +438,19 @@ public final class VPNViewModel: ObservableObject {
     /// Modes a user can pick directly; `forced` is set from the Advanced picker.
     public static let selectableModes: [ProtocolPreference] = [.automatic, .fast, .stealth, .lowPower]
 
-    /// Rungs this build can actually run, in ladder order.
+    /// Rungs this build can run *and* has somewhere to run to, in ladder order.
+    ///
+    /// A rung with no endpoint in the current inventory is not a choice, it is a
+    /// dead end: every WireGuard and Shadowsocks rung needs a server whose key
+    /// this build holds, and no signed bundle ships one. Offering them promised
+    /// fallbacks that could never engage. Driving this from the inventory rather
+    /// than a hard-coded list means it widens again on its own the day `Config/`
+    /// carries real servers.
     public var selectableRungs: [ProtocolRung] {
-        ProtocolRung.allCases.filter(AdapterFactory.availableRungs.contains)
+        let reachable = Set((servers + relays).flatMap { $0.endpoints.map(\.rung) })
+        return ProtocolRung.allCases.filter {
+            AdapterFactory.availableRungs.contains($0) && reachable.contains($0)
+        }
     }
 
     public var forcedRung: ProtocolRung? {

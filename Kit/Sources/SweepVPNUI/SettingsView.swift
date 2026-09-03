@@ -30,7 +30,7 @@ public struct SettingsView: View {
                                 Text(mode.displayName).tag(mode)
                             }
                         }
-                    Text("Automatic tries the routes this network is most likely to allow — plain WireGuard first, then QUIC, TLS or Shadowsocks if the network blocks it — and only changes route under strict anti-flap rules.")
+                    Text("Automatic tries the routes this network is most likely to allow, and only changes route under strict anti-flap rules. Routes with no server to reach are not offered.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Advanced") {
