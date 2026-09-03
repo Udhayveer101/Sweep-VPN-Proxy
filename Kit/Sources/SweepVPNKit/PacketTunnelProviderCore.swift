@@ -89,7 +89,10 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
                 do {
                     try self.beginConnection()
                 } catch {
-                    self.fail(.configurationInvalid, error, completionHandler)
+                    // Not every startup failure is a bad signature. Reporting
+                    // them all as one sent every investigation to the config
+                    // path, when the usual cause is an absent store or relay.
+                    self.fail(Self.kind(for: error), error, completionHandler)
                 }
             }
         }
@@ -261,6 +264,9 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
                 guard let self else { return }
                 if let error { return self.fail(.internalFailure, error, self.startCompletion) }
                 self.machine.transition(to: .connected(rung: adapter.rung, server: server.id))
+                // A reason kept past the connect that disproved it is just a
+                // lie with a timestamp on it.
+                TunnelFailureStore(appGroup: self.appGroup).clear()
                 self.connectedSince = Date()
                 self.publishFilterState(up: true, server: server)
                 self.persistNetworkMemory()
@@ -315,8 +321,66 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
                                            serverAddresses: addresses, options: policy.options))
     }
 
+    /// Which error screen a startup failure belongs on.
+    static func kind(for error: Error) -> TunnelErrorKind {
+        switch error {
+        case ConfigError.noServers:
+            return .noServersAvailable
+        case ConfigError.badSignature:
+            // No store at all is an environment fault, not a rejected signature.
+            return .internalFailure
+        case is AdapterFactoryError:
+            return .allRungsFailed
+        default:
+            return .configurationInvalid
+        }
+    }
+
+    /// Turns an internal error into a sentence that names the actual cause.
+    ///
+    /// Every one of these used to surface as "the signed configuration could not
+    /// be verified", which sent debugging in the wrong direction every time —
+    /// the usual cause is a store or a relay that is simply absent, not a
+    /// signature that failed.
+    static func explain(_ error: Error) -> String {
+        switch error {
+        case ConfigError.badSignature:
+            return "The app group keychain did not return a config store, so the extension could not read its settings."
+        case ConfigError.noServers:
+            return "No relay is pinned and no signed bundle is installed, so there was nothing to connect to."
+        case ConfigError.malformed:
+            return "The stored configuration could not be decoded."
+        case ConfigError.expired(let at):
+            return "The signed configuration expired on \(at.formatted(date: .abbreviated, time: .shortened))."
+        case ConfigError.notYetValid(let at):
+            return "The signed configuration is not valid until \(at.formatted(date: .abbreviated, time: .shortened))."
+        case ConfigError.rollback(let have, let offered):
+            return "The offered configuration (v\(offered)) is older than the installed one (v\(have)), so it was refused."
+        case ConfigError.appTooOld(let required, let have):
+            return "The configuration needs app build \(required); this build is \(have)."
+        case AdapterFactoryError.rungNotImplemented(let rung):
+            return "\(rung.displayName) is not built into this app."
+        case AdapterFactoryError.noEndpoint(let rung):
+            return "The chosen server has no \(rung.displayName) endpoint."
+        case AdapterFactoryError.missingCredential(let rung):
+            return "The \(rung.displayName) endpoint carries no usable profile or key."
+        default:
+            return "\(error)"
+        }
+    }
+
     private func fail(_ kind: TunnelErrorKind, _ error: Error?, _ completion: ((Error?) -> Void)?) {
-        diagnostics.record("failClosed", kind.rawValue)
+        // The kind alone collapses every beginConnection throw into
+        // "configurationInvalid", which is the one thing it must not do: a
+        // missing keychain store, an empty relay store and an unimplemented
+        // rung are three different bugs wearing the same label.
+        let detail = error.map(Self.explain) ?? kind.rawValue
+        diagnostics.record("failClosed", "\(kind.rawValue) \(detail)")
+        // Written where the app can still read it after this process is gone.
+        TunnelFailureStore(appGroup: appGroup)
+            .save(TunnelFailure(kind: kind.rawValue, detail: detail,
+                                rung: (coordinator?.activeRung ?? plannedRung()).displayName,
+                                trail: diagnostics.tail(16)))
         publishFilterState(up: false, server: coordinator?.activeServer)
         machine.transition(to: .error(kind))
         persistNetworkMemory()

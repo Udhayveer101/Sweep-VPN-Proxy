@@ -1,5 +1,6 @@
 #if os(macOS)
 import Foundation
+import os
 import SweepVPNCore
 import SweepOpenVPNC
 
@@ -21,6 +22,8 @@ import SweepOpenVPNC
 ///    its network settings from `pushedSettings` rather than from the `Server`
 ///    record, which for a relay is empty.
 public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
+    private static let log = Logger(subsystem: "com.sweep.vpn", category: "openvpn")
+
     public let rung: ProtocolRung
 
     private let server: Server
@@ -81,11 +84,30 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     /// so there is nothing to carry a UDP relay over.
     private func profileThroughWorker() -> String {
         let settings = RelayTunnelSettings.load(appGroup: appGroup)
-        guard settings.enabled, !settings.token.isEmpty, rung == .openVPNTCP else { return profile }
+        guard settings.enabled, !settings.token.isEmpty, rung == .openVPNTCP else {
+            // Falling back to a direct profile on a network that resets plain
+            // OpenVPN produces a 45-second handshake timeout and no reason at
+            // all, so every skip says which condition sent us here.
+            Self.log.error("""
+                relay tunnel skipped: enabled=\(settings.enabled, privacy: .public) \
+                hasToken=\(!settings.token.isEmpty, privacy: .public) \
+                rung=\(self.rung.shortName, privacy: .public) — connecting directly
+                """)
+            return profile
+        }
 
         let transport = WebSocketTransport(workerURL: settings.workerURL, token: settings.token,
                                            host: endpointHost, port: endpointPort)
-        guard let localPort = try? transport.start() else { return profile }
+        let localPort: UInt16
+        do {
+            localPort = try transport.start()
+        } catch {
+            Self.log.error("""
+                relay tunnel failed to start: \(error, privacy: .public) — connecting directly
+                """)
+            return profile
+        }
+        Self.log.notice("relay tunnel listening on 127.0.0.1:\(localPort, privacy: .public)")
         self.transport = transport
 
         // Replace every `remote` line with the loopback one. Profiles often
@@ -104,7 +126,10 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
             }
             rewritten.append(String(raw))
         }
-        guard inserted else { return profile }
+        guard inserted else {
+            Self.log.error("profile carried no `remote` line — connecting directly")
+            return profile
+        }
         return rewritten.joined(separator: "\n")
     }
 
@@ -268,6 +293,10 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     }
 
     private func event(_ name: String, _ info: String) {
+        // The OpenVPN core's own state names are the only account of where a
+        // handshake stopped. Without them a stalled connect is indistinguishable
+        // from a dead relay, and both look like a 45-second timeout.
+        Self.log.notice("ovpn \(name, privacy: .public) \(Diagnostics.scrub(info), privacy: .public)")
         switch name {
         case "CONNECTED":
             // Only now is there a tunnel: the session is up *and* the push has

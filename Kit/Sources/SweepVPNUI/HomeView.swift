@@ -55,7 +55,17 @@ public struct HomeView: View {
     private func errorRow(_ error: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-            Text(error).font(.caption).multilineTextAlignment(.leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(error).font(.caption).multilineTextAlignment(.leading)
+                // Which attempt produced this, so a stale reason is obvious and
+                // a live one says which route was being tried when it broke.
+                if let failure = model.tunnelFailure {
+                    Text([failure.rung.map { "via \($0)" },
+                          failure.at.formatted(date: .omitted, time: .standard)]
+                            .compactMap { $0 }.joined(separator: " · "))
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
             Spacer(minLength: 0)
             Button { model.lastError = nil } label: { Image(systemName: "xmark") }
                 .buttonStyle(.plain).accessibilityLabel("Dismiss error")

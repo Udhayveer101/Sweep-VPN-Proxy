@@ -264,7 +264,23 @@ public final class VPNViewModel: ObservableObject {
         if activeSheet == .onboarding { activeSheet = nil }
     }
 
+    /// The extension's own account of why the last start failed.
+    ///
+    /// Read from the shared group rather than asked over IPC, because a tunnel
+    /// that dies during startup cannot answer IPC — which is precisely when the
+    /// reason is worth having. Nil once a connect succeeds.
+    @Published public private(set) var tunnelFailure: TunnelFailure?
+
+    private func readTunnelFailure() {
+        let failure = TunnelFailureStore(appGroup: appGroup).load()
+        tunnelFailure = failure
+        // The extension is the authority on why it would not start; the UI's
+        // generic wording for the kind is a fallback, not a replacement.
+        if let failure, !failure.detail.isEmpty { lastError = failure.detail }
+    }
+
     public func refresh() async {
+        readTunnelFailure()
         guard let response = try? await configurator.send(.getStatus) else {
             applySystemStatus()
             return

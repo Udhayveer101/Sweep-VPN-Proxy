@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Privacy-safe structured event log. No IPs, no domains, no SNIs — enforced by
 /// the scrubber, not by convention.
@@ -11,6 +12,64 @@ public struct DiagnosticEvent: Codable, Sendable, Equatable {
     }
 }
 
+/// The last reason the tunnel refused to come up, in words the user can act on.
+///
+/// This is deliberately written to the shared app group rather than answered
+/// over IPC. The extension's diagnostic ring lives only inside the extension
+/// process and is readable solely by asking that process — so in the one case
+/// where the reason matters most, a tunnel that dies during startup, there was
+/// nothing left alive to ask and the app could only say "connecting" forever.
+public struct TunnelFailure: Codable, Sendable, Equatable {
+    public var at: Date
+    /// The `TunnelErrorKind` rawValue, so the UI can pick its own wording.
+    public var kind: String
+    /// What actually went wrong, already scrubbed of addresses and hostnames.
+    public var detail: String
+    /// Which rung was being attempted, if one had been chosen yet.
+    public var rung: String?
+    /// The last events before the failure, oldest first — the sequence that
+    /// says *where* a connect died rather than only that it did. Carried here
+    /// because the system log is not always readable after the fact, and the
+    /// ring that holds these dies with the extension.
+    public var trail: [String]
+
+    public init(at: Date = Date(), kind: String, detail: String,
+                rung: String? = nil, trail: [String] = []) {
+        self.at = at
+        self.kind = kind
+        self.detail = Diagnostics.scrub(detail)
+        self.rung = rung
+        self.trail = trail
+    }
+}
+
+public struct TunnelFailureStore: Sendable {
+    private let suiteName: String?
+    private let key = "sweep.lastFailure"
+
+    public init(appGroup: String) { self.suiteName = appGroup }
+    /// Test seam.
+    public init(suiteName: String?) { self.suiteName = suiteName }
+
+    private var defaults: UserDefaults? {
+        suiteName.flatMap { UserDefaults(suiteName: $0) }
+    }
+
+    public func load() -> TunnelFailure? {
+        guard let defaults, let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(TunnelFailure.self, from: data)
+    }
+
+    public func save(_ failure: TunnelFailure) {
+        guard let defaults, let data = try? JSONEncoder().encode(failure) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    /// Cleared on a successful connect so a stale reason cannot be shown beside
+    /// a working tunnel.
+    public func clear() { defaults?.removeObject(forKey: key) }
+}
+
 public final class Diagnostics: @unchecked Sendable {
     private let capacity: Int
     private var buffer: [DiagnosticEvent] = []
@@ -21,8 +80,22 @@ public final class Diagnostics: @unchecked Sendable {
         buffer.reserveCapacity(capacity)
     }
 
+    /// Mirrors events to the system log as well as the ring.
+    ///
+    /// The ring only lives in the process that wrote it and is readable solely
+    /// over IPC, so when the tunnel extension failed before it could answer any
+    /// IPC — which is exactly when one needs it — the failure left no trace at
+    /// all anywhere on the machine. The detail string is already scrubbed of
+    /// addresses and hostnames by `DiagnosticEvent.init`, so this publishes
+    /// nothing the ring did not already hold.
+    private static let log = Logger(subsystem: "com.sweep.vpn", category: "diagnostics")
+
     public func record(_ kind: String, _ detail: String = "", at: Date = Date()) {
         let event = DiagnosticEvent(at: at, kind: kind, detail: detail)
+        // `.notice`, not `.info`: info-level records live in a memory buffer
+        // that is discarded when the process exits, and the extension exits on
+        // every failed start — so the one process whose logs matter left none.
+        Self.log.notice("\(kind, privacy: .public) \(event.detail, privacy: .public)")
         lock.lock(); defer { lock.unlock() }
         buffer.append(event)
         if buffer.count > capacity { buffer.removeFirst(buffer.count - capacity) }
@@ -31,6 +104,16 @@ public final class Diagnostics: @unchecked Sendable {
     public func snapshot() -> [DiagnosticEvent] {
         lock.lock(); defer { lock.unlock() }
         return buffer
+    }
+
+    /// The most recent events as short strings, oldest first.
+    public func tail(_ count: Int) -> [String] {
+        snapshot().suffix(count).map { event in
+            let stamp = event.at.formatted(date: .omitted, time: .standard)
+            return event.detail.isEmpty
+                ? "\(stamp) \(event.kind)"
+                : "\(stamp) \(event.kind): \(event.detail)"
+        }
     }
 
     public func export() -> String {
