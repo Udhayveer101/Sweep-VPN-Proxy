@@ -18,7 +18,7 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// path-monitor callbacks hop onto it before touching anything.
     private let stateQueue = DispatchQueue(label: "vpn.sweep.provider")
 
-    public let diagnostics = Diagnostics()
+    public let diagnostics = Diagnostics.shared
     public private(set) var machine = StateMachine()
     public private(set) var policy = SecurityPolicy()
     public private(set) var preference: ProtocolPreference = .automatic
@@ -81,7 +81,12 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
 
         let queue = stateQueue
         // 1. Fail closed first, always.
-        applyPlan(policy.blackholePlan()) { [weak self] error in
+        // The Worker has to stay reachable through the blackhole, or the tunnel
+        // blocks the very connection it needs to come up.
+        let relayTunnel = RelayTunnelSettings.load(appGroup: appGroup)
+        let reachable = relayTunnel.enabled ? relayTunnel.workerAddresses() : []
+        diagnostics.record("blackhole", "excluding \(reachable.count) worker address(es)")
+        applyPlan(policy.blackholePlan(reachableHosts: reachable)) { [weak self] error in
             queue.async {
                 guard let self else { return }
                 if let error { return self.fail(.internalFailure, error, completionHandler) }
@@ -380,7 +385,7 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         TunnelFailureStore(appGroup: appGroup)
             .save(TunnelFailure(kind: kind.rawValue, detail: detail,
                                 rung: (coordinator?.activeRung ?? plannedRung()).displayName,
-                                trail: diagnostics.tail(16)))
+                                trail: diagnostics.tail(40)))
         publishFilterState(up: false, server: coordinator?.activeServer)
         machine.transition(to: .error(kind))
         persistNetworkMemory()

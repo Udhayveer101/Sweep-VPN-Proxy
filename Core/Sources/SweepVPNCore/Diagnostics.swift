@@ -71,6 +71,13 @@ public struct TunnelFailureStore: Sendable {
 }
 
 public final class Diagnostics: @unchecked Sendable {
+    /// One ring per process, so components that are handed no diagnostics
+    /// object — the adapters and transports, which are built by a factory —
+    /// still land in the same trail as the provider that owns them. Without
+    /// this their events existed only in the system log, which is not always
+    /// readable after the process that wrote it has exited.
+    public static let shared = Diagnostics()
+
     private let capacity: Int
     private var buffer: [DiagnosticEvent] = []
     private let lock = NSLock()   // ponytail: one lock, ring buffer is not hot

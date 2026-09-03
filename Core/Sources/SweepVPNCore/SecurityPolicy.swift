@@ -64,11 +64,23 @@ public struct SecurityPolicy: Sendable {
 
     /// Settings applied *before* the handshake completes: full default route,
     /// forwarding off. This is the blackhole that makes failure fail-closed.
-    public func blackholePlan(mtu: Int = 1280) -> TunnelPlan {
+    ///
+    /// `reachableHosts` are the addresses the tunnel needs in order to build
+    /// itself — today the Cloudflare Worker that carries the relay's stream.
+    /// The blackhole is installed before the connection is dialled, so without
+    /// excluding them the tunnel routes its own uplink into the dead interface
+    /// it is still constructing and the transport dies instantly with
+    /// NETWORK_RECV_ERROR. Excluding a host it is already about to talk to
+    /// gives away nothing: traffic to it is what the blackhole exists to permit.
+    public func blackholePlan(mtu: Int = 1280,
+                              reachableHosts: Set<String> = []) -> TunnelPlan {
         TunnelPlan(tunnelRemoteAddress: "127.0.0.1",
                    ipv4Address: "169.254.0.1",
                    ipv4Routes: [.init("0.0.0.0", 0)],
-                   ipv4ExcludedRoutes: [],
+                   ipv4ExcludedRoutes: reachableHosts
+                       .filter { !$0.contains(":") }
+                       .sorted()
+                       .map { .init($0, 32) },
                    ipv6Address: nil,
                    ipv6Routes: [.init("::", 0)],
                    ipv6Blocked: true,

@@ -93,6 +93,10 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
                 hasToken=\(!settings.token.isEmpty, privacy: .public) \
                 rung=\(self.rung.shortName, privacy: .public) — connecting directly
                 """)
+            Diagnostics.shared.record(
+                "relayTunnelSkipped",
+                "enabled=\(settings.enabled) hasToken=\(!settings.token.isEmpty) "
+                    + "rung=\(rung.shortName) — DIRECT")
             return profile
         }
 
@@ -105,9 +109,11 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
             Self.log.error("""
                 relay tunnel failed to start: \(error, privacy: .public) — connecting directly
                 """)
+            Diagnostics.shared.record("relayTunnelFailed", "\(error) — DIRECT")
             return profile
         }
         Self.log.notice("relay tunnel listening on 127.0.0.1:\(localPort, privacy: .public)")
+        Diagnostics.shared.record("relayTunnelUp", "loopback:\(localPort)")
         self.transport = transport
 
         // Replace every `remote` line with the loopback one. Profiles often
@@ -297,6 +303,7 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         // handshake stopped. Without them a stalled connect is indistinguishable
         // from a dead relay, and both look like a 45-second timeout.
         Self.log.notice("ovpn \(name, privacy: .public) \(Diagnostics.scrub(info), privacy: .public)")
+        Diagnostics.shared.record("ovpn", "\(name) \(info)")
         switch name {
         case "CONNECTED":
             // Only now is there a tunnel: the session is up *and* the push has
