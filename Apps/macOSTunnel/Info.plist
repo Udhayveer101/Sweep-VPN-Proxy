@@ -17,4 +17,5 @@
     <key>NSExtensionPointIdentifier</key><string>com.apple.networkextension.packet-tunnel</string>
     <key>NSExtensionPrincipalClass</key><string>$(PRODUCT_MODULE_NAME).PacketTunnelProvider</string>
   </dict>
+  <key>SweepAppGroup</key><string>$(DEVELOPMENT_TEAM).group.com.sweep.vpn</string>
 </dict></plist>

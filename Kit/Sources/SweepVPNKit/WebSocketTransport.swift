@@ -58,6 +58,14 @@ public final class WebSocketTransport: @unchecked Sendable {
     public func start() throws -> UInt16 {
         let params = NWParameters.tcp
         params.requiredInterfaceType = .loopback
+        // Bind IPv4 loopback explicitly. `requiredInterfaceType = .loopback`
+        // alone leaves the family to the system, and OpenVPN 3 dials the
+        // rewritten `remote 127.0.0.1 <port>` from its own BSD socket — strictly
+        // IPv4. A listener that came up on ::1 refused that connection
+        // instantly, which surfaced as a bare NETWORK_RECV_ERROR less than a
+        // second after the tunnel started and never reached the bridge at all.
+        params.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
+        params.allowLocalEndpointReuse = true
         guard let listener = try? NWListener(using: params) else {
             throw StartError.listenerFailed("could not create a loopback listener")
         }
@@ -111,10 +119,22 @@ public final class WebSocketTransport: @unchecked Sendable {
         task.receive { [weak self] result in
             guard let self else { return }
             guard case .success(.data(let status)) = result, status.first == 0x01 else {
+                // Without this the bypass failed as a bare NETWORK_RECV_ERROR
+                // from OpenVPN — the loopback hung up, and nothing anywhere
+                // said why. "Could not reach the Worker" and "the Worker
+                // refused the token" are the same symptom and completely
+                // different fixes.
+                switch result {
+                case .failure(let error):
+                    Diagnostics.shared.record("wssFailed", "\(error)")
+                case .success(let message):
+                    Diagnostics.shared.record("wssRefused", "unexpected first frame \(message)")
+                }
                 connection.cancel()
                 task.cancel(with: .goingAway, reason: nil)
                 return
             }
+            Diagnostics.shared.record("wssUp")
             self.pumpSocketToWebSocket(connection, task)
             self.pumpWebSocketToSocket(task, connection)
         }
@@ -219,7 +239,54 @@ public struct RelayTunnelSettings: Sendable {
     /// Cloudflare's addresses rotate, so this is resolved at publish time rather
     /// than pinned. An empty result is not fatal: the filter simply has one
     /// fewer allowance, which is the safe direction to be wrong in.
-    public func workerAddresses() -> Set<String> {
+    /// Resolves the Worker's addresses, giving up after `timeout`.
+    ///
+    /// `getaddrinfo` is synchronous and has no timeout of its own. This runs on
+    /// the tunnel's start path, where it was seen to block for thirty seconds
+    /// and then return nothing — half a minute in which the extension had not
+    /// yet installed any settings and the user saw only "Connecting". A bounded
+    /// wait that sometimes yields no addresses is strictly better: the addresses
+    /// are a routing optimisation, and the connection is not made from them.
+    private static let addressesKey = "sweep.relayTunnel.addresses"
+
+    /// The addresses the app last resolved, if any.
+    ///
+    /// The extension cannot rely on resolving this name itself. On-demand keeps
+    /// the previous session's blackhole installed while the next extension
+    /// starts, so a default route we own is already in place before we have
+    /// worked out what to exclude from it — the lookup goes into the dead
+    /// interface and the exclusion list comes back empty, which guarantees the
+    /// same failure on every subsequent attempt. The app has no such problem: it
+    /// is an ordinary process outside the tunnel, so it resolves the name once
+    /// and leaves the answer here.
+    public static func cachedAddresses(appGroup: String) -> Set<String> {
+        Set(UserDefaults(suiteName: appGroup)?.stringArray(forKey: addressesKey) ?? [])
+    }
+
+    public static func cache(addresses: Set<String>, appGroup: String) {
+        guard !addresses.isEmpty else { return }   // never replace a good list with nothing
+        UserDefaults(suiteName: appGroup)?.set(Array(addresses).sorted(), forKey: addressesKey)
+    }
+
+    /// Cached answer first, live lookup only as a fallback.
+    public func workerAddresses(appGroup: String, timeout: TimeInterval = 3) -> Set<String> {
+        let cached = Self.cachedAddresses(appGroup: appGroup)
+        if !cached.isEmpty { return cached }
+        return workerAddresses(timeout: timeout)
+    }
+
+    public func workerAddresses(timeout: TimeInterval = 3) -> Set<String> {
+        let box = NSMutableArray()
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            box.addObjects(from: Array(self.resolveWorkerAddresses()))
+            done.signal()
+        }
+        guard done.wait(timeout: .now() + timeout) == .success else { return [] }
+        return Set(box.compactMap { $0 as? String })
+    }
+
+    private func resolveWorkerAddresses() -> Set<String> {
         guard let host = workerURL.host else { return [] }
 
         var hints = addrinfo(ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_STREAM,

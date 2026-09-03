@@ -1,4 +1,5 @@
 import SwiftUI
+import SystemConfiguration
 import SweepVPNCore
 import SweepVPNKit
 import SweepVPNUI
@@ -30,8 +31,27 @@ struct SweepVPNMacApp: App {
         // URL and token are copied into the shared group where it can. Done on
         // every launch so a rebuilt Worker takes effect without extra steps.
         if let url = AppConfig.tunnelURL, !AppConfig.tunnelToken.isEmpty {
-            RelayTunnelSettings(enabled: true, workerURL: url, token: AppConfig.tunnelToken)
-                .save(appGroup: AppConfig.appGroup)
+            let settings = RelayTunnelSettings(enabled: true, workerURL: url,
+                                               token: AppConfig.tunnelToken)
+            settings.save(appGroup: AppConfig.appGroup)
+
+            // Resolve the Worker here, where resolution actually works, and
+            // leave the answer for the extension. By the time the extension
+            // needs it, the previous session's blackhole is usually still
+            // installed and its own lookup cannot get out. See
+            // `RelayTunnelSettings.cachedAddresses`.
+            let group = AppConfig.appGroup
+            Task.detached(priority: .utility) {
+                // The resolvers go in alongside the Worker. Not hijacking DNS
+                // is not the same as DNS working: the blackhole still owns the
+                // default route, so a query to the physical interface's
+                // resolver is routed into the tunnel and never answered. The
+                // Worker's own address is useless without the lookup that
+                // produces it.
+                let reachable = settings.workerAddresses(timeout: 5)
+                    .union(Self.systemResolvers())
+                RelayTunnelSettings.cache(addresses: reachable, appGroup: group)
+            }
         }
 
         // Short fingerprint of the pinned key, so the Security panel can show the
@@ -68,6 +88,20 @@ struct SweepVPNMacApp: App {
                                            kind: model.hasVerifiedConfig ? .configurationInvalid : .notConfigured)
         }
     }
+
+    /// The resolvers this Mac is currently using, read from the system's own
+    /// configuration rather than guessed. Empty is a safe answer: the extension
+    /// simply excludes one thing less.
+    nonisolated static func systemResolvers() -> Set<String> {
+        guard let store = SCDynamicStoreCreate(nil, "SweepVPN" as CFString, nil, nil),
+              let dns = SCDynamicStoreCopyValue(store, "State:/Network/Global/DNS" as CFString)
+                  as? [String: Any],
+              let servers = dns[kSCPropNetDNSServerAddresses as String] as? [String]
+        else { return [] }
+        // IPv6 resolvers are dropped: the blackhole captures v6 wholesale and
+        // excluded routes here are v4-only.
+        return Set(servers.filter { !$0.contains(":") })
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -77,4 +111,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
+
 }

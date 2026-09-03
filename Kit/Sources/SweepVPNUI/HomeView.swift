@@ -31,6 +31,7 @@ public struct HomeView: View {
             case .publicRelays: PublicRelayPickerView(model: model)
             case .setupGuide:   SetupGuideView(model: model)
             case .onboarding:   OnboardingView(model: model).interactiveDismissDisabled()
+            case .connectionLog: ConnectionLogView(model: model)
             }
         }
     }
@@ -64,6 +65,11 @@ public struct HomeView: View {
                           failure.at.formatted(date: .omitted, time: .standard)]
                             .compactMap { $0 }.joined(separator: " · "))
                         .font(.caption2).foregroundStyle(.secondary)
+                    // The banner names the failure; the log says where in the
+                    // connect it happened. One line of summary is not enough to
+                    // tell a dead relay from an unreachable Worker.
+                    Button("See connection log") { model.activeSheet = .connectionLog }
+                        .buttonStyle(.link).font(.caption2)
                 }
             }
             Spacer(minLength: 0)

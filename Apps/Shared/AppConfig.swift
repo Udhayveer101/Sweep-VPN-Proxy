@@ -6,7 +6,7 @@ import SweepVPNCore
 /// control plane has no way to introduce a new key at runtime, so a compromised
 /// distribution host cannot hand out a valid-looking server list.
 public enum AppConfig {
-    public static let appGroup = "group.com.sweep.vpn"
+    public static let appGroup = AppGroupID.resolved
     public static let keychainService = "com.sweep.vpn"
     #if os(iOS)
     public static let tunnelBundleID = "com.sweep.vpn.ios.tunnel"

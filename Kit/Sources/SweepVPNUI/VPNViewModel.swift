@@ -35,7 +35,7 @@ public final class VPNViewModel: ObservableObject {
     /// modifiers sit on the same view — they fight, and the wrong one wins — so
     /// there is a single presentation slot rather than a bool per screen.
     public enum Sheet: String, Identifiable, Sendable {
-        case settings, serverPicker, publicRelays, setupGuide, onboarding
+        case settings, serverPicker, publicRelays, setupGuide, onboarding, connectionLog
         public var id: String { rawValue }
     }
     @Published public var activeSheet: Sheet?
@@ -214,7 +214,7 @@ public final class VPNViewModel: ObservableObject {
     /// passes it in.
     private let appGroup: String
 
-    public init(configurator: VPNConfigurator, appGroup: String = "group.com.sweep.vpn") {
+    public init(configurator: VPNConfigurator, appGroup: String = AppGroupID.resolved) {
         self.configurator = configurator
         self.appGroup = appGroup
         self.presentation = Presentation.make(state: .disconnected, serverName: nil,
@@ -270,6 +270,11 @@ public final class VPNViewModel: ObservableObject {
     /// that dies during startup cannot answer IPC — which is precisely when the
     /// reason is worth having. Nil once a connect succeeds.
     @Published public private(set) var tunnelFailure: TunnelFailure?
+
+    /// When the user last asked for a connection. A failure older than this
+    /// belongs to a previous attempt and must not be shown against this one.
+    private var connectStartedAt = Date.distantPast
+    private var backoffStore: StartBackoffStore { StartBackoffStore(appGroup: appGroup) }
 
     private func readTunnelFailure() {
         let failure = TunnelFailureStore(appGroup: appGroup).load()
@@ -328,7 +333,18 @@ public final class VPNViewModel: ObservableObject {
             state = .verifying
             rung = nil
         case .connecting, .reasserting:
-            state = .reconnecting(attempt: 0)
+            // The system reports `.connecting` for as long as on-demand keeps
+            // restarting a tunnel that cannot come up, so trusting it alone
+            // showed a spinner that never ended and never said why. The
+            // extension has already written the reason; if that reason is
+            // newer than the attempt we are watching, this "connecting" is the
+            // next lap of a failing loop, not progress.
+            if let failure = tunnelFailure, failure.at > connectStartedAt,
+               backoffStore.load().effective().looksPersistentlyBroken {
+                state = .error(TunnelErrorKind(rawValue: failure.kind) ?? .allRungsFailed)
+            } else {
+                state = .reconnecting(attempt: 0)
+            }
             rung = nil
         case .disconnecting:
             state = .reconnecting(attempt: 0)
@@ -381,6 +397,12 @@ public final class VPNViewModel: ObservableObject {
                 // throws `noServers`, on-demand restarts it, and it throws
                 // again — with the blackhole route installed the whole time.
                 guard await ensureConnectable() else { return }
+                // A new attempt: the previous reason is history, and the streak
+                // must not make the first lap of this one look broken.
+                connectStartedAt = Date()
+                TunnelFailureStore(appGroup: appGroup).clear()
+                backoffStore.save(StartBackoff())
+                tunnelFailure = nil
                 try await configurator.install(policy: SecurityPolicy(options: options),
                                                serverDescription: serverName ?? "Sweep VPN")
                 try await configurator.start()
@@ -409,9 +431,20 @@ public final class VPNViewModel: ObservableObject {
     /// Returns false when nothing could be found, in which case the caller must
     /// not start the tunnel — the relay picker is opened instead.
     private func ensureConnectable() async -> Bool {
-        if hasVerifiedConfig { return true }
         #if os(macOS)
+        // The relay check comes first on macOS, deliberately.
+        //
+        // `hasVerifiedConfig` becomes true as soon as the extension answers with
+        // a server list — including a stale one it cached from an earlier
+        // session. Returning early on it meant that with no relay pinned the
+        // extension raced the WireGuard ladder against servers that answer
+        // nothing here, reported allRungsFailed, and the OpenVPN-over-Worker
+        // route — the only one that survives this gateway — was never tried.
         if RelaySelectionStore(appGroup: appGroup).load() != nil { return true }
+        #else
+        if hasVerifiedConfig { return true }
+        #endif
+        #if os(macOS)
 
         if relays.isEmpty { loadCachedRelays() }
         if relays.isEmpty { await refreshRelays() }

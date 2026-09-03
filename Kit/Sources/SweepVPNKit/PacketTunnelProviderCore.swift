@@ -68,7 +68,7 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// supports the OpenVPN rungs.
     open var relayStore: RelaySelectionStore? { nil }
     /// The shared app group, for the settings that live outside the keychain.
-    open var appGroup: String { "group.com.sweep.vpn" }
+    open var appGroup: String { AppGroupID.resolved }
 
     // MARK: - Lifecycle
 
@@ -84,7 +84,7 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         // The Worker has to stay reachable through the blackhole, or the tunnel
         // blocks the very connection it needs to come up.
         let relayTunnel = RelayTunnelSettings.load(appGroup: appGroup)
-        let reachable = relayTunnel.enabled ? relayTunnel.workerAddresses() : []
+        let reachable = relayTunnel.enabled ? relayTunnel.workerAddresses(appGroup: appGroup) : []
         diagnostics.record("blackhole", "excluding \(reachable.count) worker address(es)")
         applyPlan(policy.blackholePlan(reachableHosts: reachable)) { [weak self] error in
             queue.async {
@@ -616,10 +616,17 @@ public enum TunnelSettingsMapper {
             s.ipv6Settings = v6
         }
 
-        let dns = NEDNSSettings(servers: plan.dnsServers)
-        dns.matchDomains = plan.dnsMatchDomains
-        dns.matchDomainsNoSearch = false
-        s.dnsSettings = dns
+        // An empty server list is not "resolve nothing", it is "do not touch
+        // the resolver" — the pre-connect blackhole leaves DNS alone so the
+        // tunnel can look up its own uplink. Installing NEDNSSettings with no
+        // servers would instead leave the interface with a resolver that
+        // answers nothing.
+        if !plan.dnsServers.isEmpty {
+            let dns = NEDNSSettings(servers: plan.dnsServers)
+            dns.matchDomains = plan.dnsMatchDomains
+            dns.matchDomainsNoSearch = false
+            s.dnsSettings = dns
+        }
         return s
     }
 

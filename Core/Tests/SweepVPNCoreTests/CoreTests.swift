@@ -267,7 +267,11 @@ final class SecurityPolicyTests: XCTestCase {
         XCTAssertEqual(plan.ipv4Routes, [.init("0.0.0.0", 0)])
         XCTAssertEqual(plan.ipv6Routes, [.init("::", 0)])
         XCTAssertTrue(plan.ipv6Blocked)
-        XCTAssertEqual(plan.dnsMatchDomains, [""])
+        // DNS is left to the system while connecting: the tunnel has to resolve
+        // its own uplink before it exists. Fail-closed is carried by the default
+        // route and forwardingEnabled, not by breaking the resolver.
+        XCTAssertTrue(plan.dnsServers.isEmpty)
+        XCTAssertTrue(plan.dnsMatchDomains.isEmpty)
     }
 
     func testIPv6IsNeverLeftToThePhysicalInterface() {

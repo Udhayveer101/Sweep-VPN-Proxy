@@ -15,11 +15,12 @@ final class TunnelSettingsMapperTests: XCTestCase {
         XCTAssertEqual(TunnelSettingsMapper.mask4(32), "255.255.255.255")
     }
 
-    func testBlackholeSettingsRouteEverythingAndResolveNothingOutside() {
+    func testBlackholeSettingsRouteEverythingAndLeaveTheResolverAlone() {
         let s = TunnelSettingsMapper.settings(for: SecurityPolicy().blackholePlan())
         XCTAssertEqual(s.ipv4Settings?.includedRoutes?.first?.destinationAddress, "0.0.0.0")
         XCTAssertEqual(s.ipv4Settings?.includedRoutes?.first?.destinationSubnetMask, "0.0.0.0")
-        XCTAssertEqual(s.dnsSettings?.matchDomains, [""])
+        // No DNS settings at all while connecting — see blackholePlan.
+        XCTAssertNil(s.dnsSettings)
         XCTAssertNotNil(s.ipv6Settings, "IPv6 must be captured, not left to the physical interface")
         XCTAssertEqual(s.ipv6Settings?.includedRoutes?.first?.destinationAddress, "::")
     }

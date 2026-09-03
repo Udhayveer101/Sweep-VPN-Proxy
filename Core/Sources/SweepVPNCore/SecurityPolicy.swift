@@ -84,8 +84,19 @@ public struct SecurityPolicy: Sendable {
                    ipv6Address: nil,
                    ipv6Routes: [.init("::", 0)],
                    ipv6Blocked: true,
-                   dnsServers: ["127.0.0.1"],
-                   dnsMatchDomains: [""],
+                   // DNS is deliberately NOT captured here. The blackhole is
+                   // installed before the Worker is dialled, and the transport
+                   // dials it by hostname, so pointing every domain at a
+                   // resolver that does not exist made the tunnel unable to
+                   // resolve the one name it needs to come up.
+                   //
+                   // Accepted trade-off: for the seconds between the blackhole
+                   // going up and the peer authenticating, DNS queries leave in
+                   // plaintext on the physical interface. Traffic still cannot:
+                   // the default route is ours and forwarding is off. Once
+                   // `connectedPlan` replaces this, all DNS is in-tunnel again.
+                   dnsServers: [],
+                   dnsMatchDomains: [],
                    splitDNSDomains: [],
                    mtu: mtu,
                    forwardingEnabled: false)

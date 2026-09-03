@@ -32,5 +32,7 @@
 	<string>$(SWEEP_TUNNEL_URL)</string>
 	<key>SweepTunnelToken</key>
 	<string>$(SWEEP_TUNNEL_TOKEN)</string>
+	<key>SweepAppGroup</key>
+	<string>$(DEVELOPMENT_TEAM).group.com.sweep.vpn</string>
 </dict>
 </plist>

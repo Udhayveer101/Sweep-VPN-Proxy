@@ -65,7 +65,7 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     }
 
     public init?(rung: ProtocolRung, server: Server, endpoint: ServerEndpoint,
-                 appGroup: String = "group.com.sweep.vpn") {
+                 appGroup: String = AppGroupID.resolved) {
         guard let profile = endpoint.openVPNProfile, !profile.isEmpty else { return nil }
         self.rung = rung
         self.server = server
