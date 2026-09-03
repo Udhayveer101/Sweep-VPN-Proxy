@@ -45,6 +45,7 @@ open class SweepFilterDataProvider: NEFilterDataProvider, @unchecked Sendable {
         let candidate = FilterPolicy.Flow(
             interfaceName: flowInterfaceName(flow),
             remoteAddress: remote,
+            remoteHostname: Self.remoteHostname(of: flow, socket: socket),
             isLoopback: remote.map { $0 == "127.0.0.1" || $0 == "::1" } ?? false,
             isOutbound: socket?.direction != .inbound)
 
@@ -54,21 +55,47 @@ open class SweepFilterDataProvider: NEFilterDataProvider, @unchecked Sendable {
         return verdict == .allow ? .allow() : .drop()
     }
 
-    /// Pull the remote host out of whichever endpoint API this OS provides.
+    /// Pull the remote address out of whichever endpoint API this OS provides.
+    ///
+    /// The macOS 15 path alone was not enough: the deployment target is macOS
+    /// 14, where this returned nil for *every* flow. That is not a cosmetic gap
+    /// — with the kill switch armed and the tunnel down, `serverAddresses`
+    /// could never match, so the filter dropped the tunnel's own handshake and
+    /// the VPN could never connect at all. `remoteEndpoint` is deprecated but
+    /// present back to 10.15 and answers the same question.
     static func remoteAddress(of flow: NEFilterSocketFlow) -> String? {
         if #available(macOS 15.0, *), let endpoint = flow.remoteFlowEndpoint {
-            let described = String(describing: endpoint)
-            // nw_endpoint prints as "host:port"; keep the host half only.
-            if let host = described.split(separator: ":").first, described.filter({ $0 == ":" }).count == 1 {
-                return String(host)
+            // Match the endpoint rather than parsing its description, whose
+            // format is not contractual and quietly changed shape before.
+            if case .hostPort(let host, _) = endpoint {
+                switch host {
+                case .ipv4(let address): return "\(address)"
+                // Scoped v6 addresses render as "fe80::1%en0".
+                case .ipv6(let address): return "\(address)".split(separator: "%").first.map(String.init)
+                case .name(let name, _): return name
+                @unknown default: return nil
+                }
             }
-            if let lastColon = described.lastIndex(of: ":") {
-                return String(described[described.startIndex..<lastColon])
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-            }
-            return described
+            return nil
         }
-        return nil
+        // macOS 14 has no `remoteFlowEndpoint`, and its predecessor
+        // (`remoteEndpoint`/`NWHostEndpoint`) is not surfaced to Swift at all,
+        // so it is read through KVC. Both are plain Objective-C objects, and
+        // returning nil here is not cosmetic: with the kill switch armed the
+        // filter would have no address to match `serverAddresses` against and
+        // would drop the tunnel's own handshake, so the VPN could never come up.
+        return (flow.value(forKey: "remoteEndpoint") as? NSObject)?
+            .value(forKey: "hostname") as? String
+    }
+
+    /// The hostname the flow is for, when the OS knows it. Required for domain
+    /// rules: `remoteAddress` is an address, so matching "ads.example.com"
+    /// against it never fired and the blocklist silently did nothing.
+    static func remoteHostname(of flow: NEFilterFlow, socket: NEFilterSocketFlow?) -> String? {
+        if #available(macOS 11.0, *), let name = socket?.remoteHostname, !name.isEmpty {
+            return name
+        }
+        return flow.url?.host
     }
 
     /// `NEFilterFlow` does not publish the interface a flow will use. We keep

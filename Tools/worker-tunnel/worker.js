@@ -125,7 +125,11 @@ async function runTunnel(ws, host, port, token, expected) {
     writer = socket.writable.getWriter();
     for (const b of pending) writer.write(b).catch(() => {});
     pending.length = 0;
-    console.log("connected to", host, port);
+    // Deliberately not logged. `console.log(host, port)` here wrote which relay
+    // this user picked into Workers logs, and the read loop below logged a line
+    // per chunk — between them, the relay choice and a byte-size/timing trace of
+    // the session. That is precisely the metadata a VPN exists to not produce,
+    // and it was being produced by the operator rather than the network.
     ws.send(new Uint8Array([0x01]));
   } catch {
     return fail("connect failed");
@@ -141,7 +145,6 @@ async function runTunnel(ws, host, port, token, expected) {
   try {
     for (;;) {
       const { value, done } = await reader.read();
-      console.log("relay->client", done, value ? value.byteLength : 0, "wsState=", ws.readyState);
       if (done || ws.readyState !== 1) break;
       // Copy exactly this chunk's bytes out of the pooled buffer.
       ws.send(value.buffer.byteLength === value.byteLength

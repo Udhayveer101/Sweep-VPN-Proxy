@@ -33,7 +33,14 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     private let endpointHost: String
     private let endpointPort: UInt16
 
-    private var handle: OpaquePointer?
+    /// Guarded by `lock`. It is written when the tunnel starts and read from
+    /// whichever queue is sending packets or sampling stats, so it cannot be a
+    /// bare stored property.
+    private var _handle: OpaquePointer?
+    private var handle: OpaquePointer? {
+        get { lock.lock(); defer { lock.unlock() }; return _handle }
+        set { lock.lock(); _handle = newValue; lock.unlock() }
+    }
 
     private var onAuthenticated: (@Sendable () -> Void)?
     private var onInbound: (@Sendable ([Data], [NSNumber]) -> Void)?
@@ -43,6 +50,10 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     private var _pushed: PushedTunnelSettings?
     private var connectedAt: Date?
     private var finished = false
+    /// Previous liveness sample: the inbound byte count and when it was taken.
+    /// Liveness here is "did anything arrive since last time", because OpenVPN
+    /// has no periodic handshake to age out.
+    private var lastRxSample: (bytes: UInt64, at: Date)?
 
     /// What the relay assigned. Nil until the tunnel is up.
     public var pushedSettings: PushedTunnelSettings? {
@@ -98,7 +109,7 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     }
 
     deinit {
-        if let handle { sweep_ovpn_free(handle) }
+        if let _handle { sweep_ovpn_free(_handle) }
     }
 
     // MARK: - TunnelAdapter
@@ -109,7 +120,14 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         self.onAuthenticated = onAuthenticated
         self.onInbound = onInbound
         self.onFailure = onFailure
+        // Bringing up the loopback listener waits for it to become ready, and
+        // the caller is the coordinator's serial queue — the same queue its
+        // timers and failure handling run on. Blocking it there stalls every
+        // other rung and delays the very deadlines meant to bound this attempt.
+        queue.async { [weak self] in self?.startOnQueue() }
+    }
 
+    private func startOnQueue() {
         let ctx = Unmanaged.passUnretained(self).toOpaque()
 
         let created = profileThroughWorker().withCString { cProfile in
@@ -143,13 +161,13 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         }
 
         guard let created else {
-            onFailure(.allRungsFailed)
+            fail(.allRungsFailed)
             return
         }
         handle = created
 
         guard sweep_ovpn_start(created) == 0 else {
-            onFailure(.allRungsFailed)
+            fail(.allRungsFailed)
             return
         }
     }
@@ -173,6 +191,14 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
 
     public func reassert() {
         guard let handle else { return }
+        // `finished` latches so the several events OpenVPN 3 emits on the way
+        // down are reported once. A reconnect starts a new attempt, so the latch
+        // has to be released or that attempt's failure is swallowed and the
+        // coordinator waits forever on an adapter that is already dead.
+        lock.lock()
+        finished = false
+        lastRxSample = nil
+        lock.unlock()
         sweep_ovpn_reconnect(handle)
     }
 
@@ -183,6 +209,28 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard let connectedAt else { return -1 }
         return Int64(Date().timeIntervalSince(connectedAt))
+    }
+
+    /// Alive if inbound bytes advanced since the previous sample, or if the
+    /// session is still inside its opening grace period. The default
+    /// implementation would call a perfectly healthy OpenVPN session dead the
+    /// moment it had been up for `handshakeStaleAfter` seconds, because the only
+    /// number it has to go on is one that never stops growing.
+    public func sampleLiveness() -> Bool {
+        let now = Date()
+        let rx = transferred.rx
+
+        lock.lock()
+        let since = connectedAt
+        let previous = lastRxSample
+        lastRxSample = (rx, now)
+        lock.unlock()
+
+        // Not connected yet: nothing to judge, and the provider's handshake
+        // deadline is what bounds this phase.
+        guard let since else { return false }
+        if let previous, rx > previous.bytes { return true }
+        return now.timeIntervalSince(since) < TunnelLiveness.openVPNQuietGrace
     }
 
     public var transferred: (tx: UInt64, rx: UInt64) {

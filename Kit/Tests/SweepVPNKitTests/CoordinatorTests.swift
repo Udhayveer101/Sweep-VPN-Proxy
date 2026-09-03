@@ -5,7 +5,13 @@ import SweepVPNCore
 /// A scriptable stand-in for a real rung: it either authenticates after a delay
 /// or fails, so the whole fallback ladder can be exercised deterministically.
 final class FakeAdapter: TunnelAdapter, @unchecked Sendable {
-    enum Behaviour { case authenticate(after: TimeInterval), fail(after: TimeInterval), hang }
+    enum Behaviour {
+        case authenticate(after: TimeInterval)
+        case fail(after: TimeInterval)
+        case hang
+        /// Comes up, then loses the peer — the live-tunnel-drop case.
+        case authenticateThenDrop(after: TimeInterval, dropAfter: TimeInterval)
+    }
 
     let rung: ProtocolRung
     let behaviour: Behaviour
@@ -35,6 +41,14 @@ final class FakeAdapter: TunnelAdapter, @unchecked Sendable {
             }
         case .hang:
             break
+        case .authenticateThenDrop(let delay, let dropDelay):
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                guard !self.stopped else { return }
+                onAuthenticated()
+                DispatchQueue.global().asyncAfter(deadline: .now() + dropDelay) {
+                    onFailure(.allRungsFailed)
+                }
+            }
         }
     }
 
@@ -64,6 +78,7 @@ final class ConnectionCoordinatorTests: XCTestCase {
         var constants = AutoModeConstants()
         constants.raceStagger = 0.02
         constants.raceDeadline = 1.0
+        constants.slowRungDeadline = 6.0
         let engine = AutoModeEngine(constants: constants, preference: preference,
                                     enabledRungs: Set(ProtocolRung.allCases)
                                         .intersection(AdapterFactory.implementedRungs))
@@ -210,4 +225,89 @@ final class ConnectionCoordinatorTests: XCTestCase {
         adapter(.wireGuardTLS)?.deliver(Data([9]))
         wait(for: [delivered], timeout: 1)
     }
+}
+
+// MARK: - Regressions
+
+/// The bugs below all produced the same user-visible symptom: the tunnel
+/// connecting, dropping and reconnecting until the kill switch parked it on a
+/// blocked-traffic state. They are separate faults on the OpenVPN relay path,
+/// which is newer than the WireGuard logic that surrounds it.
+extension ConnectionCoordinatorTests {
+
+    /// A pinned public relay permits exactly one rung, and it is an OpenVPN one.
+    /// It was given WireGuard's 3 s race deadline and abandoned every time,
+    /// long before its TLS negotiation and PUSH_REPLY could finish — so the
+    /// tunnel could never come up at all. Slow rungs get their own deadline.
+    func testSlowRungIsNotAbandonedAtTheRaceDeadline() {
+        let won = XCTestExpectation(description: "the lone rung authenticated")
+        let exhausted = XCTestExpectation(description: "must not be exhausted")
+        exhausted.isInverted = true
+
+        // raceDeadline is 1.0 s in this harness; authenticate well after it.
+        let (coordinator, _) = makeCoordinator(
+            behaviours: [.openVPNTCP: .authenticate(after: 2.0)],
+            preference: .forced(.openVPNTCP),
+            onAuthenticated: { _, _ in won.fulfill() },
+            onExhausted: { _ in exhausted.fulfill() })
+
+        coordinator.start(signals: NetworkSignals())
+        wait(for: [won, exhausted], timeout: 5)
+    }
+
+    /// Every attempt still gets a deadline. A WireGuard ladder of hung rungs
+    /// must walk itself to exhaustion rather than stalling on the first one —
+    /// the regression the protocol-aware deadline had to avoid introducing.
+    func testHungWireGuardRungsStillExhaustTheLadder() {
+        let exhausted = XCTestExpectation(description: "the race gave up")
+        let (coordinator, _) = makeCoordinator(
+            behaviours: Dictionary(uniqueKeysWithValues:
+                AdapterFactory.implementedRungs.map { ($0, FakeAdapter.Behaviour.hang) }),
+            onExhausted: { _ in exhausted.fulfill() })
+
+        coordinator.start(signals: NetworkSignals())
+        wait(for: [exhausted], timeout: 20)
+    }
+
+    /// Losing a live tunnel used to retire its rung permanently, because
+    /// `descend` skips anything already attempted. With a pinned relay that is
+    /// the only permitted rung, so a single blip ended the tunnel for good.
+    func testLosingTheLiveTunnelRetriesTheSameRungOnce() {
+        let authenticated = XCTestExpectation(description: "authenticated twice")
+        authenticated.expectedFulfillmentCount = 2
+
+        let box = AdapterBox()
+        var constants = AutoModeConstants()
+        constants.raceStagger = 0.02
+        constants.raceDeadline = 1.0
+        constants.slowRungDeadline = 6.0
+        let engine = AutoModeEngine(constants: constants, preference: .forced(.openVPNTCP),
+                                   enabledRungs: [.openVPNTCP])
+
+        // First adapter authenticates then drops; the retry authenticates and stays.
+        let attempts = Counter()
+        let coordinator = ConnectionCoordinator(
+            engine: engine, catalog: ServerCatalog(servers: [server()]), memory: .init(),
+            constants: constants,
+            build: { rung, _ in
+                let behaviour: FakeAdapter.Behaviour =
+                    attempts.next() == 0 ? .authenticateThenDrop(after: 0.05, dropAfter: 0.05)
+                                         : .authenticate(after: 0.05)
+                let adapter = FakeAdapter(rung: rung, behaviour: behaviour)
+                box.store(adapter)
+                return adapter
+            },
+            callbacks: .init(onAuthenticated: { _, _ in authenticated.fulfill() },
+                             onInbound: { _, _ in },
+                             onExhausted: { _ in }))
+
+        coordinator.start(signals: NetworkSignals())
+        wait(for: [authenticated], timeout: 5)
+    }
+}
+
+final class Counter: @unchecked Sendable {
+    private var value = 0
+    private let lock = NSLock()
+    func next() -> Int { lock.lock(); defer { value += 1; lock.unlock() }; return value }
 }

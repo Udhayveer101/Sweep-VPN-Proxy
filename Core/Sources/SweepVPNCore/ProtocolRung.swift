@@ -48,6 +48,11 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
         }
     }
 
+    /// Rungs whose handshake is too slow to judge on the race deadline. This is
+    /// a property of the protocol, not of the network: OpenVPN's TLS negotiation
+    /// plus PUSH_REPLY is simply not a one-round-trip WireGuard handshake.
+    public var handshakeIsSlow: Bool { !isOwnWireGuardTunnel }
+
     /// Rungs that survive a network where every UDP port is dropped.
     public var survivesUDPBlock: Bool { !isUDP }
 

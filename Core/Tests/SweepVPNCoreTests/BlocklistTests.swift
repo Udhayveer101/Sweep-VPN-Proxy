@@ -52,3 +52,39 @@ final class BlocklistTests: XCTestCase {
                                                  isLoopback: true)), .allow)
     }
 }
+
+/// Domain rules were matched against the flow's remote *address*, which by the
+/// time a flow exists is an IP — so the blocklist advertised in Settings
+/// ("blocked at the connection, not just in DNS") silently blocked nothing.
+extension BlocklistTests {
+    private func policy(blocking domains: [String]) -> FilterPolicy {
+        var options = SecurityPolicyOptions()
+        options.blockedDomains = domains
+        return FilterPolicy(options: options, tunnelIsUp: true)
+    }
+
+    func testDomainRuleMatchesTheHostnameNotJustTheAddress() {
+        let p = policy(blocking: ["ads.example.com"])
+        XCTAssertEqual(p.verdict(for: .init(interfaceName: nil, remoteAddress: "93.184.216.34",
+                                            remoteHostname: "ads.example.com")), .drop)
+        // Subdomains too, as the settings copy promises.
+        XCTAssertEqual(p.verdict(for: .init(interfaceName: nil, remoteAddress: "93.184.216.34",
+                                            remoteHostname: "img.ads.example.com")), .drop)
+    }
+
+    func testUnrelatedHostnameIsNotBlocked() {
+        let p = policy(blocking: ["ads.example.com"])
+        XCTAssertEqual(p.verdict(for: .init(interfaceName: nil, remoteAddress: "93.184.216.34",
+                                            remoteHostname: "notads.example.com")), .allow)
+        XCTAssertEqual(p.verdict(for: .init(interfaceName: nil, remoteAddress: "93.184.216.34",
+                                            remoteHostname: "ads.example.com.attacker.net")), .allow)
+    }
+
+    /// A literal address in the list must still work — the hostname check is an
+    /// addition, not a replacement.
+    func testLiteralAddressRuleStillMatches() {
+        let p = policy(blocking: ["93.184.216.34"])
+        XCTAssertEqual(p.verdict(for: .init(interfaceName: nil, remoteAddress: "93.184.216.34",
+                                            remoteHostname: nil)), .drop)
+    }
+}

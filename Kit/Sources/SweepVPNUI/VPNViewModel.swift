@@ -342,6 +342,11 @@ public final class VPNViewModel: ObservableObject {
         do {
             switch action {
             case .connect, .retry:
+                // Installing an on-demand profile with nothing to connect to is
+                // what produces the connect/disconnect loop: the extension
+                // throws `noServers`, on-demand restarts it, and it throws
+                // again — with the blackhole route installed the whole time.
+                guard await ensureConnectable() else { return }
                 try await configurator.install(policy: SecurityPolicy(options: options),
                                                serverDescription: serverName ?? "Sweep VPN")
                 try await configurator.start()
@@ -362,6 +367,44 @@ public final class VPNViewModel: ObservableObject {
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    /// Guarantees the extension will have something to connect to, picking a
+    /// public relay if that is the only option available.
+    ///
+    /// Returns false when nothing could be found, in which case the caller must
+    /// not start the tunnel — the relay picker is opened instead.
+    private func ensureConnectable() async -> Bool {
+        if hasVerifiedConfig { return true }
+        #if os(macOS)
+        if RelaySelectionStore(appGroup: appGroup).load() != nil { return true }
+
+        if relays.isEmpty { loadCachedRelays() }
+        if relays.isEmpty { await refreshRelays() }
+        guard !relays.isEmpty else {
+            // `refreshRelays` has already put the specific reason (a 403 block
+            // page reads very differently from being offline) into relayStatus.
+            lastError = relayStatus ?? "No relays available yet."
+            activeSheet = .publicRelays
+            return false
+        }
+
+        // Measure before pinning: VPN Gate's advertised score says nothing about
+        // reachability from here, and pinning a dead relay just moves the same
+        // failure into the extension.
+        await probeRelays(limit: 40)
+        let reachable = rankedRelays.first { ($0.1?.lossFraction ?? 1) < 1 }?.0
+        guard let chosen = reachable ?? rankedRelays.first?.0 else {
+            lastError = "No relay answered. Pick one manually or try again."
+            activeSheet = .publicRelays
+            return false
+        }
+        select(server: chosen)
+        return true
+        #else
+        lastError = "No verified configuration to connect to."
+        return false
+        #endif
     }
 
     public func apply(options newOptions: SecurityPolicyOptions) {

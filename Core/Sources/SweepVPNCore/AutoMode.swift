@@ -20,6 +20,13 @@ public struct AutoModeConstants: Sendable, Equatable {
     public var raceStagger: TimeInterval = 0.25
     public var raceMaxConcurrent: Int = 3
     public var raceDeadline: TimeInterval = 3
+    /// Deadline for rungs that cannot possibly authenticate inside
+    /// `raceDeadline`. A WireGuard handshake is one round trip and lands in well
+    /// under a second; OpenVPN negotiates TLS, waits for PUSH_REPLY, and on this
+    /// network does all of it inside a WSS session to Cloudflare — 5-15 s is
+    /// normal. Cutting those off at 3 s abandoned the attempt every time.
+    /// Must stay below the provider's handshake deadline, which is the outer bound.
+    public var slowRungDeadline: TimeInterval = 25
     public var serverSwitchMinGainMs: Double = 25
     public init() {}
 }

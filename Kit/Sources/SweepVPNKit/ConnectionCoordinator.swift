@@ -38,6 +38,9 @@ public final class ConnectionCoordinator: @unchecked Sendable {
     private var memory: NetworkMemory
     private var attempted: Set<ProtocolRung> = []
     private var failed: Set<ProtocolRung> = []
+    /// Rungs already given their one post-loss retry, so a relay that drops
+    /// repeatedly still terminates instead of looping.
+    private var retriedAfterLoss: Set<ProtocolRung> = []
     private var racing: [ProtocolRung: TunnelAdapter] = [:]
     private var winner: TunnelAdapter?
     private var server: Server?
@@ -64,6 +67,9 @@ public final class ConnectionCoordinator: @unchecked Sendable {
     public var activeServer: Server? { server }
     /// Seconds since the live rung last completed a handshake, or -1.
     public var handshakeAgeSeconds: Int64 { winner?.lastHandshakeAgeSeconds ?? -1 }
+    /// Ask the live rung whether it still looks alive, on its own terms.
+    /// No live rung is not "unhealthy" — there is simply nothing to sample.
+    public func sampleLiveness() -> Bool? { winner?.sampleLiveness() }
     public var transferred: (tx: UInt64, rx: UInt64) { winner?.transferred ?? (0, 0) }
 
     // MARK: - Starting
@@ -97,10 +103,19 @@ public final class ConnectionCoordinator: @unchecked Sendable {
             }
         }
 
+        // The deadline has to suit the slowest rung actually in flight. Applying
+        // WireGuard's 3 s to an OpenVPN attempt killed it long before its TLS
+        // negotiation and PUSH_REPLY could complete — which, with a pinned
+        // relay, meant the only permitted rung was abandoned every single time
+        // and the tunnel could never come up. Every attempt still gets *a*
+        // deadline, so a hung rung cannot stall the ladder.
+        let timeout = fresh.contains(where: \.handshakeIsSlow)
+            ? constants.slowRungDeadline
+            : constants.raceDeadline
         let deadline = DispatchWorkItem { [weak self] in self?.raceTimedOut() }
         raceDeadline?.cancel()
         raceDeadline = deadline
-        queue.asyncAfter(deadline: .now() + constants.raceDeadline, execute: deadline)
+        queue.asyncAfter(deadline: .now() + timeout, execute: deadline)
     }
 
     private func startAdapter(for rung: ProtocolRung) {
@@ -166,6 +181,16 @@ public final class ConnectionCoordinator: @unchecked Sendable {
                 winner?.stop()
                 winner = nil
                 racing.removeValue(forKey: rung)
+                // A rung that carried a working tunnel and then dropped has
+                // earned one more try: the relay blipped, the network moved.
+                // Without this, `descend` skips it as already-attempted, and
+                // when it is the only permitted rung — which is exactly the
+                // pinned-relay case — one blip retires the tunnel for good.
+                if !retriedAfterLoss.contains(rung) {
+                    retriedAfterLoss.insert(rung)
+                    attempted.remove(rung)
+                    failed.remove(rung)
+                }
                 descend(now: Date())
             }
             return

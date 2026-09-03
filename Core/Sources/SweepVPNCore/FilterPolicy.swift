@@ -26,13 +26,19 @@ public struct FilterPolicy: Sendable, Equatable {
     public struct Flow: Sendable, Equatable {
         public var interfaceName: String?
         public var remoteAddress: String?
+        /// The name the flow is for, when the OS knows it. Domain rules match on
+        /// this — matching them against `remoteAddress` never worked, because by
+        /// the time a flow exists the name has usually been resolved away.
+        public var remoteHostname: String?
         public var isLoopback: Bool
         public var isOutbound: Bool
 
         public init(interfaceName: String?, remoteAddress: String?,
+                    remoteHostname: String? = nil,
                     isLoopback: Bool = false, isOutbound: Bool = true) {
             self.interfaceName = interfaceName
             self.remoteAddress = remoteAddress
+            self.remoteHostname = remoteHostname
             self.isLoopback = isLoopback
             self.isOutbound = isOutbound
         }
@@ -62,8 +68,13 @@ public struct FilterPolicy: Sendable, Equatable {
         // switch. A domain the user has blocked must stay blocked when the VPN
         // is off — that is the whole point of it, and an in-tunnel DNS filter
         // cannot do it because with the tunnel down there is no in-tunnel DNS.
-        if let host = flow.remoteAddress, Self.isBlocked(host, by: options.blockedDomains) {
-            return .drop
+        // Check the hostname first: it is the only field a domain rule can
+        // actually match. An IP rule still works, because a literal address in
+        // the list is compared against `remoteAddress` too.
+        for candidate in [flow.remoteHostname, flow.remoteAddress] {
+            if let candidate, Self.isBlocked(candidate, by: options.blockedDomains) {
+                return .drop
+            }
         }
 
         // With the kill switch off the filter is not an enforcement point.

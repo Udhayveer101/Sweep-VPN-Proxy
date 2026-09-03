@@ -191,6 +191,41 @@ public struct RelayTunnelSettings: Sendable {
                                    token: defaults?.string(forKey: tokenKey) ?? "")
     }
 
+    /// Addresses the Worker currently resolves to.
+    ///
+    /// The content filter compares flows by address, and when the relay tunnel
+    /// is on, the extension's real outbound flow goes to the Worker rather than
+    /// to the relay. Without these in the filter's allow-list the kill switch
+    /// drops the one connection the tunnel needs in order to come up — a
+    /// deadlock that fails closed and never recovers.
+    ///
+    /// Cloudflare's addresses rotate, so this is resolved at publish time rather
+    /// than pinned. An empty result is not fatal: the filter simply has one
+    /// fewer allowance, which is the safe direction to be wrong in.
+    public func workerAddresses() -> Set<String> {
+        guard let host = workerURL.host else { return [] }
+
+        var hints = addrinfo(ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_STREAM,
+                             ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil,
+                             ai_addr: nil, ai_next: nil)
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &result) == 0, let head = result else { return [] }
+        defer { freeaddrinfo(head) }
+
+        var addresses: Set<String> = []
+        var node: UnsafeMutablePointer<addrinfo>? = head
+        while let current = node {
+            var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if let sa = current.pointee.ai_addr,
+               getnameinfo(sa, current.pointee.ai_addrlen, &buffer, socklen_t(buffer.count),
+                           nil, 0, NI_NUMERICHOST) == 0 {
+                addresses.insert(String(cString: buffer))
+            }
+            node = current.pointee.ai_next
+        }
+        return addresses
+    }
+
     public func save(appGroup: String) {
         let defaults = UserDefaults(suiteName: appGroup)
         defaults?.set(enabled, forKey: Self.enabledKey)

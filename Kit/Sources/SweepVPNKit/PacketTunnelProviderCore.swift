@@ -67,6 +67,8 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// Where the user's chosen public relay is kept, if the platform target
     /// supports the OpenVPN rungs.
     open var relayStore: RelaySelectionStore? { nil }
+    /// The shared app group, for the settings that live outside the keychain.
+    open var appGroup: String { "group.com.sweep.vpn" }
 
     // MARK: - Lifecycle
 
@@ -83,7 +85,7 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             queue.async {
                 guard let self else { return }
                 if let error { return self.fail(.internalFailure, error, completionHandler) }
-                self.machine.transition(to: .connecting(rung: .wireGuardUDP))
+                self.machine.transition(to: .connecting(rung: self.plannedRung()))
                 do {
                     try self.beginConnection()
                 } catch {
@@ -203,11 +205,25 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
                 }))
         self.coordinator = coordinator
 
-        machine.transition(to: .handshaking(rung: .wireGuardUDP))
+        machine.transition(to: .handshaking(rung: enabled.min() ?? .wireGuardUDP))
         armHandshakeDeadline()
         coordinator.start(signals: signals)
         startPathMonitor()
-        startProbing()
+        // A pinned relay is a catalog of one, and probing it means dialling it
+        // directly — outside the Worker, in plaintext OpenVPN, which is the very
+        // signature this kind of network resets. There is also nothing to rank.
+        if catalog.servers.count > 1 { startProbing() }
+    }
+
+    /// The rung the next attempt will use, for honest state reporting before the
+    /// coordinator exists. A pinned relay decides it; otherwise the ladder does.
+    private func plannedRung() -> ProtocolRung {
+        if let relay = relayStore?.load(),
+           let rung = Set(relay.endpoints.map(\.rung))
+               .intersection(AdapterFactory.implementedRungs).min() {
+            return rung
+        }
+        return .wireGuardUDP
     }
 
     private func armHandshakeDeadline() {
@@ -286,7 +302,15 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// than "connected" publishes `up: false`, which makes the filter drop.
     private func publishFilterState(up: Bool, server: Server?) {
         guard let filterStateStore else { return }
-        let addresses = Set((server?.endpoints ?? []).map(\.host))
+        var addresses = Set((server?.endpoints ?? []).map(\.host))
+        #if os(macOS)
+        // When the relay tunnel is on, the flow that actually leaves this
+        // machine goes to the Worker, not to the relay. Allow-listing only the
+        // relay leaves the filter dropping the connection the tunnel needs to
+        // come up at all, which fails closed with no way back.
+        let relayTunnel = RelayTunnelSettings.load(appGroup: appGroup)
+        if relayTunnel.enabled { addresses.formUnion(relayTunnel.workerAddresses()) }
+        #endif
         filterStateStore.write(FilterState(tunnelInterface: nil, tunnelIsUp: up,
                                            serverAddresses: addresses, options: policy.options))
     }
@@ -328,12 +352,14 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
 
     private func sampleHealth() {
         guard let coordinator, let rung = coordinator.activeRung else { return }
-        let age = coordinator.handshakeAgeSeconds
-        // WireGuard rekeys about every two minutes; an older handshake with no
-        // traffic means the path is gone.
-        let healthy = age >= 0 && age < 180
-        let health = LinkHealth(rttMs: Double(max(age, 0)) * 1000 / 180,
-                                lossFraction: healthy ? 0 : 1, handshakeOK: healthy)
+        // Each rung judges its own liveness: handshake freshness for WireGuard,
+        // inbound byte movement for OpenVPN, which has no periodic handshake and
+        // whose session age only ever grows. Deriving both from one number here
+        // marked every healthy OpenVPN tunnel dead at the three-minute mark.
+        guard let healthy = coordinator.sampleLiveness() else { return }
+        // rttMs is measured by the prober, not inferred here; the engine reads
+        // only lossFraction and handshakeOK.
+        let health = LinkHealth(rttMs: 0, lossFraction: healthy ? 0 : 1, handshakeOK: healthy)
         if !healthy, machine.state.forwardingAllowed {
             publishFilterState(up: false, server: coordinator.activeServer)
             machine.transition(to: .degraded(rung: rung, reason: .handshakeFlapping))

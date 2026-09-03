@@ -19,6 +19,15 @@ public protocol TunnelAdapter: AnyObject, Sendable {
     func reassert()
     var lastHandshakeAgeSeconds: Int64 { get }
     var transferred: (tx: UInt64, rx: UInt64) { get }
+    /// Whether the tunnel still looks alive, judged the way *this protocol*
+    /// allows. It exists because "handshake age" does not mean the same thing on
+    /// every rung: WireGuard rekeys on a schedule, so a stale handshake is a
+    /// dead path, while OpenVPN establishes its session once and would fail that
+    /// test by simply staying connected. Each adapter answers for itself rather
+    /// than the provider reinterpreting a number that means two things.
+    ///
+    /// Called on a timer, so implementations may keep sample-to-sample state.
+    func sampleLiveness() -> Bool
     /// Settings the peer assigned at connect time. Nil for every WireGuard
     /// rung, where the address comes from the signed bundle before the tunnel
     /// starts; set for OpenVPN, where it arrives in PUSH_REPLY.
@@ -27,6 +36,23 @@ public protocol TunnelAdapter: AnyObject, Sendable {
 
 public extension TunnelAdapter {
     var pushedSettings: PushedTunnelSettings? { nil }
+
+    /// WireGuard's rule, and the right default: the protocol rekeys about every
+    /// two minutes, so a handshake older than that with no traffic means the
+    /// path is gone. `-1` is "never handshaked", which is not alive either.
+    func sampleLiveness() -> Bool {
+        let age = lastHandshakeAgeSeconds
+        return age >= 0 && age < TunnelLiveness.handshakeStaleAfter
+    }
+}
+
+public enum TunnelLiveness {
+    /// Roughly one and a half WireGuard rekey intervals.
+    public static let handshakeStaleAfter: Int64 = 180
+    /// How long an OpenVPN session is given to carry its first inbound bytes
+    /// before silence counts against it. A relay that has assigned an address
+    /// but sent nothing back yet is still connecting, not dead.
+    public static let openVPNQuietGrace: TimeInterval = 90
 }
 
 public enum AdapterFactoryError: Error, Equatable {
