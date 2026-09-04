@@ -40,33 +40,73 @@
 import { connect } from "cloudflare:sockets";
 
 const RELAY_LIST = "https://www.vpngate.net/api/iphone/";
-const ALLOW_TTL_MS = 60 * 60 * 1000;
+/// Deliberately the same 300 s the mirror route below serves the app, and the
+/// same `cacheTtl`, so both routes read one edge-cached body. They used to be an
+/// hour apart, and that hour was a bug with a signature: the user refreshes the
+/// relay list, gets rows newer than this isolate's allow-list, and every one of
+/// them comes back `1008 not a known relay` until the TTL rolls over. VPN Gate
+/// rotates addresses within hours, so after a refresh that was most of the pool.
+const ALLOW_TTL_MS = 5 * 60 * 1000;
 
 let allowCache = { at: 0, hosts: new Set() };
+/// One in-flight refresh shared by every concurrent dial. A burst of sixteen
+/// relays failing the set must not become sixteen upstream fetches.
+let allowInFlight = null;
 
-/// IPs the relay list currently advertises. On a refresh failure the previous
-/// set is kept — never falling open, never falling shut mid-session.
+function parseHosts(body) {
+  const hosts = new Set();
+  for (const line of body.split("\n")) {
+    const cols = line.split(",");
+    // #HostName,IP,... — column 1 is the relay's address.
+    if (cols.length > 14 && /^\d+\.\d+\.\d+\.\d+$/.test(cols[1])) hosts.add(cols[1]);
+  }
+  return hosts;
+}
+
+/// Fetch the list and replace the cache. On failure the previous set is kept —
+/// never falling open, never falling shut mid-session.
+function refreshHosts() {
+  if (allowInFlight) return allowInFlight;
+  const run = (async () => {
+    try {
+      const res = await fetch(RELAY_LIST, {
+        cf: { cacheTtl: 300, cacheEverything: true },
+        headers: { "user-agent": "sweep-vpn-tunnel" },
+      });
+      if (res.ok) {
+        const hosts = parseHosts(await res.text());
+        if (hosts.size) allowCache = { at: Date.now(), hosts };
+      }
+    } catch {
+      // keep whatever we had
+    } finally {
+      allowInFlight = null;
+    }
+    return allowCache.hosts;
+  })();
+  allowInFlight = run;
+  return run;
+}
+
+/// IPs the relay list currently advertises.
 async function allowedHosts() {
   if (Date.now() - allowCache.at < ALLOW_TTL_MS && allowCache.hosts.size) {
     return allowCache.hosts;
   }
-  try {
-    const res = await fetch(RELAY_LIST, {
-      cf: { cacheTtl: 3600, cacheEverything: true },
-      headers: { "user-agent": "sweep-vpn-tunnel" },
-    });
-    if (!res.ok) return allowCache.hosts;
-    const hosts = new Set();
-    for (const line of (await res.text()).split("\n")) {
-      const cols = line.split(",");
-      // #HostName,IP,... — column 1 is the relay's address.
-      if (cols.length > 14 && /^\d+\.\d+\.\d+\.\d+$/.test(cols[1])) hosts.add(cols[1]);
-    }
-    if (hosts.size) allowCache = { at: Date.now(), hosts };
-  } catch {
-    // keep whatever we had
-  }
-  return allowCache.hosts;
+  return refreshHosts();
+}
+
+/// A miss is not yet a refusal. The relay the client just picked may have been
+/// published after this isolate last looked, so spend one forced refresh before
+/// turning it away — otherwise a freshly-listed relay is unusable for the whole
+/// TTL, which is the whole of what the client can see.
+async function isAllowed(host) {
+  const before = allowCache.at;
+  if ((await allowedHosts()).has(host)) return true;
+  // Only worth a second trip if the set we just missed against was not itself
+  // freshly fetched.
+  if (allowCache.at !== before) return false;
+  return (await refreshHosts()).has(host);
 }
 
 /// Constant-time-ish compare, so the token cannot be recovered a byte at a time.
@@ -115,8 +155,7 @@ async function runTunnel(ws, host, port, token, expected) {
 
   if (!tokenMatches(token, expected)) return fail("forbidden");
   if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return fail("bad target");
-  const allowed = await allowedHosts();
-  if (!allowed.has(host)) return fail("not a known relay");
+  if (!(await isAllowed(host))) return fail("not a known relay");
 
   let socket;
   try {
