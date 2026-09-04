@@ -170,6 +170,12 @@ final class MinimalWebSocket: @unchecked Sendable {
     /// stream ended without one, which is a dropped TCP session rather than a
     /// close either end chose.
     private(set) var closeSummary: String?
+    /// The close frame's status code, if the peer sent one. Nil means the
+    /// stream just ended. The two lead to opposite decisions: a Worker that
+    /// says 1000 is telling us the *relay* finished, which no amount of
+    /// redialling can undo, and a stream that ends with nothing is our own leg
+    /// dropping, which is exactly what redialling is for.
+    private(set) var closeCode: Int?
 
     func receive(onMessage: @escaping @Sendable (Data) -> Void,
                  onClose: @escaping @Sendable (Error?) -> Void) {
@@ -223,6 +229,7 @@ final class MinimalWebSocket: @unchecked Sendable {
                     let code = Int(parsed.payload[parsed.payload.startIndex]) << 8
                         | Int(parsed.payload[parsed.payload.startIndex + 1])
                     let reason = String(decoding: parsed.payload.dropFirst(2), as: UTF8.self)
+                    closeCode = code
                     closeSummary = reason.isEmpty ? "close \(code)" : "close \(code) \(reason)"
                 } else {
                     closeSummary = "close, no code"

@@ -369,7 +369,6 @@ public final class WebSocketTransport: @unchecked Sendable {
                         "wssReattached",
                         "the relay session survived the drop; OpenVPN never saw it")
                 }
-                leg.attempts = 0
                 leg.socket = socket
                 // Anything OpenVPN sent while the leg was down goes first, in
                 // order, or the relay sees a hole in its stream.
@@ -378,6 +377,13 @@ public final class WebSocketTransport: @unchecked Sendable {
                 self.pumpSocketToWorker(leg)
                 return
             }
+            // Traffic, not a status byte, is what proves the leg is good. The
+            // budget resets here and nowhere else: a Worker that answers 0x01
+            // and then closes at once would otherwise refill the budget on
+            // every attempt and redial forever — measured, about twenty times
+            // in ten seconds before OpenVPN gave up and renegotiated anyway,
+            // with the internet dead throughout.
+            leg.attempts = 0
             leg.connection.send(content: data, completion: .contentProcessed { _ in })
         }, onClose: { [weak self] error in
             // A clean close here is almost never the Worker: the Worker closes
@@ -392,7 +398,21 @@ public final class WebSocketTransport: @unchecked Sendable {
                     ?? "relay \(self?.host ?? "?") dropped the session "
                         + "(\(socket.closeSummary ?? "stream ended, no close frame")) "
                         + "after \(Int(Date().timeIntervalSince(openedAt)))s")
-            self?.redial(leg, worker)
+            guard let self else { return }
+            // The Worker closes 1000 "eof" when the *relay* hung up, and 1008
+            // when it will not carry this relay at all. Neither is our leg
+            // failing, so neither is worth a redial — the relay is gone and
+            // only the coordinator can move off it. A stream that ends with no
+            // close frame is the opposite case: our leg, and redialling it is
+            // the whole point.
+            if let code = socket.closeCode, code != 1006 {
+                Diagnostics.shared.record(
+                    "wssRelayFinished",
+                    "the Worker closed \(code); handing over rather than redialling a relay that is gone")
+                self.giveUp(leg, worker)
+                return
+            }
+            self.redial(leg, worker)
         })
     }
 
