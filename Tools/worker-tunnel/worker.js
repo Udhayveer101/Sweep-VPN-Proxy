@@ -161,17 +161,24 @@ export class RelaySession {
     const url = new URL(request.url);
     const host = url.searchParams.get("h");
     const port = Number(url.searchParams.get("p"));
+    // `r=1` says the client is resuming, not starting. It matters because this
+    // object can be evicted while parked, and a resumed session that quietly
+    // opened a *fresh* relay socket would hand OpenVPN a stream it cannot pick
+    // up — a corrupt session that only fails later, on a timeout. Refusing it
+    // outright turns that into an immediate, honest handover.
+    const resuming = url.searchParams.get("r") === "1";
     const [client, server] = Object.values(new WebSocketPair());
     server.accept();
     // Same rule as before: return the 101 promptly. Everything else happens
     // after it, or the runtime kills the request as hung.
-    this.attach(server, host, port);
+    this.attach(server, host, port, resuming);
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  attach(ws, host, port) {
+  attach(ws, host, port, resuming = false) {
     const target = `${host}:${port}`;
     if (this.dead) return this.refuse(ws, "session gone");
+    if (resuming && !this.socket) return this.refuse(ws, "session gone");
     // A resumed session may only resume the relay it started on. The session id
     // is the client's to choose, and this is what stops a chosen id from being
     // a way to point someone else's live socket somewhere new.

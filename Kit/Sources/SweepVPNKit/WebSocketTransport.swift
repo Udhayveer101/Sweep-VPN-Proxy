@@ -116,7 +116,7 @@ public final class WebSocketTransport: @unchecked Sendable {
     /// The request target. Only the path and query travel in the request line;
     /// the host travels in `Host` and in SNI, because the socket is opened to
     /// an address.
-    func tunnelPath(session: String) -> String {
+    func tunnelPath(session: String, resuming: Bool = false) -> String {
         var components = URLComponents()
         components.path = "/tcp"
         components.queryItems = [
@@ -128,6 +128,9 @@ public final class WebSocketTransport: @unchecked Sendable {
             // of opening a new one and making OpenVPN start over.
             URLQueryItem(name: "s", value: session),
         ]
+        // Says this is a redial, so the Worker refuses to answer it with a
+        // fresh relay socket the OpenVPN session could not have resumed.
+        if resuming { components.queryItems?.append(URLQueryItem(name: "r", value: "1")) }
         return components.string ?? "/tcp"
     }
 
@@ -232,7 +235,8 @@ public final class WebSocketTransport: @unchecked Sendable {
             return
         }
         let socket = MinimalWebSocket(connection: worker, host: name,
-                                      path: tunnelPath(session: leg.session))
+                                      path: tunnelPath(session: leg.session,
+                                                       resuming: leg.attempts > 0))
 
         worker.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
