@@ -116,29 +116,37 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         Diagnostics.shared.record("relayTunnelUp", "loopback:\(localPort)")
         self.transport = transport
 
-        // Replace every `remote` line with the loopback one. Profiles often
-        // list several relays; leaving any of them pointing outward would let
-        // OpenVPN fail over to a direct connection the gateway kills.
+        guard let rewritten = Self.pointingAtLoopback(profile, port: localPort) else {
+            Self.log.error("profile carried no `remote` line — connecting directly")
+            Diagnostics.shared.record("relayTunnelUnrewritten", "no remote line — DIRECT")
+            return profile
+        }
+        Diagnostics.shared.record("relayTunnelRewritten", "remote 127.0.0.1:\(localPort)")
+        return rewritten
+    }
+
+    /// Replace every `remote` line with one pointing at our loopback listener,
+    /// or nil if the profile has none. Profiles often list several relays;
+    /// leaving any of them pointing outward would let OpenVPN fail over to a
+    /// direct connection the gateway kills.
+    static func pointingAtLoopback(_ profile: String, port: UInt16) -> String? {
         var rewritten: [String] = []
         var inserted = false
-        for raw in profile.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.lowercased().hasPrefix("remote ") {
+        // Split on `isNewline`, not on "\n". VPN Gate ships CRLF profiles, and
+        // in Swift "\r\n" is one Character — so splitting on "\n" returned the
+        // whole file as a single line, no `remote` was ever matched, and every
+        // connect went out in plaintext to be reset by the gateway.
+        for raw in profile.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
+            if raw.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("remote ") {
                 if !inserted {
-                    rewritten.append("remote 127.0.0.1 \(localPort)")
+                    rewritten.append("remote 127.0.0.1 \(port)")
                     inserted = true
                 }
                 continue
             }
             rewritten.append(String(raw))
         }
-        guard inserted else {
-            Self.log.error("profile carried no `remote` line — connecting directly")
-            Diagnostics.shared.record("relayTunnelUnrewritten", "no remote line — DIRECT")
-            return profile
-        }
-        Diagnostics.shared.record("relayTunnelRewritten", "remote 127.0.0.1:\(localPort)")
-        return rewritten.joined(separator: "\n")
+        return inserted ? rewritten.joined(separator: "\n") : nil
     }
 
     deinit {

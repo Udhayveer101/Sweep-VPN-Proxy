@@ -78,3 +78,29 @@ final class TunnelLivenessTests: XCTestCase {
         XCTAssertTrue(adapter.sampleLiveness(), "still inside the opening grace period")
     }
 }
+
+/// The rewrite that puts OpenVPN on our loopback listener. Every case here is
+/// CRLF because that is what VPN Gate actually ships — an LF-only fixture
+/// passes even when the rewrite is completely broken.
+final class LoopbackRewriteTests: XCTestCase {
+    func testRewritesRemoteInACRLFProfile() throws {
+        let profile = "client\r\nproto tcp\r\nremote 219.100.37.196 443\r\nnobind\r\n"
+        let out = try XCTUnwrap(OpenVPNTunnelAdapter.pointingAtLoopback(profile, port: 59141))
+        XCTAssertTrue(out.contains("remote 127.0.0.1 59141"))
+        XCTAssertFalse(out.contains("219.100.37.196"))
+        XCTAssertTrue(out.contains("proto tcp"))
+    }
+
+    /// A profile listing several relays must not keep a route out: OpenVPN
+    /// would fail over to one and be reset by the gateway.
+    func testCollapsesEveryRemote() throws {
+        let profile = "remote a.example 443\r\nremote b.example 443\r\ncipher AES-256-GCM\r\n"
+        let out = try XCTUnwrap(OpenVPNTunnelAdapter.pointingAtLoopback(profile, port: 1))
+        XCTAssertEqual(out.components(separatedBy: "remote ").count - 1, 1)
+        XCTAssertFalse(out.contains("example"))
+    }
+
+    func testNilWhenThereIsNothingToRewrite() {
+        XCTAssertNil(OpenVPNTunnelAdapter.pointingAtLoopback("client\r\n# remote here\r\n", port: 1))
+    }
+}

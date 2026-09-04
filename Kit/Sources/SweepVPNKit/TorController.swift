@@ -320,7 +320,8 @@ public final class TorController: @unchecked Sendable {
     /// Parses tor's `notice`-level bootstrap lines. Format is stable across
     /// releases: `... [notice] Bootstrapped 45% (requesting_descriptors): Asking ...`
     func ingest(log text: String) {
-        for line in text.split(separator: "\n") {
+        // The control protocol is CRLF and Swift reads "\r\n" as one Character.
+        for line in text.split(whereSeparator: \.isNewline) {
             guard let progress = Self.parseBootstrap(String(line)) else { continue }
             if progress.percent >= 100 {
                 stallTimer?.cancel()
