@@ -34,6 +34,16 @@ public final class WebSocketTransport: @unchecked Sendable {
     public static let defaultWorkerURL =
         URL(string: "https://relay-worker.example.workers.dev")!
 
+    /// Called when the Worker's verdict on this relay is "unusable": it
+    /// declined the host, refused the token, or never answered at all.
+    ///
+    /// Without this the verdict was only logged. OpenVPN 3 saw nothing but a
+    /// loopback socket that went quiet, so it redialled the same dead relay on
+    /// its own ten-second timer — measured in the field as a 26-second handover
+    /// where the coordinator had already picked a replacement in 3 ms. The
+    /// relay is what failed, and only the coordinator can move off it.
+    public var onUnusable: (@Sendable () -> Void)?
+
     private let workerURL: URL
     private let token: String
     private let host: String
@@ -169,7 +179,13 @@ public final class WebSocketTransport: @unchecked Sendable {
         // is a different bug from anything on the Worker leg.
         Diagnostics.shared.record("wssDialled")
         guard let worker = workerConnection(), let name = workerURL.host else {
-            connection.cancel(); return
+            // No resolved Worker address means this relay cannot be dialled at
+            // all. Cancelling in silence left OpenVPN 3 staring at a loopback
+            // socket that closed for no stated reason; the coordinator has to
+            // hear about it like any other unusable relay.
+            connection.cancel()
+            onUnusable?()
+            return
         }
         let socket = MinimalWebSocket(connection: worker, host: name, path: tunnelPath())
 
@@ -184,7 +200,7 @@ public final class WebSocketTransport: @unchecked Sendable {
                         // different fixes, so the reason is recorded rather
                         // than inferred later.
                         Diagnostics.shared.record("wssHandshakeFailed", "\(error)")
-                        self.tearDown(worker, connection)
+                        self.giveUp(worker, connection)
                         return
                     }
                     Diagnostics.shared.record("wssUpgraded")
@@ -192,7 +208,7 @@ public final class WebSocketTransport: @unchecked Sendable {
                 }
             case .failed(let error):
                 Diagnostics.shared.record("wssFailed", "\(error)")
-                self.tearDown(worker, connection)
+                self.giveUp(worker, connection)
             case .waiting(let error):
                 // Not fatal on its own, but on this network it is how a blocked
                 // path presents, and it is the state URLSession never surfaced.
@@ -222,9 +238,20 @@ public final class WebSocketTransport: @unchecked Sendable {
     /// against the attempt that caused it rather than the one after.
     private static let readyDeadline: TimeInterval = 8
 
+    /// Comfortably inside OpenVPN 3's ten-second retry, so a relay the Worker
+    /// cannot reach is handed over before the core starts redialling it.
+    private static let statusDeadline: TimeInterval = 6
+
     private func tearDown(_ worker: NWConnection, _ connection: NWConnection) {
         worker.cancel()
         connection.cancel()
+    }
+
+    /// Tear down *and* say the relay is unusable, so the coordinator burns it
+    /// and hands over instead of leaving OpenVPN 3 to retry it.
+    private func giveUp(_ worker: NWConnection, _ connection: NWConnection) {
+        tearDown(worker, connection)
+        onUnusable?()
     }
 
     /// The Worker's first frame is a one-byte status: 0x01 connected. Nothing
@@ -233,6 +260,19 @@ public final class WebSocketTransport: @unchecked Sendable {
     private func awaitStatus(_ socket: MinimalWebSocket, _ worker: NWConnection,
                              _ connection: NWConnection) {
         let seenStatus = OSAllocatedUnfairLock(initialState: false)
+
+        // An upgraded socket that never carries a status byte is a relay the
+        // Worker is still failing to reach. Nothing bounded this before, so the
+        // stall ran until OpenVPN 3's own retry — the Worker's `0x00` for a
+        // declined relay arrived a full 9 s after the upgrade in the field log.
+        let statusDeadline = DispatchWorkItem { [weak self] in
+            guard let self, !seenStatus.withLock({ $0 }) else { return }
+            Diagnostics.shared.record(
+                "wssStatusTimedOut",
+                "the Worker upgraded but never reached this relay in \(Int(Self.statusDeadline))s")
+            self.giveUp(worker, connection)
+        }
+        queue.asyncAfter(deadline: .now() + Self.statusDeadline, execute: statusDeadline)
         socket.receive(onMessage: { [weak self] data in
             guard let self else { return }
             let first = seenStatus.withLock { seen -> Bool in
@@ -242,7 +282,7 @@ public final class WebSocketTransport: @unchecked Sendable {
             if first {
                 guard data.first == 0x01 else {
                     Diagnostics.shared.record("wssRefused", "the Worker declined this relay")
-                    self.tearDown(worker, connection)
+                    self.giveUp(worker, connection)
                     return
                 }
                 Diagnostics.shared.record("wssUp")

@@ -24,6 +24,48 @@ final class WebSocketTransportTests: XCTestCase {
     private let hardReset = Data([0x00, 0x0e, 0x38, 0x11, 0x22, 0x33, 0x44, 0x55,
                                  0x66, 0x77, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00])
 
+    /// The field failure this guards: the Worker declined a relay in the pool
+    /// and nothing acted on the verdict, so OpenVPN 3 redialled the same dead
+    /// host on its own ten-second timer and a handover that should have taken
+    /// three seconds took twenty-six.
+    ///
+    /// 203.0.113.1 is TEST-NET-3 and can never be on the VPN Gate list, so the
+    /// Worker answers `0x00` for it every time.
+    func testADeclinedRelayIsReportedAsUnusable() throws {
+        let token = ProcessInfo.processInfo.environment["SWEEP_TUNNEL_TOKEN"] ?? ""
+        try XCTSkipIf(token.isEmpty, "set SWEEP_TUNNEL_TOKEN to run the live tunnel test")
+
+        // The transport dials the Worker by address, from a cache the app fills
+        // while it is still outside the tunnel. A test process has no such
+        // cache, so resolve it here — otherwise this exercises the no-address
+        // path rather than the Worker's verdict.
+        let suite = "sweep.test.\(UUID().uuidString)"
+        let settings = RelayTunnelSettings(enabled: true,
+                                           workerURL: WebSocketTransport.defaultWorkerURL,
+                                           token: token)
+        let resolved = settings.workerAddresses(appGroup: suite)
+        try XCTSkipIf(resolved.isEmpty, "could not resolve the Worker")
+        RelayTunnelSettings.cache(workerAddresses: resolved, appGroup: suite)
+
+        let transport = WebSocketTransport(token: token, host: "203.0.113.1", port: 443,
+                                           appGroup: suite)
+        let unusable = expectation(description: "the transport reports the relay unusable")
+        transport.onUnusable = { unusable.fulfill() }
+        let localPort = try transport.start()
+        defer { transport.stop() }
+
+        // Dialling loopback is what makes the transport open the Worker leg.
+        let connection = NWConnection(host: "127.0.0.1",
+                                      port: NWEndpoint.Port(rawValue: localPort)!,
+                                      using: .tcp)
+        connection.start(queue: .global())
+        defer { connection.cancel() }
+
+        // Comfortably inside OpenVPN 3's ten-second retry, which is the whole
+        // point of bounding it.
+        wait(for: [unusable], timeout: 9)
+    }
+
     func testRelayAnswersThroughTheWorkerTunnel() throws {
         let token = ProcessInfo.processInfo.environment["SWEEP_TUNNEL_TOKEN"] ?? ""
         try XCTSkipIf(token.isEmpty, "set SWEEP_TUNNEL_TOKEN to run the live tunnel test")

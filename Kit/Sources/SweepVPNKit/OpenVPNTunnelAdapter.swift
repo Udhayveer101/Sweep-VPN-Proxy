@@ -114,6 +114,11 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         }
         Self.log.notice("relay tunnel listening on 127.0.0.1:\(localPort, privacy: .public)")
         Diagnostics.shared.record("relayTunnelUp", "loopback:\(localPort)")
+        // A relay the Worker cannot use is a failed relay, and the coordinator
+        // is the only thing that can move to another one. Reporting it as an
+        // adapter failure is what makes the handover immediate instead of
+        // waiting on OpenVPN 3 to notice a quiet socket.
+        transport.onUnusable = { [weak self] in self?.fail(.allRungsFailed) }
         self.transport = transport
 
         guard let rewritten = Self.pointingAtLoopback(profile, port: localPort) else {
