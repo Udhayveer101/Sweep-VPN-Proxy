@@ -260,6 +260,7 @@ public final class WebSocketTransport: @unchecked Sendable {
     private func awaitStatus(_ socket: MinimalWebSocket, _ worker: NWConnection,
                              _ connection: NWConnection) {
         let seenStatus = OSAllocatedUnfairLock(initialState: false)
+        let openedAt = Date()
 
         // An upgraded socket that never carries a status byte is a relay the
         // Worker is still failing to reach. Nothing bounded this before, so the
@@ -299,7 +300,10 @@ public final class WebSocketTransport: @unchecked Sendable {
             // day. Name the relay, since that is what actually went away.
             Diagnostics.shared.record(
                 "wssEnded",
-                error.map { "\($0)" } ?? "relay \(self?.host ?? "?") dropped the session")
+                error.map { "\($0)" }
+                    ?? "relay \(self?.host ?? "?") dropped the session "
+                        + "(\(socket.closeSummary ?? "stream ended, no close frame")) "
+                        + "after \(Int(Date().timeIntervalSince(openedAt)))s")
             self?.tearDown(worker, connection)
         })
     }

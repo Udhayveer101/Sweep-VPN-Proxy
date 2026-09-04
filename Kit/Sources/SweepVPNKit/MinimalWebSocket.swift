@@ -166,6 +166,11 @@ final class MinimalWebSocket: @unchecked Sendable {
 
     /// Calls `onMessage` for each complete binary/text message, and `onClose`
     /// once, when the peer closes or the connection errors.
+    /// What the peer's close frame said, once one has arrived. Nil means the
+    /// stream ended without one, which is a dropped TCP session rather than a
+    /// close either end chose.
+    private(set) var closeSummary: String?
+
     func receive(onMessage: @escaping @Sendable (Data) -> Void,
                  onClose: @escaping @Sendable (Error?) -> Void) {
         // Drain whatever the handshake read left over before asking for more,
@@ -210,6 +215,18 @@ final class MinimalWebSocket: @unchecked Sendable {
                     onMessage(message)
                 }
             case 0x8:
+                // The close payload is code+reason. It is the only thing that
+                // says whether the relay hung up (Worker: 1000 "eof"), the
+                // Worker itself was torn down, or the stream just ended — and
+                // those have three different fixes.
+                if parsed.payload.count >= 2 {
+                    let code = Int(parsed.payload[parsed.payload.startIndex]) << 8
+                        | Int(parsed.payload[parsed.payload.startIndex + 1])
+                    let reason = String(decoding: parsed.payload.dropFirst(2), as: UTF8.self)
+                    closeSummary = reason.isEmpty ? "close \(code)" : "close \(code) \(reason)"
+                } else {
+                    closeSummary = "close, no code"
+                }
                 onClose(nil)
                 return true
             case 0x9:
