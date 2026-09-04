@@ -16,12 +16,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 static SweepOvpnClient *g_client;
 static char g_dns[64];
 static char g_local[64];
 static int g_got_reply;
 static int g_sent;
+static int g_replies;
+static size_t build_packet(uint8_t *buf, const char *src, const char *dst);
+static int g_probes;
+static time_t g_last_reply;
+
+/// Re-arms the same probe the CONNECTED path sends, so a soak run can tell
+/// "still carrying packets" from "still nominally connected".
+static void probe(void)
+{
+    if (!g_local[0] || !g_dns[0]) return;
+    uint8_t pkt[128];
+    const size_t n = build_packet(pkt, g_local, g_dns);
+    g_probes++;
+    sweep_ovpn_send(g_client, pkt, n);
+}
 
 static uint16_t checksum(const void *data, size_t len, uint32_t seed)
 {
@@ -98,6 +114,7 @@ static void on_packet(void *ctx, const uint8_t *data, size_t len, int32_t family
         if (sport == 53) {
             printf("  <-- DNS REPLY from %s, %zu bytes  ** DATA PLANE WORKS **\n", src, len);
             g_got_reply = 1;
+            g_replies++;
             return;
         }
     }
@@ -180,6 +197,47 @@ int main(int argc, char **argv)
     if (!g_client) { fprintf(stderr, "profile did not parse\n"); return 1; }
 
     if (sweep_ovpn_start(g_client) != 0) { fprintf(stderr, "start failed\n"); return 1; }
+
+    const char *soak = getenv("SWEEP_SOAK");
+    if (soak) {
+        // Soak mode: keep probing for N seconds and report the first gap. A
+        // session that stays "connected" while replies stop is the failure we
+        // are actually chasing, and only a repeated probe can see it.
+        const int secs = atoi(soak);
+        const time_t start = time(NULL);
+        g_last_reply = start;
+        int reported_gap = 0;
+        for (int i = 0; i < secs; i++) {
+            sleep(1);
+            if (g_sent && (i % 2) == 0) probe();
+            if (g_replies) g_last_reply = g_got_reply ? time(NULL) : g_last_reply;
+            if (g_got_reply) { g_got_reply = 0; g_last_reply = time(NULL); }
+            const long gap = (long)(time(NULL) - g_last_reply);
+            if (gap >= 10 && !reported_gap) {
+                printf("!! %lds elapsed: NO REPLY for %lds (probes=%d replies=%d)\n",
+                       (long)(time(NULL) - start), gap, g_probes, g_replies);
+                reported_gap = 1;
+            }
+            if (gap < 10) reported_gap = 0;
+            if ((i % 15) == 0) {
+                uint64_t tx = 0, rx = 0;
+                sweep_ovpn_stats(g_client, &tx, &rx);
+                printf("== %4lds  probes=%d replies=%d tun tx=%llu rx=%llu\n",
+                       (long)(time(NULL) - start), g_probes, g_replies,
+                       (unsigned long long)tx, (unsigned long long)rx);
+                fflush(stdout);
+            }
+        }
+        uint64_t tx = 0, rx = 0;
+        sweep_ovpn_stats(g_client, &tx, &rx);
+        printf("SOAK DONE probes=%d replies=%d tx=%llu rx=%llu\n",
+               g_probes, g_replies, (unsigned long long)tx, (unsigned long long)rx);
+        sweep_ovpn_stop(g_client);
+        sleep(1);
+        sweep_ovpn_free(g_client);
+        free(profile);
+        return g_replies > 0 ? 0 : 1;
+    }
 
     for (int i = 0; i < 40 && !g_got_reply; i++) sleep(1);
 

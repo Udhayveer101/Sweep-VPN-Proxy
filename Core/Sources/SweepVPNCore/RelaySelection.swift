@@ -19,6 +19,7 @@ import Foundation
 public struct RelaySelectionStore: Sendable {
     private let suiteName: String?
     private let key = "sweep.selectedRelay"
+    private let poolKey = "sweep.selectedRelayPool"
 
     public init(appGroup: String) { self.suiteName = appGroup }
 
@@ -27,6 +28,32 @@ public struct RelaySelectionStore: Sendable {
 
     private var defaults: UserDefaults? {
         suiteName.flatMap { UserDefaults(suiteName: $0) }
+    }
+
+    /// The whole pool, best first.
+    ///
+    /// A pool rather than a pin because a VPN Gate relay is a volunteer's
+    /// machine that drops sessions without warning — measured: an idle TCP
+    /// session FIN'd at 62 s, a live one at 92 s, and a re-auth to the same
+    /// relay immediately after came back AUTH_FAILED. With one relay stored,
+    /// every one of those ends the tunnel for good, because there is nothing
+    /// for the coordinator to move to. With alternates here it is a handover.
+    public func loadAll() -> [Server] {
+        guard let defaults else { return [] }
+        if let data = defaults.data(forKey: poolKey),
+           let pool = try? JSONDecoder().decode([Server].self, from: data) {
+            let relays = pool.filter(\.isThirdPartyRelay)
+            if !relays.isEmpty { return relays }
+        }
+        return load().map { [$0] } ?? []
+    }
+
+    public func saveAll(_ servers: [Server]) {
+        guard let defaults else { return }
+        let relays = servers.filter(\.isThirdPartyRelay)
+        guard let head = relays.first, let data = try? JSONEncoder().encode(relays) else { return }
+        defaults.set(data, forKey: poolKey)
+        save(head)   // keeps `load()` meaningful for anything still reading the pin
     }
 
     public func load() -> Server? {
@@ -48,5 +75,6 @@ public struct RelaySelectionStore: Sendable {
 
     public func clear() {
         defaults?.removeObject(forKey: key)
+        defaults?.removeObject(forKey: poolKey)
     }
 }

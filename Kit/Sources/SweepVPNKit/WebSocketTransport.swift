@@ -251,7 +251,15 @@ public final class WebSocketTransport: @unchecked Sendable {
             }
             connection.send(content: data, completion: .contentProcessed { _ in })
         }, onClose: { [weak self] error in
-            Diagnostics.shared.record("wssEnded", error.map { "\($0)" } ?? "the Worker closed")
+            // A clean close here is almost never the Worker: the Worker closes
+            // 1000 "eof" when the *relay* drops its TCP session, which is what
+            // a VPN Gate volunteer relay does on its own schedule (measured: an
+            // idle session FIN'd at 62 s, a live one at 92 s). Saying "the
+            // Worker closed" sent the last investigation at Cloudflare for a
+            // day. Name the relay, since that is what actually went away.
+            Diagnostics.shared.record(
+                "wssEnded",
+                error.map { "\($0)" } ?? "relay \(self?.host ?? "?") dropped the session")
             self?.tearDown(worker, connection)
         })
     }

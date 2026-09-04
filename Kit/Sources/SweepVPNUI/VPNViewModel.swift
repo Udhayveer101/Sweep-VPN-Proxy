@@ -586,7 +586,25 @@ public final class VPNViewModel: ObservableObject {
         // pinned 219.100.37.196 was refused, and it is absent from the live CSV.
         if let pinned {
             let live = Set(relays.flatMap { $0.endpoints.map(\.host) })
-            if pinned.endpoints.contains(where: { live.contains($0.host) }) { return true }
+            if pinned.endpoints.contains(where: { live.contains($0.host) }) {
+                // A pin saved before pools existed — or one whose alternates
+                // have since been delisted — leaves the extension with nothing
+                // to fail over to, which is the whole failure this pool exists
+                // to prevent. Top it up before connecting rather than after the
+                // relay drops.
+                let pool = store.loadAll().filter { relay in
+                    relay.endpoints.contains { live.contains($0.host) }
+                }
+                if pool.count < 2 {
+                    await probeRelays(limit: 40)
+                    store.saveAll(relayPool(headedBy: pinned))
+                    log.record(phase: "relay", level: .info, kind: "relayPoolTopUp",
+                               detail: "\(store.loadAll().count) relays available for handover")
+                } else if pool.count < store.loadAll().count {
+                    store.saveAll(pool)   // drop the delisted alternates
+                }
+                return true
+            }
             log.record(phase: "relay", level: .warn, kind: "pinnedRelayDelisted",
                        detail: "\(pinned.name) is no longer on the list — reselecting")
             store.clear()
@@ -835,12 +853,31 @@ public final class VPNViewModel: ObservableObject {
             return
         }
         #if os(macOS)
-        RelaySelectionStore(appGroup: appGroup).save(server)
+        RelaySelectionStore(appGroup: appGroup).saveAll(relayPool(headedBy: server))
         Task { _ = try? await configurator.send(.relaySelectionChanged) }
         #else
         lastError = "Public relays need the OpenVPN rung, which this build only has on macOS."
         #endif
     }
+
+    #if os(macOS)
+    /// The chosen relay first, then the best measured alternates.
+    ///
+    /// The extension can only fail over to relays it was given, and a VPN Gate
+    /// relay drops sessions on its own schedule, so handing it one relay is
+    /// handing it a tunnel with a fixed lifetime.
+    private func relayPool(headedBy head: Server) -> [Server] {
+        let alternates = rankedRelays
+            .filter { ($0.1?.lossFraction ?? 1) < 1 }
+            .map(\.0)
+            .filter { $0.id != head.id }
+        return [head] + alternates.prefix(Self.relayPoolSize - 1)
+    }
+
+    /// Enough that a bad run of relays is survivable, few enough that the
+    /// stored pool stays small and every entry was actually measured.
+    private static let relayPoolSize = 8
+    #endif
 
     public func setShowAccountOnlyServers(_ show: Bool) {
         showAccountOnlyServers = show

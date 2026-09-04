@@ -159,12 +159,17 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         // behind it — that is the whole point of the separation — so it must
         // not be gated on one, and it pins exactly the relay the user picked
         // rather than racing a ladder the relay is not part of.
-        let relay = relayStore?.load()
+        // The whole pool, not just the pin: a relay that drops mid-session has
+        // to have somewhere to hand over to, or the tunnel dies with it.
+        let relayPool = relayStore?.loadAll() ?? []
+        let relay = relayPool.first
         let bundle = try store.loadBundle()
         guard bundle != nil || relay != nil else { throw ConfigError.noServers }
 
-        catalog = relay.map { ServerCatalog(servers: [$0], rungs: Set($0.endpoints.map(\.rung))) }
-            ?? ServerCatalog(servers: bundle?.servers ?? [], rung: .wireGuardUDP)
+        catalog = relay == nil
+            ? ServerCatalog(servers: bundle?.servers ?? [], rung: .wireGuardUDP)
+            : ServerCatalog(servers: relayPool,
+                            rungs: Set(relayPool.flatMap { $0.endpoints.map(\.rung) }))
         let memoryStore = NetworkMemoryStore(store: store.store)
         self.memoryStore = memoryStore
         let fingerprint = currentFingerprint(store: store)
@@ -176,7 +181,8 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         if let relay {
             // Only the rungs this relay actually offers, and forced, because
             // Automatic deliberately will not select an OpenVPN rung.
-            enabled = Set(relay.endpoints.map(\.rung))
+            _ = relay
+            enabled = Set(relayPool.flatMap { $0.endpoints.map(\.rung) })
                 .intersection(AdapterFactory.implementedRungs)
             activePreference = enabled.min().map { ProtocolPreference.forced($0) } ?? preference
         } else {
@@ -235,10 +241,11 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         armHandshakeDeadline()
         coordinator.start(signals: signals)
         startPathMonitor()
-        // A pinned relay is a catalog of one, and probing it means dialling it
-        // directly — outside the Worker, in plaintext OpenVPN, which is the very
-        // signature this kind of network resets. There is also nothing to rank.
-        if catalog.servers.count > 1 { startProbing() }
+        // Relays are never probed here: probing one means dialling it directly,
+        // outside the Worker, in plaintext OpenVPN — the exact signature this
+        // gateway resets (measured: instant RST on every direct attempt). The
+        // app ranks them from outside the tunnel instead.
+        if relay == nil, catalog.servers.count > 1 { startProbing() }
     }
 
     /// The rung the next attempt will use, for honest state reporting before the

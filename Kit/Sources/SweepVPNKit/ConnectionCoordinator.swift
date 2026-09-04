@@ -38,9 +38,20 @@ public final class ConnectionCoordinator: @unchecked Sendable {
     private var memory: NetworkMemory
     private var attempted: Set<ProtocolRung> = []
     private var failed: Set<ProtocolRung> = []
-    /// Rungs already given their one post-loss retry, so a relay that drops
-    /// repeatedly still terminates instead of looping.
+    /// Relays that have already failed or dropped this session. A rung is only
+    /// out of options once every server that can carry it is in here.
+    private var burned: Set<ServerID> = []
+    /// The relay each racing rung is currently dialling, so a failure can be
+    /// charged to the right one.
+    private var dialling: [ProtocolRung: Server] = [:]
+    /// Full sweeps of the relay pool since the last success. Bounded so a
+    /// network where nothing works still fails closed instead of spinning.
+    private var sweeps = 0
+    private static let maxSweeps = 3
+    /// Single-relay fallback: with no pool to hand over to, a rung that carried
+    /// a working tunnel still earns one redial before the ladder moves on.
     private var retriedAfterLoss: Set<ProtocolRung> = []
+    private var hadLiveTunnel: Set<ProtocolRung> = []
     private var racing: [ProtocolRung: TunnelAdapter] = [:]
     private var winner: TunnelAdapter?
     private var server: Server?
@@ -118,16 +129,26 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         queue.asyncAfter(deadline: .now() + timeout, execute: deadline)
     }
 
+    /// The best relay for this rung that has not already failed this session.
+    ///
+    /// `catalog.fastest()` alone was the bug behind "connected, then dead": it
+    /// returns the same relay every time, so the post-loss retry redialled the
+    /// machine that had just dropped us — and VPN Gate answers an immediate
+    /// re-auth to the same relay with AUTH_FAILED, which openvpn3 treats as
+    /// fatal. Rotating is what turns a relay drop into a handover.
+    private func nextServer(for rung: ProtocolRung) -> Server? {
+        let usable = catalog.ranked().map(\.0).filter { $0.supports(rung) }
+        return usable.first { !burned.contains($0.id) } ?? usable.first
+    }
+
     private func startAdapter(for rung: ProtocolRung) {
         guard winner == nil else { return }
-        guard let server = catalog.fastest() ?? catalog.servers.first(where: { $0.supports(rung) }),
-              server.supports(rung) || catalog.servers.contains(where: { $0.supports(rung) }) else {
+        guard let host = nextServer(for: rung) else {
             callbacks.onEvent("rungSkipped", rung.shortName)
+            queue.async { [weak self] in self?.rungFailed(rung) }
             return
         }
-        let host = server.supports(rung)
-            ? server
-            : (catalog.servers.first { $0.supports(rung) } ?? server)
+        dialling[rung] = host
 
         do {
             let adapter = try build(rung, host)
@@ -169,47 +190,98 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         if rung.looksLikeWeb, failed.contains(where: { !$0.looksLikeWeb }) {
             updatedMemory.noteHostile(now: now)
         }
+        // A relay that authenticated resets the ledger: the next drop gets the
+        // full pool again rather than whatever was left over from this connect.
+        burned.removeAll()
+        // Keep the winner's relay on the ledger, not clear it: this is the
+        // entry that lets a later drop be charged to the relay that dropped us
+        // rather than leaving it top of the pool to be redialled.
+        dialling = [rung: server]
+        sweeps = 0
         callbacks.onEvent("rungWon", rung.shortName)
         callbacks.onAuthenticated(adapter, server)
     }
 
     private func rungFailed(_ rung: ProtocolRung) {
+        // Whichever relay this rung was on has just proved it cannot carry the
+        // tunnel right now. Charge the failure to it, not to the protocol.
+        if let host = dialling.removeValue(forKey: rung) { burned.insert(host.id) }
+
         guard winner == nil else {
-            // The live tunnel died: treat it as a reconnect on the next rung.
+            // The live tunnel died. Hand over to another relay rather than
+            // retiring the rung — on a pinned-relay build it is the only rung
+            // there is, so retiring it is retiring the VPN.
             if winner?.rung == rung {
+                hadLiveTunnel.insert(rung)
                 callbacks.onEvent("activeRungLost", rung.shortName)
                 winner?.stop()
                 winner = nil
+                server = nil
                 racing.removeValue(forKey: rung)
-                // A rung that carried a working tunnel and then dropped has
-                // earned one more try: the relay blipped, the network moved.
-                // Without this, `descend` skips it as already-attempted, and
-                // when it is the only permitted rung — which is exactly the
-                // pinned-relay case — one blip retires the tunnel for good.
-                if !retriedAfterLoss.contains(rung) {
-                    retriedAfterLoss.insert(rung)
-                    attempted.remove(rung)
-                    failed.remove(rung)
-                }
-                descend(now: Date())
+                retryOrDescend(rung)
             }
             return
         }
         racing.removeValue(forKey: rung)?.stop()
         failed.insert(rung)
         callbacks.onEvent("rungFailed", rung.shortName)
-        if racing.isEmpty { descend(now: Date()) }
+        if racing.isEmpty { retryOrDescend(rung) }
+    }
+
+    /// Move this rung onto the next relay, or give up on it and walk the ladder.
+    ///
+    /// Retrying is only ever a *relay* decision. With a single server there is
+    /// nothing to hand over to, so this falls straight through to `descend` and
+    /// the ladder behaves exactly as it did before pools existed — including
+    /// leaving `attempted` intact, which is what the network memory reads to
+    /// decide that this network blocks UDP.
+    private func retryOrDescend(_ rung: ProtocolRung) {
+        let carriers = catalog.ranked().map(\.0).filter { $0.supports(rung) }
+        guard carriers.count > 1 else {
+            // No pool. A rung that had a live tunnel gets the single redial it
+            // has always had; anything else walks the ladder unchanged.
+            if winner == nil, retriedAfterLoss.insert(rung).inserted, hadLiveTunnel.contains(rung) {
+                return retry(rung)
+            }
+            return descend(now: Date())
+        }
+
+        if carriers.contains(where: { !burned.contains($0.id) }) {
+            callbacks.onEvent("relayHandover",
+                              "\(rung.shortName): \(burned.count)/\(carriers.count) relays burned")
+            return retry(rung)
+        }
+        // Every relay in the pool has failed for this rung. Another sweep is
+        // worth trying — relays come back, and a whole pool failing at once is
+        // far more often the path than the relays — but not forever.
+        sweeps += 1
+        guard sweeps < Self.maxSweeps else { return descend(now: Date()) }
+        callbacks.onEvent("relayPoolRecycled", "sweep \(sweeps) of \(Self.maxSweeps)")
+        burned.removeAll()
+        retry(rung)
+    }
+
+    /// Re-arm a rung for another relay. `attempt` skips anything already tried,
+    /// so the bookkeeping has to be undone here and nowhere else.
+    private func retry(_ rung: ProtocolRung) {
+        attempted.remove(rung)
+        failed.remove(rung)
+        attempt([rung], now: Date())
     }
 
     private func raceTimedOut() {
         guard winner == nil else { return }
         callbacks.onEvent("raceTimedOut", "")
+        let stalled = Array(racing.keys)
         for (rung, adapter) in racing {
             adapter.stop()
-            failed.insert(rung)
+            if let host = dialling.removeValue(forKey: rung) { burned.insert(host.id) }
         }
         racing.removeAll()
-        descend(now: Date())
+        // A relay that never finished its handshake is a burned relay, not a
+        // burned protocol — the next one down the pool deserves the same rung.
+        for rung in stalled { failed.insert(rung) }
+        if let rung = stalled.first { retryOrDescend(rung) } else { descend(now: Date()) }
     }
 
     /// Try the next untried rung. When the UDP rungs are the ones that died,
