@@ -49,6 +49,8 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     private let prober = ServerProber()
     private var handshakeDeadline: DispatchWorkItem?
     private var lastSignals = NetworkSignals()
+    /// Tells roaming apart from our own tunnel appearing. See `handlePathChange`.
+    private var roaming = RoamingDetector()
     /// Slows the fail -> on-demand-restart -> fail cycle when nothing will
     /// authenticate. See `StartBackoff`.
     private var backoff = StartBackoff()
@@ -522,29 +524,58 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             let expensive = path.isExpensive
             let satisfied = path.status == .satisfied
             let constrained = path.isConstrained
+            // The interfaces that are not ours. `.other` is the utun family, so
+            // excluding it is what makes this signature blind to the tunnel we
+            // are ourselves installing.
+            let signature = path.availableInterfaces
+                .filter { $0.type != .other }
+                .map { "\($0.name):\($0.type)" }
+                .sorted()
+                .joined(separator: ",")
             queue.async {
                 self?.handlePathChange(satisfied: satisfied, expensive: expensive,
-                                       constrained: constrained)
+                                       constrained: constrained, signature: signature)
             }
         }
         monitor.start(queue: DispatchQueue(label: "vpn.sweep.path"))
         pathMonitor = monitor
     }
 
-    private func handlePathChange(satisfied: Bool, expensive: Bool, constrained: Bool) {
-        guard satisfied else {
-            diagnostics.record("pathLost")
-            publishFilterState(up: false, server: coordinator?.activeServer)
-            machine.transition(to: .reasserting)
-            return
-        }
-        diagnostics.record("pathChanged", expensive ? "expensive" : "cheap")
+    /// Roaming. Only a *different* underlying network is roaming.
+    ///
+    /// This used to reassert on every path update, which is a reconnect storm
+    /// rather than a roaming handler: bringing the tunnel up changes the path,
+    /// so installing our own settings triggered a reassert, which redialled
+    /// OpenVPN through a fresh Worker socket, which changed the path again.
+    /// Measured on the 2026-09-04 journal — the session never held a route for
+    /// more than about ten seconds, and because `.reasserting` gates forwarding,
+    /// every packet in between was dropped. That is the "connected but no
+    /// internet" the user saw, and no amount of relay or transport tuning could
+    /// have shown through it.
+    ///
+    /// So: act when the set of non-tunnel interfaces actually changes, and
+    /// otherwise record the update and leave the tunnel alone.
+    private func handlePathChange(satisfied: Bool, expensive: Bool, constrained: Bool,
+                                  signature: String) {
         lastSignals = NetworkSignals(isExpensive: expensive,
                                      isLowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled,
                                      isConstrained: constrained)
-        machine.transition(to: .reasserting)
-        coordinator?.reassert()   // re-handshake; forwarding stays gated
-        probeServers()            // the fastest server on Wi-Fi is rarely the fastest on cellular
+
+        switch roaming.update(satisfied: satisfied, signature: signature) {
+        case .lost:
+            diagnostics.record("pathLost")
+            publishFilterState(up: false, server: coordinator?.activeServer)
+            machine.transition(to: .reasserting)
+        case .first:
+            diagnostics.record("pathChanged", "first sighting: \(signature)")
+        case .unchanged:
+            diagnostics.record("pathChanged", "same network — keeping the tunnel")
+        case .roamed(let from, let to):
+            diagnostics.record("pathChanged", "\(from) → \(to)")
+            machine.transition(to: .reasserting)
+            coordinator?.reassert()   // re-handshake; forwarding stays gated
+            probeServers()            // the fastest server on Wi-Fi is rarely the fastest on cellular
+        }
     }
 
     private func currentSignals() -> NetworkSignals {

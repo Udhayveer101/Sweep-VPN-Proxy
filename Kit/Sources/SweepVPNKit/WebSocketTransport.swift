@@ -1,6 +1,7 @@
 #if os(macOS)
 import Foundation
 import Network
+import os
 import SweepVPNCore
 
 /// Carries a relay's TCP stream inside a WebSocket to our Cloudflare Worker.
@@ -37,11 +38,14 @@ public final class WebSocketTransport: @unchecked Sendable {
     private let token: String
     private let host: String
     private let port: UInt16
+    private let appGroup: String
     private let queue = DispatchQueue(label: "vpn.sweep.wstransport")
     private var listener: NWListener?
 
     public init(workerURL: URL = WebSocketTransport.defaultWorkerURL,
-                token: String, host: String, port: UInt16) {
+                token: String, host: String, port: UInt16,
+                appGroup: String = AppGroupID.resolved) {
+        self.appGroup = appGroup
         self.workerURL = workerURL
         self.token = token
         self.host = host
@@ -50,7 +54,15 @@ public final class WebSocketTransport: @unchecked Sendable {
 
     /// Starts the loopback listener and returns the port it bound.
     public func start() throws -> UInt16 {
-        let params = NWParameters.tcp
+        let tcp = NWProtocolTCP.Options()
+        // Nagle has no business on a tunnel transport. Every write here is
+        // already a whole OpenVPN record that the far end is waiting on, so
+        // holding a small one back for up to 40 ms just to coalesce it adds
+        // that delay to every request the user makes — and, stacked on the
+        // outer TCP to the Worker, it is what makes a page load feel like the
+        // link is dead rather than slow.
+        tcp.noDelay = true
+        let params = NWParameters(tls: nil, tcp: tcp)
         params.requiredInterfaceType = .loopback
         // Bind IPv4 loopback explicitly. `requiredInterfaceType = .loopback`
         // alone leaves the family to the system, and OpenVPN 3 dials the
@@ -91,16 +103,18 @@ public final class WebSocketTransport: @unchecked Sendable {
 
     // MARK: - One connection
 
-    private func tunnelURL() -> URL? {
-        var components = URLComponents(url: workerURL, resolvingAgainstBaseURL: false)
-        components?.scheme = workerURL.scheme == "http" ? "ws" : "wss"
-        components?.path = "/tcp"
-        components?.queryItems = [
+    /// The request target. Only the path and query travel in the request line;
+    /// the host travels in `Host` and in SNI, because the socket is opened to
+    /// an address.
+    private func tunnelPath() -> String {
+        var components = URLComponents()
+        components.path = "/tcp"
+        components.queryItems = [
             URLQueryItem(name: "h", value: host),
             URLQueryItem(name: "p", value: String(port)),
             URLQueryItem(name: "t", value: token),
         ]
-        return components?.url
+        return components.string ?? "/tcp"
     }
 
     /// The socket that carries the relay stream to the Worker.
@@ -118,40 +132,35 @@ public final class WebSocketTransport: @unchecked Sendable {
     /// exclusion covers the right addresses, and its state machine reports
     /// `.failed` and `.waiting`, so a transport that cannot connect says so.
     private func workerConnection() -> NWConnection? {
-        guard let url = tunnelURL(), let name = url.host else { return nil }
+        guard let name = workerURL.host else { return nil }
+        // The address the app resolved while it was still outside the tunnel.
+        // Rotating through them means one Cloudflare address being unreachable
+        // is a retry rather than a dead tunnel.
+        let addresses = RelayTunnelSettings.cachedWorkerAddresses(appGroup: appGroup)
+        guard let address = addresses.randomElement(),
+              let ipv4 = IPv4Address(address) else {
+            Diagnostics.shared.record("wssNoAddress",
+                                      "the app has not resolved the Worker yet")
+            return nil
+        }
 
         let tls = NWProtocolTLS.Options()
         sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, name)
-        let params = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true   // same reason as the loopback listener
+        let params = NWParameters(tls: tls, tcp: tcp)
 
         // `.other` is the utun family. Our own transport must never ride the
         // tunnel it is bringing up — that is a deadlock, and once the tunnel is
         // established it would also be a loop.
         params.prohibitedInterfaceTypes = [.other]
-
-        // IPv4 only, deliberately.
-        //
-        // `workers.dev` publishes A *and* AAAA records, and on a dual-stack path
-        // the system prefers v6. The blackhole this connection has to escape
-        // routes `::/0` into the tunnel and its exclusion list is built from the
-        // addresses the app resolved — so a v6 SYN went into the tunnel and was
-        // dropped. Nothing reported it: no `.ready`, no `.failed`, no
-        // `.waiting`, just `.preparing` until OpenVPN gave up ten seconds later
-        // and dialled again. Measured: `wssDialled` three times per attempt with
-        // not one other transport event between them.
-        //
-        // Pinning the family here is what makes the transport and the exclusion
-        // list agree by construction, rather than by both happening to resolve
-        // the same records.
         if let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
             ip.version = .v4
         }
 
-        let websocket = NWProtocolWebSocket.Options()
-        websocket.autoReplyPing = true
-        params.defaultProtocolStack.applicationProtocols.insert(websocket, at: 0)
-
-        return NWConnection(to: .url(url), using: params)
+        // No `NWProtocolWebSocket`: see `MinimalWebSocket` for the measurements.
+        return NWConnection(to: .hostPort(host: .ipv4(ipv4), port: NWEndpoint.Port(rawValue: 443)!),
+                            using: params)
     }
 
     private func bridge(_ connection: NWConnection) {
@@ -159,20 +168,29 @@ public final class WebSocketTransport: @unchecked Sendable {
         // `relayTunnelUp` means the bytes never left OpenVPN towards us, which
         // is a different bug from anything on the Worker leg.
         Diagnostics.shared.record("wssDialled")
-        guard let worker = workerConnection() else { connection.cancel(); return }
+        guard let worker = workerConnection(), let name = workerURL.host else {
+            connection.cancel(); return
+        }
+        let socket = MinimalWebSocket(connection: worker, host: name, path: tunnelPath())
 
         worker.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
             case .ready:
-                // The Worker's first frame is a one-byte status: 0x01 connected.
-                // Nothing may be forwarded before it, or the relay sees our
-                // handshake interleaved with a connection that does not exist.
-                self.awaitStatus(worker, connection)
+                socket.handshake { error in
+                    if let error {
+                        // "Could not reach the Worker" and "the Worker refused
+                        // the token" are the same symptom and completely
+                        // different fixes, so the reason is recorded rather
+                        // than inferred later.
+                        Diagnostics.shared.record("wssHandshakeFailed", "\(error)")
+                        self.tearDown(worker, connection)
+                        return
+                    }
+                    Diagnostics.shared.record("wssUpgraded")
+                    self.awaitStatus(socket, worker, connection)
+                }
             case .failed(let error):
-                // "Could not reach the Worker" and "the Worker refused the
-                // token" are the same symptom and completely different fixes,
-                // so the reason is recorded rather than inferred later.
                 Diagnostics.shared.record("wssFailed", "\(error)")
                 self.tearDown(worker, connection)
             case .waiting(let error):
@@ -209,59 +227,47 @@ public final class WebSocketTransport: @unchecked Sendable {
         connection.cancel()
     }
 
-    private func awaitStatus(_ worker: NWConnection, _ connection: NWConnection) {
-        worker.receiveMessage { [weak self] data, _, _, error in
+    /// The Worker's first frame is a one-byte status: 0x01 connected. Nothing
+    /// may be forwarded before it, or the relay sees our handshake interleaved
+    /// with a connection that does not exist.
+    private func awaitStatus(_ socket: MinimalWebSocket, _ worker: NWConnection,
+                             _ connection: NWConnection) {
+        let seenStatus = OSAllocatedUnfairLock(initialState: false)
+        socket.receive(onMessage: { [weak self] data in
             guard let self else { return }
-            guard error == nil, let data, data.first == 0x01 else {
-                Diagnostics.shared.record(
-                    "wssRefused",
-                    error.map { "\($0)" } ?? "unexpected first frame")
-                self.tearDown(worker, connection)
+            let first = seenStatus.withLock { seen -> Bool in
+                defer { seen = true }
+                return !seen
+            }
+            if first {
+                guard data.first == 0x01 else {
+                    Diagnostics.shared.record("wssRefused", "the Worker declined this relay")
+                    self.tearDown(worker, connection)
+                    return
+                }
+                Diagnostics.shared.record("wssUp")
+                self.pumpSocketToWorker(connection, socket, worker)
                 return
             }
-            Diagnostics.shared.record("wssUp")
-            self.pumpSocketToWorker(connection, worker)
-            self.pumpWorkerToSocket(worker, connection)
-        }
-    }
-
-    /// Relay -> app.
-    private func pumpWorkerToSocket(_ worker: NWConnection, _ connection: NWConnection) {
-        worker.receiveMessage { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-            if let error {
-                Diagnostics.shared.record("wssEnded", "\(error)")
-                self.tearDown(worker, connection)
-                return
-            }
-            if let data, !data.isEmpty {
-                connection.send(content: data, completion: .contentProcessed { _ in })
-            }
-            if isComplete && data == nil {
-                self.tearDown(worker, connection)
-                return
-            }
-            self.pumpWorkerToSocket(worker, connection)
-        }
+            connection.send(content: data, completion: .contentProcessed { _ in })
+        }, onClose: { [weak self] error in
+            Diagnostics.shared.record("wssEnded", error.map { "\($0)" } ?? "the Worker closed")
+            self?.tearDown(worker, connection)
+        })
     }
 
     /// App -> relay.
-    private func pumpSocketToWorker(_ connection: NWConnection, _ worker: NWConnection) {
+    private func pumpSocketToWorker(_ connection: NWConnection, _ socket: MinimalWebSocket,
+                                    _ worker: NWConnection) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
             [weak self] data, _, isComplete, error in
             guard let self else { return }
-            if let data, !data.isEmpty {
-                let metadata = NWProtocolWebSocket.Metadata(opcode: .binary)
-                let context = NWConnection.ContentContext(identifier: "relay",
-                                                          metadata: [metadata])
-                worker.send(content: data, contentContext: context,
-                            completion: .contentProcessed { _ in })
-            }
+            if let data, !data.isEmpty { socket.send(data) }
             if isComplete || error != nil {
                 self.tearDown(worker, connection)
                 return
             }
-            self.pumpSocketToWorker(connection, worker)
+            self.pumpSocketToWorker(connection, socket, worker)
         }
     }
 }
@@ -334,6 +340,10 @@ public struct RelayTunnelSettings: Sendable {
     /// wait that sometimes yields no addresses is strictly better: the addresses
     /// are a routing optimisation, and the connection is not made from them.
     private static let addressesKey = "sweep.relayTunnel.addresses"
+    /// The Worker's own addresses, without the system resolvers that share
+    /// `addressesKey`. The exclusion list wants both; something dialling the
+    /// Worker must have only these, or it will try to open a tunnel to 8.8.8.8.
+    private static let workerAddressesKey = "sweep.relayTunnel.workerAddresses"
 
     /// The addresses the app last resolved, if any.
     ///
@@ -352,6 +362,21 @@ public struct RelayTunnelSettings: Sendable {
     public static func cache(addresses: Set<String>, appGroup: String) {
         guard !addresses.isEmpty else { return }   // never replace a good list with nothing
         UserDefaults(suiteName: appGroup)?.set(Array(addresses).sorted(), forKey: addressesKey)
+    }
+
+    /// The Worker's addresses alone, for dialling.
+    public static func cache(workerAddresses: Set<String>, appGroup: String) {
+        guard !workerAddresses.isEmpty else { return }
+        UserDefaults(suiteName: appGroup)?
+            .set(Array(workerAddresses).sorted(), forKey: workerAddressesKey)
+    }
+
+    /// IPv4 addresses of the Worker, newest resolution first-equal. Empty when
+    /// the app has never run — the transport says so rather than falling back
+    /// to a name it cannot resolve from inside the tunnel.
+    public static func cachedWorkerAddresses(appGroup: String) -> [String] {
+        (UserDefaults(suiteName: appGroup)?.stringArray(forKey: workerAddressesKey) ?? [])
+            .filter { !$0.contains(":") }
     }
 
     /// Cached answer first, live lookup only as a fallback.

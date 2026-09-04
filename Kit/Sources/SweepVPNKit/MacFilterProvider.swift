@@ -17,6 +17,16 @@ import SweepVPNCore
 open class SweepFilterDataProvider: NEFilterDataProvider, @unchecked Sendable {
     private let lock = NSLock()
     private var policy = FilterPolicy()
+    private var policyReadAt: Date = .distantPast
+    /// How stale the filter's copy of the tunnel state may be.
+    ///
+    /// `refreshPolicy` reads the app group and JSON-decodes the state, and it
+    /// used to do that on *every* new flow — a page load opens dozens, so the
+    /// decode ran dozens of times a second on the connection path for a value
+    /// that changes only when the tunnel does. A second of staleness costs
+    /// nothing: the tunnel publishes `up: false` before it stops forwarding, so
+    /// the window can only ever drop flows that were about to be dropped.
+    private static let policyTTL: TimeInterval = 1
 
     /// The provider reads its state from the App Group defaults the tunnel
     /// writes to; nothing else can change the verdict.
@@ -104,10 +114,15 @@ open class SweepFilterDataProvider: NEFilterDataProvider, @unchecked Sendable {
     private func flowInterfaceName(_ flow: NEFilterFlow) -> String? { nil }
 
     private func refreshPolicy() {
+        lock.lock()
+        let fresh = Date().timeIntervalSince(policyReadAt) < Self.policyTTL
+        lock.unlock()
+        if fresh { return }
         guard let state = stateStore?.read() else { return }
         lock.lock()
         policy = FilterPolicy(options: state.options, tunnelInterface: state.tunnelInterface,
                               tunnelIsUp: state.tunnelIsUp, serverAddresses: state.serverAddresses)
+        policyReadAt = Date()
         lock.unlock()
     }
 }
