@@ -47,7 +47,10 @@ public final class ConnectionCoordinator: @unchecked Sendable {
     /// Full sweeps of the relay pool since the last success. Bounded so a
     /// network where nothing works still fails closed instead of spinning.
     private var sweeps = 0
-    private static let maxSweeps = 3
+    /// Relays recover: the pool is re-tried from the top this many times before
+    /// the ladder gives up, which is what lets a long session outlive every
+    /// relay in it dying at least once.
+    private static let maxSweeps = 5
     /// Single-relay fallback: with no pool to hand over to, a rung that carried
     /// a working tunnel still earns one redial before the ladder moves on.
     private var retriedAfterLoss: Set<ProtocolRung> = []

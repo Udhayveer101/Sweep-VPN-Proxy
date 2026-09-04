@@ -874,9 +874,12 @@ public final class VPNViewModel: ObservableObject {
         return [head] + alternates.prefix(Self.relayPoolSize - 1)
     }
 
-    /// Enough that a bad run of relays is survivable, few enough that the
-    /// stored pool stays small and every entry was actually measured.
-    private static let relayPoolSize = 8
+    /// Sized from measured relay lifetimes, not from taste: soaking three
+    /// relays through the Worker, the longest single session lasted 9.5 min,
+    /// one dropped at 92 s and one never connected at all. An hour therefore
+    /// costs somewhere between six and thirty handovers, so the pool has to be
+    /// deep enough to spend that many dials without running dry.
+    private static let relayPoolSize = 16
     #endif
 
     public func setShowAccountOnlyServers(_ show: Bool) {
