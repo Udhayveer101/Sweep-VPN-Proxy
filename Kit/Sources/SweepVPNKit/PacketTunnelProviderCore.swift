@@ -19,7 +19,14 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     private let stateQueue = DispatchQueue(label: "vpn.sweep.provider")
 
     public let diagnostics = Diagnostics.shared
-    public private(set) var machine = StateMachine()
+    /// The provider's own transitions, journalled. `StateMachine` has always
+    /// taken a log closure and this was the default no-op, so the authoritative
+    /// state machine — the one the app only ever sees a mirror of — left no
+    /// record at all. A tunnel that sits in `handshaking` until the deadline
+    /// fires is indistinguishable from one that never started without it.
+    public private(set) var machine = StateMachine { old, new in
+        Diagnostics.shared.record("providerState", "\(old.logLabel) → \(new.logLabel)")
+    }
     public private(set) var policy = SecurityPolicy()
     public private(set) var preference: ProtocolPreference = .automatic
 
@@ -175,6 +182,15 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             activePreference = preference
         }
         guard !enabled.isEmpty else { throw AdapterFactoryError.rungNotImplemented(.wireGuardUDP) }
+        // The three facts that decide everything that follows. Without them a
+        // failed run cannot be told apart from a run that was never going to
+        // work: a pinned relay and a signed bundle walk completely different
+        // ladders, and "allRungsFailed" means nothing until you know which
+        // rungs were even on the list.
+        diagnostics.record("mode", relay != nil ? "pinned relay" : "signed bundle")
+        diagnostics.record("candidates",
+                           "\(catalog.servers.count) server(s), rungs: "
+                           + enabled.sorted().map(\.shortName).joined(separator: ", "))
         let engine = AutoModeEngine(preference: activePreference, enabledRungs: enabled)
 
         // Operators that register a key per config ship it in the bundle; our
@@ -235,8 +251,14 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     }
 
     private func armHandshakeDeadline() {
+        // Named in the log with its duration, so a run that stops producing
+        // lines has a stated deadline to be read against rather than looking
+        // like it could still come back at any moment.
+        diagnostics.record("handshakeDeadline", "\(Int(Self.handshakeTimeout))s to authenticate")
         let deadline = DispatchWorkItem { [weak self] in
             guard let self, !self.machine.state.forwardingAllowed else { return }
+            self.diagnostics.record("handshakeDeadlineExpired",
+                                    "no peer authenticated in \(Int(Self.handshakeTimeout))s")
             self.fail(.allRungsFailed, nil, self.startCompletion)
             self.coordinator?.stop()
         }

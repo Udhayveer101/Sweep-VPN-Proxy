@@ -103,9 +103,41 @@ public final class Diagnostics: @unchecked Sendable {
         // that is discarded when the process exits, and the extension exits on
         // every failed start — so the one process whose logs matter left none.
         Self.log.notice("\(kind, privacy: .public) \(event.detail, privacy: .public)")
+        // Mirrored into the shared journal here rather than at each of the ~50
+        // call sites: every component that already records a diagnostic becomes
+        // visible in the log the user can open, without any of them knowing the
+        // log exists. The ring stays because `tail(_:)` still builds the trail
+        // stapled to a failure.
+        EventLog.shared.record(phase: Self.phase(for: kind), level: Self.level(for: kind),
+                               kind: kind, detail: event.detail)
         lock.lock(); defer { lock.unlock() }
         buffer.append(event)
         if buffer.count > capacity { buffer.removeFirst(buffer.count - capacity) }
+    }
+
+    /// Classifies an existing diagnostic kind into a journal phase, so the ~50
+    /// call sites that predate the journal group sensibly without being touched.
+    /// Unknown kinds land in "tunnel", which is where the bulk of them are.
+    static func phase(for kind: String) -> String {
+        let k = kind.lowercased()
+        if k.hasPrefix("wss") || k.contains("worker") { return "worker" }
+        if k.hasPrefix("ovpn") || k.contains("relaytunnel") { return "relay" }
+        if k.contains("config") || k.contains("catalog") { return "config" }
+        if k.contains("filter") { return "filter" }
+        if k.contains("rung") || k.contains("ladder") || k.contains("handshake") { return "ladder" }
+        return "tunnel"
+    }
+
+    /// A kind that names a failure must not be filtered out as routine detail —
+    /// the whole point of the level is that "show me only what went wrong"
+    /// leaves the failure visible.
+    static func level(for kind: String) -> LogEntry.Level {
+        let k = kind.lowercased()
+        if k.contains("fail") || k.contains("refused") || k.contains("error")
+            || k.contains("denied") || k.contains("closed") { return .error }
+        if k.contains("waiting") || k.contains("retry") || k.contains("backoff")
+            || k.contains("unrewritten") || k.contains("ended") { return .warn }
+        return .info
     }
 
     public func snapshot() -> [DiagnosticEvent] {

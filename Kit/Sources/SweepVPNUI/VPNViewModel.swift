@@ -31,6 +31,14 @@ public final class VPNViewModel: ObservableObject {
     private var lastSeenRung: ProtocolRung?
     private var protocolNoteClearTask: Task<Void, Never>?
     @Published public private(set) var isBusy = false
+
+    /// The shared journal, written by this process and by the extension.
+    let log = EventLog.shared
+    /// Snapshot of the journal for the log screen. Republished on a timer while
+    /// that screen is open, so a connect that is still running can be watched as
+    /// it happens rather than read only after it has failed.
+    @Published public private(set) var logEntries: [LogEntry] = []
+    private var logTask: Task<Void, Never>?
     /// One sheet at a time. SwiftUI silently misbehaves when several `.sheet`
     /// modifiers sit on the same view — they fight, and the wrong one wins — so
     /// there is a single presentation slot rather than a bool per screen.
@@ -255,7 +263,40 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
-    public func onDisappear() { pollTask?.cancel(); pollTask = nil }
+    public func onDisappear() { pollTask?.cancel(); pollTask = nil; stopWatchingLog() }
+
+    /// Follows the journal while the log screen is open. One second, because the
+    /// thing being watched is a connect that can stall for tens of seconds and
+    /// the user needs to see which step it stopped on as it stops.
+    public func startWatchingLog() {
+        logTask?.cancel()
+        logTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let entries = self.log.entries()
+                await MainActor.run { self.logEntries = entries }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    public func stopWatchingLog() { logTask?.cancel(); logTask = nil }
+
+    public func clearLog() {
+        log.clear()
+        logEntries = []
+        log.record(phase: "connect", kind: "logCleared", detail: "by the user")
+    }
+
+    public func copyLog() {
+        let text = log.export()
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #else
+        UIPasteboard.general.string = text
+        #endif
+    }
 
     /// Remembering that the primer was shown is the only thing this app stores
     /// outside the Keychain — it is not a secret and not user data.
@@ -376,14 +417,60 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
+    /// Last state written to the journal, so a 5-second poll that finds nothing
+    /// changed does not write a line every 5 seconds.
+    private var lastLoggedState: TunnelState?
+
     private func recompute() {
+        // Every transition the user-facing screen makes, in one place. This is
+        // what turns "it just says connecting" into a timestamped sequence: the
+        // absence of a further line after `connecting` is itself the finding.
+        if state != lastLoggedState {
+            log.record(phase: "state", level: state.isFailure ? .error : .info,
+                       kind: "state", detail: "\(lastLoggedState.map(\.logLabel) ?? "—") → \(state.logLabel)")
+            lastLoggedState = state
+        }
         presentation = Presentation.make(state: state, serverName: serverName,
                                          killSwitchArmed: killSwitchArmed,
                                          onDemandArmed: onDemandArmed, quality: quality)
     }
 
+    /// The in-flight connect, so Cancel can actually interrupt it.
+    ///
+    /// Without this, Cancel could only ask the OS to stop a tunnel that had not
+    /// been started yet — the slow part of a connect is `ensureConnectable()`,
+    /// which happens entirely before `start()`. Pressing Cancel during those
+    /// seconds did nothing at all.
+    private var connectTask: Task<Void, Never>?
+
     public func perform(_ action: Presentation.Action) {
-        Task { await run(action) }
+        switch action {
+        case .connect, .retry:
+            // Move to `.connecting` on the user's intent, not on the OS
+            // reporting it. The OS does not report `.connecting` until
+            // `start()` is called, which is after the relay probe — so for the
+            // whole probe the screen still said "Connect" while the button was
+            // disabled, and there was no way to back out. This is optimistic and
+            // `refresh()` overwrites it with the truth moments later.
+            // The rung carried here is the one the user forced, or the first the
+            // ladder is permitted to try — it is never rendered for
+            // `.connecting` (the screen says "Finding the best route"), and
+            // `rung`, which *is* rendered, stays nil until the extension
+            // reports what it actually negotiated.
+            state = .connecting(rung: forcedRung ?? .openVPNTCP)
+            recompute()
+            connectTask = Task { await run(action) }
+        case .cancel, .disconnect:
+            // Interrupt the attempt first, then tell the OS. Order matters: if
+            // the connect task is still in `ensureConnectable()` it would
+            // otherwise go on to install a profile and start a tunnel the user
+            // has just asked to abandon.
+            connectTask?.cancel()
+            connectTask = nil
+            Task { await run(action) }
+        case .openSettings:
+            Task { await run(action) }
+        }
     }
 
     private func run(_ action: Presentation.Action) async {
@@ -392,24 +479,44 @@ public final class VPNViewModel: ObservableObject {
         do {
             switch action {
             case .connect, .retry:
+                log.beginRun(action == .retry ? "user pressed Retry" : "user pressed Connect")
+                log.record(phase: "connect", kind: "preflight",
+                           detail: "servers=\(servers.count) relays=\(relays.count)")
                 // Installing an on-demand profile with nothing to connect to is
                 // what produces the connect/disconnect loop: the extension
                 // throws `noServers`, on-demand restarts it, and it throws
                 // again — with the blackhole route installed the whole time.
-                guard await ensureConnectable() else { return }
+                guard await ensureConnectable() else {
+                    log.record(phase: "connect", level: .error, kind: "preflightFailed",
+                               detail: lastError ?? "nothing to connect to")
+                    state = .disconnected
+                    recompute()
+                    return
+                }
+                guard !Task.isCancelled else { return await abandonConnect() }
                 // A new attempt: the previous reason is history, and the streak
                 // must not make the first lap of this one look broken.
                 connectStartedAt = Date()
                 TunnelFailureStore(appGroup: appGroup).clear()
                 backoffStore.save(StartBackoff())
                 tunnelFailure = nil
+                log.record(phase: "profile", kind: "installing",
+                           detail: "server=\(serverName ?? "Sweep VPN")")
                 try await configurator.install(policy: SecurityPolicy(options: options),
                                                serverDescription: serverName ?? "Sweep VPN")
+                log.record(phase: "profile", kind: "installed")
+                guard !Task.isCancelled else { return await abandonConnect() }
+                log.record(phase: "tunnel", kind: "startRequested")
                 try await configurator.start()
+                log.record(phase: "tunnel", kind: "startReturned",
+                           detail: "handed to the extension; waiting on it to report")
             case .disconnect, .cancel:
+                log.record(phase: "connect", level: .warn, kind: "userStopped",
+                           detail: action == .cancel ? "Cancel" : "Disconnect")
                 // Explicit user action: disarm on-demand so the OS does not
                 // immediately restart the tunnel (the connect/disconnect loop).
                 try await configurator.stop(userInitiated: true)
+                log.record(phase: "tunnel", kind: "stopRequested")
             case .openSettings:
                 // The same button means two different things: finish setup, or
                 // re-grant a VPN permission the user revoked.
@@ -421,8 +528,20 @@ public final class VPNViewModel: ObservableObject {
             }
             await refresh()
         } catch {
+            log.record(phase: "connect", level: .error, kind: "actionThrew",
+                       detail: "\(action.rawValue): \(error)")
             lastError = error.localizedDescription
+            await refresh()
         }
+    }
+
+    /// Cancel landed while the connect was still in its pre-flight, before any
+    /// profile was installed. Nothing to stop at the OS level — just put the
+    /// screen back where the user left it.
+    private func abandonConnect() async {
+        log.record(phase: "connect", level: .warn, kind: "cancelled",
+                   detail: "abandoned before the tunnel was started")
+        await refresh()
     }
 
     /// Guarantees the extension will have something to connect to, picking a
@@ -609,9 +728,12 @@ public final class VPNViewModel: ObservableObject {
         defer { isRefreshingRelays = false }
 
         let fetcher = VPNGateFetcher(customSource: customRelaySource())
+        log.record(phase: "relay", kind: "fetchingList",
+                   detail: customRelaySource() == nil ? "default sources" : "custom mirror")
         do {
             let fetched = try await fetcher.refresh()
             relays = fetched
+            log.record(phase: "relay", kind: "listFetched", detail: "\(fetched.count) relays")
             relaysFetchedAt = fetcher.cache()?.fetchedAt ?? Date()
             relayStatus = "\(fetched.count) relays in \(Set(fetched.map(\.countryCode)).count) countries"
         } catch VPNGateFetcher.FetchError.allSourcesFailed(let status) {
@@ -620,8 +742,11 @@ public final class VPNViewModel: ObservableObject {
             relayStatus = status == 403
                 ? "Blocked on this network (HTTP 403). Set a mirror URL below and try again."
                 : "Could not reach the VPN Gate list. Set a mirror URL below and try again."
+            log.record(phase: "relay", level: .error, kind: "listFetchFailed",
+                       detail: "all sources failed, last status \(status.map(String.init) ?? "none")")
         } catch {
             relayStatus = "Could not read the relay list: \(error)"
+            log.record(phase: "relay", level: .error, kind: "listFetchFailed", detail: "\(error)")
         }
     }
 
@@ -637,6 +762,10 @@ public final class VPNViewModel: ObservableObject {
         // start dropping connections and report healthy servers as dead, so
         // this takes the most promising slice rather than the whole list.
         let targets = Array(rankedRelays.map(\.0).prefix(limit))
+        // The single longest step in a connect, and previously the most silent:
+        // the screen showed a disabled "Connect" for however long this took.
+        let started = Date()
+        log.record(phase: "relay", kind: "probing", detail: "\(targets.count) relays, 2s timeout each")
         let prober = ServerProber(timeout: 2.0, samples: 2)
         let results: [ServerProber.Result] = await withCheckedContinuation { continuation in
             prober.probe(targets, rungs: [.openVPNTCP]) { continuation.resume(returning: $0) }
@@ -644,6 +773,9 @@ public final class VPNViewModel: ObservableObject {
         for result in results { relayProbes[result.id] = result.probe }
         let reachable = results.filter { $0.probe.lossFraction < 1 }.count
         relayStatus = "Measured \(results.count) relays — \(reachable) answered"
+        log.record(phase: "relay", level: reachable == 0 ? .error : .info, kind: "probed",
+                   detail: String(format: "%d of %d answered in %.1fs",
+                                  reachable, results.count, Date().timeIntervalSince(started)))
     }
 
     public let automaticID: ServerID = "__automatic__"

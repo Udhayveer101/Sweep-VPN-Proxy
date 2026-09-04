@@ -31,6 +31,34 @@ public enum TunnelState: Equatable, Sendable, Codable {
 
     /// Whether protected traffic is currently blackholed (fail-closed posture).
     public var isBlocking: Bool { !forwardingAllowed }
+
+    /// Short name for the journal. Carries the associated values, because
+    /// "connecting" and "connecting on a different rung than last time" are the
+    /// two readings a stalled connect has to be told apart by.
+    public var logLabel: String {
+        switch self {
+        case .disconnected:                    return "disconnected"
+        case .onDemandArmed:                   return "onDemandArmed"
+        case .connecting(let r):               return "connecting(\(r.rawValue))"
+        case .handshaking(let r):              return "handshaking(\(r.rawValue))"
+        case .connected(let r, let s):         return "connected(\(r.rawValue), \(s))"
+        case .verifying:                       return "verifying"
+        case .reasserting:                     return "reasserting"
+        case .reconnecting(let attempt):       return "reconnecting(attempt \(attempt))"
+        case .degraded(let r, let why):        return "degraded(\(r.rawValue), \(why.rawValue))"
+        case .killSwitchActive:                return "killSwitchActive"
+        case .error(let kind):                 return "error(\(kind.rawValue))"
+        }
+    }
+
+    /// States that mean the user is not protected *and* something went wrong,
+    /// as opposed to simply being off. Used to pick a log level.
+    public var isFailure: Bool {
+        switch self {
+        case .error, .killSwitchActive: return true
+        default: return false
+        }
+    }
 }
 
 public enum DegradeReason: String, Equatable, Sendable, Codable {

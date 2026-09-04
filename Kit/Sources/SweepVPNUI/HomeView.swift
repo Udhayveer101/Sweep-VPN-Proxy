@@ -43,6 +43,16 @@ public struct HomeView: View {
         HStack {
             Text("Sweep VPN").font(.headline)
             Spacer()
+            // Permanent, not conditional on an error. A connect that hangs in
+            // "Connecting…" never raises an error banner, so hanging the only
+            // route to the log off that banner made it unreachable in exactly
+            // the case it was needed for.
+            Button { model.activeSheet = .connectionLog } label: {
+                Image(systemName: "text.alignleft").font(.title3)
+            }
+            .buttonStyle(.plain)
+            .help("Connection log")
+            .accessibilityLabel("Connection log")
             Button { model.activeSheet = .settings } label: {
                 Image(systemName: "gearshape").font(.title3)
             }
@@ -166,7 +176,11 @@ public struct HomeView: View {
         .tint(model.presentation.tint == .good ? .green : .accentColor)
         .controlSize(.large)
         .frame(maxWidth: 420)
-        .disabled(model.isBusy)
+        // `isBusy` covers the whole connect, including a relay probe that can
+        // run for tens of seconds. Disabling the button for all of it left the
+        // user with a dead control and no way out — which is the one moment
+        // Cancel has to work. A cancel is never busy-blocked.
+        .disabled(model.isBusy && model.presentation.primaryAction != .cancel)
     }
 }
 

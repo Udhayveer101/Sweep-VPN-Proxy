@@ -14,6 +14,20 @@ public final class VPNConfigurator: @unchecked Sendable {
     /// the system slot", and the UI ends up reporting a foreign tunnel as our own.
     private var ownsProfile = false
 
+    /// Guards `manager`/`ownsProfile`/`loadTask`. The class is `@unchecked
+    /// Sendable` and is called from several tasks at once — the view model's
+    /// `onAppear`, its 5-second poll, and a user-driven connect all reach
+    /// `loadManager()` — so this state was being read and written concurrently
+    /// with no synchronisation at all.
+    private let stateLock = NSLock()
+    /// The load that is already in flight, so concurrent callers join it rather
+    /// than each starting their own. See `loadManager()`.
+    ///
+    /// It carries no value: `NETunnelProviderManager` is not `Sendable`, so it
+    /// cannot travel out of a `Task`. The task's job is to populate `manager`
+    /// under the lock, and joiners read it there once the task has settled.
+    private var loadTask: Task<Void, Error>?
+
     public init(bundleIdentifier: String, displayName: String = "Sweep VPN") {
         self.bundleIdentifier = bundleIdentifier
         self.displayName = displayName
@@ -25,14 +39,74 @@ public final class VPNConfigurator: @unchecked Sendable {
     /// Adopting `.first` meant we read an unrelated VPN's status as ours and — far
     /// worse — `install()` would overwrite that unrelated VPN's configuration.
     /// Identity is the provider bundle id; nothing else is a safe discriminator.
+    ///
+    /// # Why this is single-flighted
+    ///
+    /// The body suspends on `loadAllFromPreferences()` between checking the
+    /// cache and filling it. Two callers arriving during that window both saw
+    /// an empty cache and both continued — and when no Sweep profile existed
+    /// yet, each constructed its *own* `NETunnelProviderManager()`. Two
+    /// managers, two `saveToPreferences()`, two profiles: the system VPN menu
+    /// then offers to disconnect "Sweep VPN" twice, and only one of them is the
+    /// object this app is holding, so the other can neither be shown nor
+    /// stopped. Joining the in-flight load closes the window; the check and the
+    /// assignment either side of it now happen under the lock with no
+    /// suspension between them.
     public func loadManager() async throws -> NETunnelProviderManager {
-        if let manager { return manager }
+        // Every critical section here goes through `withState`, which is
+        // synchronous: `NSLock` must never be held across a suspension, and the
+        // compiler enforces that by refusing `lock()` in an async context.
+        if let cached = withState({ manager }) { return cached }
+
+        let task = withState { () -> Task<Void, Error> in
+            if let inFlight = loadTask { return inFlight }
+            let started = Task { try await self.performLoad() }
+            loadTask = started
+            return started
+        }
+
+        do {
+            try await task.value
+        } catch {
+            // A failed load must not be cached, or every later call replays the
+            // same failure against a system that may since have recovered.
+            withState { loadTask = nil }
+            throw error
+        }
+
+        guard let loaded = withState({ manager }) else {
+            throw ConfiguratorError.managerUnavailable
+        }
+        return loaded
+    }
+
+    public enum ConfiguratorError: Error {
+        /// The shared load reported success but left no manager behind. Only
+        /// reachable if `performLoad` is changed to return without assigning.
+        case managerUnavailable
+    }
+
+    private func performLoad() async throws {
         let existing = try await NETunnelProviderManager.loadAllFromPreferences()
         let ours = Self.selectOurs(from: existing, bundleIdentifier: bundleIdentifier)
+        // Counted, because a second profile carrying our provider id is the one
+        // thing that would explain the system VPN menu offering to disconnect
+        // "Sweep VPN" twice — and it is invisible from anywhere else. `mine`
+        // above 1 is a bug; `mine == 0` alongside a non-zero total means we are
+        // about to create a profile rather than adopt one.
+        let mine = existing.filter {
+            ($0.protocolConfiguration as? NETunnelProviderProtocol)?
+                .providerBundleIdentifier == bundleIdentifier
+        }.count
+        EventLog.shared.record(phase: "profile", level: mine > 1 ? .error : .info,
+                               kind: "profileInventory",
+                               detail: "\(existing.count) VPN profile(s) on this Mac, \(mine) ours"
+                                   + (ours == nil ? " — creating a new one" : " — adopting the existing one"))
         let m = ours ?? NETunnelProviderManager()
-        ownsProfile = (ours != nil)
-        manager = m
-        return m
+        withState {
+            ownsProfile = (ours != nil)
+            manager = m
+        }
     }
 
     /// Picks the profile whose provider is `bundleIdentifier`, or nil.
@@ -50,12 +124,21 @@ public final class VPNConfigurator: @unchecked Sendable {
 
     /// Whether a Sweep profile actually exists in system preferences.
     /// Callers must treat `false` as "not configured", not as "disconnected".
-    public var hasInstalledProfile: Bool { ownsProfile }
+    public var hasInstalledProfile: Bool { withState { ownsProfile } }
 
     /// The connection object for *our* profile, for scoping `NEVPNStatusDidChange`
     /// observation. Observing with `object: nil` delivers every VPN's transitions.
     public var ourConnection: NEVPNConnection? {
-        ownsProfile ? manager?.connection : nil
+        withState { ownsProfile ? manager?.connection : nil }
+    }
+
+    /// Reads the lock-guarded state. These are all called from the main actor
+    /// while `loadManager()` may still be resolving on another task, which is
+    /// the same race in its read-only form: the UI could observe `ownsProfile`
+    /// set against a `manager` that had not been assigned yet.
+    private func withState<T>(_ body: () -> T) -> T {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return body()
     }
 
     /// Applies the researched kill-switch construction:
@@ -79,14 +162,33 @@ public final class VPNConfigurator: @unchecked Sendable {
         manager.isOnDemandEnabled = policy.onDemandEnabled
         manager.onDemandRules = policy.onDemandEnabled ? [NEOnDemandRuleConnect()] : []
 
+        EventLog.shared.record(phase: "profile", kind: "saving",
+                               detail: "onDemand=\(policy.onDemandEnabled) "
+                                   + "includeAllNetworks=\(policy.includeAllNetworks)")
         try await manager.saveToPreferences()
         try await manager.loadFromPreferences()
-        ownsProfile = true
+        withState { ownsProfile = true }
+        EventLog.shared.record(phase: "profile", kind: "saved", detail: "profile is ours")
     }
 
     public func start() async throws {
         let manager = try await loadManager()
+        EventLog.shared.record(phase: "tunnel", kind: "startVPNTunnel",
+                               detail: "status before start: \(Self.name(manager.connection.status))")
         try manager.connection.startVPNTunnel()
+    }
+
+    /// `NEVPNStatus` prints as a bare integer, which is useless in a log.
+    static func name(_ status: NEVPNStatus) -> String {
+        switch status {
+        case .invalid:       return "invalid"
+        case .disconnected:  return "disconnected"
+        case .connecting:    return "connecting"
+        case .connected:     return "connected"
+        case .reasserting:   return "reasserting"
+        case .disconnecting: return "disconnecting"
+        @unknown default:    return "unknown(\(status.rawValue))"
+        }
     }
 
     /// `userInitiated: true` is an explicit "Disconnect"/"Cancel" from the UI.
@@ -103,11 +205,15 @@ public final class VPNConfigurator: @unchecked Sendable {
     public func stop(userInitiated: Bool = false) async throws {
         let manager = try await loadManager()
         if userInitiated, manager.isOnDemandEnabled {
+            EventLog.shared.record(phase: "profile", kind: "disarmingOnDemand",
+                                   detail: "so the OS does not restart the tunnel we are stopping")
             manager.isOnDemandEnabled = false
             manager.onDemandRules = []
             try? await manager.saveToPreferences()
             try? await manager.loadFromPreferences()
         }
+        EventLog.shared.record(phase: "tunnel", level: .warn, kind: "stopVPNTunnel",
+                               detail: "status: \(Self.name(manager.connection.status))")
         manager.connection.stopVPNTunnel()
     }
 
@@ -115,8 +221,13 @@ public final class VPNConfigurator: @unchecked Sendable {
     public func removeProfile() async throws {
         let manager = try await loadManager()
         try await manager.removeFromPreferences()
-        self.manager = nil
-        ownsProfile = false
+        withState {
+            self.manager = nil
+            ownsProfile = false
+            // The cached load has to go too, or the next `loadManager()` hands
+            // back the task that resolved to the profile we just removed.
+            loadTask = nil
+        }
     }
 
     public func send(_ message: AppToProvider) async throws -> ProviderToApp? {
@@ -138,14 +249,18 @@ public final class VPNConfigurator: @unchecked Sendable {
     /// Whether *the saved profile* actually carries an on-demand rule. The UI must
     /// not show "Standing by" off a local toggle that was never written to a profile.
     public var profileOnDemandEnabled: Bool {
-        guard ownsProfile, let manager else { return false }
-        return manager.isOnDemandEnabled && !(manager.onDemandRules ?? []).isEmpty
+        withState {
+            guard ownsProfile, let manager else { return false }
+            return manager.isOnDemandEnabled && !(manager.onDemandRules ?? []).isEmpty
+        }
     }
 
     /// `.invalid` unless the profile we are reading is provably ours.
     public var connectionStatus: NEVPNStatus {
-        guard ownsProfile, let manager else { return .invalid }
-        return manager.connection.status
+        withState {
+            guard ownsProfile, let manager else { return .invalid }
+            return manager.connection.status
+        }
     }
 }
 
