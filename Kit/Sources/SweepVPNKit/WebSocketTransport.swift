@@ -39,7 +39,6 @@ public final class WebSocketTransport: @unchecked Sendable {
     private let port: UInt16
     private let queue = DispatchQueue(label: "vpn.sweep.wstransport")
     private var listener: NWListener?
-    private let session: URLSession
 
     public init(workerURL: URL = WebSocketTransport.defaultWorkerURL,
                 token: String, host: String, port: UInt16) {
@@ -47,11 +46,6 @@ public final class WebSocketTransport: @unchecked Sendable {
         self.token = token
         self.host = host
         self.port = port
-        let config = URLSessionConfiguration.ephemeral
-        // The tunnel must not be routed back into our own VPN once it comes up,
-        // and it must not sit behind a system proxy the user set for browsing.
-        config.connectionProxyDictionary = [:]
-        self.session = URLSession(configuration: config)
     }
 
     /// Starts the loopback listener and returns the port it bound.
@@ -93,7 +87,6 @@ public final class WebSocketTransport: @unchecked Sendable {
     public func stop() {
         listener?.cancel()
         listener = nil
-        session.invalidateAndCancel()
     }
 
     // MARK: - One connection
@@ -110,79 +103,130 @@ public final class WebSocketTransport: @unchecked Sendable {
         return components?.url
     }
 
+    /// The socket that carries the relay stream to the Worker.
+    ///
+    /// This was a `URLSession` WebSocket task and could not be. Inside a packet
+    /// tunnel provider, `URLSession` evaluates its path against the network the
+    /// provider itself has just taken over, and when that path is ours it opens
+    /// no socket and reports no error — measured: across a full connect the
+    /// extension held loopback descriptors and nothing else, no TCP to the
+    /// Worker and no DNS. The connection simply never happened, silently, which
+    /// is the worst possible failure mode in a transport.
+    ///
+    /// `NWConnection` fixes both halves. `prohibitedInterfaceTypes` keeps the
+    /// socket off the tunnel by construction rather than by hoping a route
+    /// exclusion covers the right addresses, and its state machine reports
+    /// `.failed` and `.waiting`, so a transport that cannot connect says so.
+    private func workerConnection() -> NWConnection? {
+        guard let url = tunnelURL(), let name = url.host else { return nil }
+
+        let tls = NWProtocolTLS.Options()
+        sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, name)
+        let params = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
+
+        // `.other` is the utun family. Our own transport must never ride the
+        // tunnel it is bringing up — that is a deadlock, and once the tunnel is
+        // established it would also be a loop.
+        params.prohibitedInterfaceTypes = [.other]
+
+        let websocket = NWProtocolWebSocket.Options()
+        websocket.autoReplyPing = true
+        params.defaultProtocolStack.applicationProtocols.insert(websocket, at: 0)
+
+        return NWConnection(to: .url(url), using: params)
+    }
+
     private func bridge(_ connection: NWConnection) {
         // Proves the core actually dialled loopback. Its absence next to a
         // `relayTunnelUp` means the bytes never left OpenVPN towards us, which
         // is a different bug from anything on the Worker leg.
         Diagnostics.shared.record("wssDialled")
-        guard let url = tunnelURL() else { connection.cancel(); return }
-        let task = session.webSocketTask(with: url)
-        task.resume()
-        connection.start(queue: queue)
+        guard let worker = workerConnection() else { connection.cancel(); return }
 
-        // The Worker's first frame is a one-byte status: 0x01 connected.
-        // Nothing may be forwarded before it, or the relay sees our handshake
-        // interleaved with a connection that does not exist yet.
-        task.receive { [weak self] result in
+        worker.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
-            guard case .success(.data(let status)) = result, status.first == 0x01 else {
-                // Without this the bypass failed as a bare NETWORK_RECV_ERROR
-                // from OpenVPN — the loopback hung up, and nothing anywhere
-                // said why. "Could not reach the Worker" and "the Worker
-                // refused the token" are the same symptom and completely
-                // different fixes.
-                switch result {
-                case .failure(let error):
-                    Diagnostics.shared.record("wssFailed", "\(error)")
-                case .success(let message):
-                    Diagnostics.shared.record("wssRefused", "unexpected first frame \(message)")
-                }
-                connection.cancel()
-                task.cancel(with: .goingAway, reason: nil)
+            switch state {
+            case .ready:
+                // The Worker's first frame is a one-byte status: 0x01 connected.
+                // Nothing may be forwarded before it, or the relay sees our
+                // handshake interleaved with a connection that does not exist.
+                self.awaitStatus(worker, connection)
+            case .failed(let error):
+                // "Could not reach the Worker" and "the Worker refused the
+                // token" are the same symptom and completely different fixes,
+                // so the reason is recorded rather than inferred later.
+                Diagnostics.shared.record("wssFailed", "\(error)")
+                self.tearDown(worker, connection)
+            case .waiting(let error):
+                // Not fatal on its own, but on this network it is how a blocked
+                // path presents, and it is the state URLSession never surfaced.
+                Diagnostics.shared.record("wssWaiting", "\(error)")
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+        worker.start(queue: queue)
+    }
+
+    private func tearDown(_ worker: NWConnection, _ connection: NWConnection) {
+        worker.cancel()
+        connection.cancel()
+    }
+
+    private func awaitStatus(_ worker: NWConnection, _ connection: NWConnection) {
+        worker.receiveMessage { [weak self] data, _, _, error in
+            guard let self else { return }
+            guard error == nil, let data, data.first == 0x01 else {
+                Diagnostics.shared.record(
+                    "wssRefused",
+                    error.map { "\($0)" } ?? "unexpected first frame")
+                self.tearDown(worker, connection)
                 return
             }
             Diagnostics.shared.record("wssUp")
-            self.pumpSocketToWebSocket(connection, task)
-            self.pumpWebSocketToSocket(task, connection)
+            self.pumpSocketToWorker(connection, worker)
+            self.pumpWorkerToSocket(worker, connection)
         }
     }
 
     /// Relay -> app.
-    private func pumpWebSocketToSocket(_ task: URLSessionWebSocketTask, _ connection: NWConnection) {
-        task.receive { [weak self] result in
+    private func pumpWorkerToSocket(_ worker: NWConnection, _ connection: NWConnection) {
+        worker.receiveMessage { [weak self] data, _, isComplete, error in
             guard let self else { return }
-            switch result {
-            case .success(let message):
-                let data: Data
-                switch message {
-                case .data(let d): data = d
-                case .string(let s): data = Data(s.utf8)
-                @unknown default: data = Data()
-                }
-                if !data.isEmpty {
-                    connection.send(content: data, completion: .contentProcessed { _ in })
-                }
-                self.pumpWebSocketToSocket(task, connection)
-            case .failure:
-                connection.cancel()
+            if let error {
+                Diagnostics.shared.record("wssEnded", "\(error)")
+                self.tearDown(worker, connection)
+                return
             }
+            if let data, !data.isEmpty {
+                connection.send(content: data, completion: .contentProcessed { _ in })
+            }
+            if isComplete && data == nil {
+                self.tearDown(worker, connection)
+                return
+            }
+            self.pumpWorkerToSocket(worker, connection)
         }
     }
 
     /// App -> relay.
-    private func pumpSocketToWebSocket(_ connection: NWConnection, _ task: URLSessionWebSocketTask) {
+    private func pumpSocketToWorker(_ connection: NWConnection, _ worker: NWConnection) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
             [weak self] data, _, isComplete, error in
             guard let self else { return }
             if let data, !data.isEmpty {
-                task.send(.data(data)) { _ in }
+                let metadata = NWProtocolWebSocket.Metadata(opcode: .binary)
+                let context = NWConnection.ContentContext(identifier: "relay",
+                                                          metadata: [metadata])
+                worker.send(content: data, contentContext: context,
+                            completion: .contentProcessed { _ in })
             }
             if isComplete || error != nil {
-                task.cancel(with: .goingAway, reason: nil)
-                connection.cancel()
+                self.tearDown(worker, connection)
                 return
             }
-            self.pumpSocketToWebSocket(connection, task)
+            self.pumpSocketToWorker(connection, worker)
         }
     }
 }
