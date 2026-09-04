@@ -276,13 +276,18 @@ public struct RelayTunnelSettings: Sendable {
     }
 
     /// Cached answer first, live lookup only as a fallback.
+    ///
+    /// This is the only form anything inside the extension may use. The live
+    /// lookup is named for what it does precisely so that reaching for it there
+    /// reads as a mistake: a resolution attempted from inside the tunnel, with
+    /// the blackhole already installed, comes back empty.
     public func workerAddresses(appGroup: String, timeout: TimeInterval = 3) -> Set<String> {
         let cached = Self.cachedAddresses(appGroup: appGroup)
         if !cached.isEmpty { return cached }
-        return workerAddresses(timeout: timeout)
+        return liveWorkerAddresses(timeout: timeout)
     }
 
-    public func workerAddresses(timeout: TimeInterval = 3) -> Set<String> {
+    public func liveWorkerAddresses(timeout: TimeInterval = 3) -> Set<String> {
         let box = NSMutableArray()
         let done = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .userInitiated).async {

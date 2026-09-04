@@ -320,7 +320,16 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         // relay leaves the filter dropping the connection the tunnel needs to
         // come up at all, which fails closed with no way back.
         let relayTunnel = RelayTunnelSettings.load(appGroup: appGroup)
-        if relayTunnel.enabled { addresses.formUnion(relayTunnel.workerAddresses()) }
+        // Cache-first, like the blackhole's exclusion list. Resolving here
+        // instead returned nothing — the lookup runs inside a tunnel whose
+        // default route we already own — so the filter was published with an
+        // empty allow-list while the kill switch was armed. It then dropped the
+        // extension's own connection to the Worker: no reset, no error, just a
+        // flow that never completed, which surfaced as OpenVPN retrying every
+        // ten seconds until the race timed out.
+        if relayTunnel.enabled {
+            addresses.formUnion(relayTunnel.workerAddresses(appGroup: appGroup))
+        }
         #endif
         filterStateStore.write(FilterState(tunnelInterface: nil, tunnelIsUp: up,
                                            serverAddresses: addresses, options: policy.options))

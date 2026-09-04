@@ -104,3 +104,31 @@ final class LoopbackRewriteTests: XCTestCase {
         XCTAssertNil(OpenVPNTunnelAdapter.pointingAtLoopback("client\r\n# remote here\r\n", port: 1))
     }
 }
+
+/// The filter's allow-list and the blackhole's exclusion list are both built
+/// from these, from inside a tunnel that already owns the default route. A
+/// lookup there returns nothing, so the cache is not an optimisation — it is
+/// the only source that works.
+final class WorkerAddressCacheTests: XCTestCase {
+    private let group = "test.sweep.workeraddresses"
+
+    override func setUp() { UserDefaults(suiteName: group)?.removePersistentDomain(forName: group) }
+
+    func testCachedAddressesAreUsedWithoutResolving() {
+        let settings = RelayTunnelSettings(
+            enabled: true,
+            workerURL: URL(string: "https://nothing.invalid")!,   // never resolves
+            token: "t")
+        XCTAssertTrue(settings.workerAddresses(appGroup: group, timeout: 1).isEmpty)
+        RelayTunnelSettings.cache(addresses: ["104.21.37.108"], appGroup: group)
+        XCTAssertEqual(settings.workerAddresses(appGroup: group, timeout: 1), ["104.21.37.108"])
+    }
+
+    /// An empty answer must never overwrite a good list: the extension would
+    /// then publish an empty allow-list and fail closed on its own tunnel.
+    func testEmptyResultNeverClearsTheCache() {
+        RelayTunnelSettings.cache(addresses: ["104.21.37.108"], appGroup: group)
+        RelayTunnelSettings.cache(addresses: [], appGroup: group)
+        XCTAssertEqual(RelayTunnelSettings.cachedAddresses(appGroup: group), ["104.21.37.108"])
+    }
+}

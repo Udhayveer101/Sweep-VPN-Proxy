@@ -48,7 +48,7 @@ struct SweepVPNMacApp: App {
                 // resolver is routed into the tunnel and never answered. The
                 // Worker's own address is useless without the lookup that
                 // produces it.
-                let reachable = settings.workerAddresses(timeout: 5)
+                let reachable = settings.liveWorkerAddresses(timeout: 5)
                     .union(Self.systemResolvers())
                 RelayTunnelSettings.cache(addresses: reachable, appGroup: group)
             }
