@@ -376,3 +376,39 @@ final class PostQuantumTests: XCTestCase {
         XCTAssertFalse(ProtocolRung.openVPNTCP.supportsHybridPQ)
     }
 }
+
+/// The blackhole must let the Worker out on whichever family the transport
+/// actually uses. It excluded v4 only, so a v6-preferring connection went into
+/// `::/0` and was dropped with no error at all.
+final class BlackholeExclusionTests: XCTestCase {
+    func testBothFamiliesAreExcluded() {
+        let plan = SecurityPolicy().blackholePlan(
+            reachableHosts: ["104.21.37.108", "2606:4700:3030::ac43:cf84"])
+        XCTAssertEqual(plan.ipv4ExcludedRoutes.map(\.address), ["104.21.37.108"])
+        XCTAssertEqual(plan.ipv4ExcludedRoutes.map(\.prefix), [32])
+        XCTAssertEqual(plan.ipv6ExcludedRoutes.map(\.address), ["2606:4700:3030::ac43:cf84"])
+        XCTAssertEqual(plan.ipv6ExcludedRoutes.map(\.prefix), [128])
+    }
+}
+
+/// From macOS 15 a flow dialled by URL reports its remote as a hostname, not an
+/// address. The allow-list is matched against that string, so the Worker's name
+/// has to be in it or the kill switch drops the tunnel's own bootstrap.
+final class FilterAllowsWorkerByNameTests: XCTestCase {
+    func testHostnameFlowIsAllowedWhileTheTunnelIsDown() {
+        var options = SecurityPolicyOptions()
+        options.killSwitchEnabled = true
+        let byAddress = FilterPolicy(options: options, tunnelInterface: nil, tunnelIsUp: false,
+                                     serverAddresses: ["104.21.37.108"])
+        let flow = FilterPolicy.Flow(interfaceName: nil,
+                                     remoteAddress: "relay-worker.example.workers.dev",
+                                     remoteHostname: "relay-worker.example.workers.dev",
+                                     isLoopback: false, isOutbound: true)
+        XCTAssertEqual(byAddress.verdict(for: flow), .drop, "the bug: addresses only")
+
+        let byName = FilterPolicy(options: options, tunnelInterface: nil, tunnelIsUp: false,
+                                  serverAddresses: ["104.21.37.108",
+                                                    "relay-worker.example.workers.dev"])
+        XCTAssertEqual(byName.verdict(for: flow), .allow)
+    }
+}

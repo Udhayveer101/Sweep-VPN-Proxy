@@ -15,6 +15,14 @@ public struct TunnelPlan: Sendable, Equatable {
     public var ipv4ExcludedRoutes: [Route]
     public var ipv6Address: String?
     public var ipv6Routes: [Route]
+    /// Addresses that must stay on the physical interface while the v6 default
+    /// route is ours. Without this the blackhole swallowed the Worker leg: the
+    /// name resolves to A *and* AAAA records, the system prefers v6, the SYN
+    /// went into `::/0` and was dropped, and `NWConnection` sat in `.preparing`
+    /// — no `.ready`, no `.failed`, no `.waiting`, nothing logged at all until
+    /// OpenVPN's own ten-second retry. A v4-only exclusion list is only correct
+    /// on a v4-only network.
+    public var ipv6ExcludedRoutes: [Route]
     public var ipv6Blocked: Bool          // no v6 address -> v6 must be blackholed, never left to wifi
     public var dnsServers: [String]
     public var dnsMatchDomains: [String]  // [""] = all queries in tunnel
@@ -83,6 +91,10 @@ public struct SecurityPolicy: Sendable {
                        .map { .init($0, 32) },
                    ipv6Address: nil,
                    ipv6Routes: [.init("::", 0)],
+                   ipv6ExcludedRoutes: reachableHosts
+                       .filter { $0.contains(":") }
+                       .sorted()
+                       .map { .init($0, 128) },
                    ipv6Blocked: true,
                    // DNS is deliberately NOT captured here. The blackhole is
                    // installed before the Worker is dialled, and the transport
@@ -114,6 +126,7 @@ public struct SecurityPolicy: Sendable {
             // Either route v6 into the tunnel, or blackhole it. Never leave it
             // to the physical interface (vault 01-Apple-Platform/IPv4-IPv6-Routing-And-Leak-Risk).
             ipv6Routes: (hasV6 || options.blockIPv6WhenUnavailable) ? [.init("::", 0)] : [],
+            ipv6ExcludedRoutes: [],
             ipv6Blocked: !hasV6 && options.blockIPv6WhenUnavailable,
             dnsServers: options.dnsFilteringEnabled && !server.filteringDNSServers.isEmpty
                 ? server.filteringDNSServers : server.dnsServers,
@@ -151,6 +164,8 @@ public struct SecurityPolicy: Sendable {
             ipv4ExcludedRoutes: excluded,
             ipv6Address: v6?.address,
             ipv6Routes: (hasV6 || options.blockIPv6WhenUnavailable) ? [.init("::", 0)] : [],
+            ipv6ExcludedRoutes: pushed.routes.filter { $0.exclude && $0.ipv6 }
+                .map { TunnelPlan.Route($0.address, $0.prefix) },
             ipv6Blocked: !hasV6 && options.blockIPv6WhenUnavailable,
             // The relay chose these resolvers. We cannot make that private, but
             // an empty push must not silently fall back to the device's own

@@ -148,7 +148,28 @@ public final class VPNConfigurator: @unchecked Sendable {
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = bundleIdentifier
         proto.serverAddress = serverDescription
-        proto.includeAllNetworks = policy.includeAllNetworks
+
+        // `includeAllNetworks` and the Worker bypass cannot both be on.
+        //
+        // It is the OS-level kill switch, and it is absolute: with it set,
+        // excluded routes are ignored and *every* socket goes into the tunnel —
+        // including the extension's own connection to the Worker, which is the
+        // one thing that has to leave on the physical interface for the tunnel
+        // to come up at all. Measured: the exclusion list grew from four
+        // addresses to six and changed nothing; the Worker connection sat in
+        // `preparing` until the watchdog killed it, on every single attempt.
+        //
+        // What is given up is only this layer. The blackhole still owns the
+        // default route from the moment the tunnel starts and refuses to
+        // forward until the peer authenticates, and the content filter still
+        // drops every flow that is not on its allow-list — so traffic cannot
+        // leak, it simply is not the kernel enforcing it.
+        #if os(macOS)
+        let relayTunnelOn = RelayTunnelSettings.load(appGroup: AppGroupID.resolved).enabled
+        #else
+        let relayTunnelOn = false
+        #endif
+        proto.includeAllNetworks = policy.includeAllNetworks && !relayTunnelOn
         proto.excludeLocalNetworks = policy.excludeLocalNetworks
         if #available(iOS 16.4, macOS 13.3, *) {
             proto.excludeAPNs = false          // keep Apple push inside the tunnel where allowed
@@ -164,7 +185,8 @@ public final class VPNConfigurator: @unchecked Sendable {
 
         EventLog.shared.record(phase: "profile", kind: "saving",
                                detail: "onDemand=\(policy.onDemandEnabled) "
-                                   + "includeAllNetworks=\(policy.includeAllNetworks)")
+                                   + "includeAllNetworks=\(proto.includeAllNetworks)"
+                                   + (relayTunnelOn ? " (off: the Worker leg needs the wire)" : ""))
         try await manager.saveToPreferences()
         try await manager.loadFromPreferences()
         withState { ownsProfile = true }

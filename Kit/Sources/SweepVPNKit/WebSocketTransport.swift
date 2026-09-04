@@ -129,6 +129,24 @@ public final class WebSocketTransport: @unchecked Sendable {
         // established it would also be a loop.
         params.prohibitedInterfaceTypes = [.other]
 
+        // IPv4 only, deliberately.
+        //
+        // `workers.dev` publishes A *and* AAAA records, and on a dual-stack path
+        // the system prefers v6. The blackhole this connection has to escape
+        // routes `::/0` into the tunnel and its exclusion list is built from the
+        // addresses the app resolved — so a v6 SYN went into the tunnel and was
+        // dropped. Nothing reported it: no `.ready`, no `.failed`, no
+        // `.waiting`, just `.preparing` until OpenVPN gave up ten seconds later
+        // and dialled again. Measured: `wssDialled` three times per attempt with
+        // not one other transport event between them.
+        //
+        // Pinning the family here is what makes the transport and the exclusion
+        // list agree by construction, rather than by both happening to resolve
+        // the same records.
+        if let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ip.version = .v4
+        }
+
         let websocket = NWProtocolWebSocket.Options()
         websocket.autoReplyPing = true
         params.defaultProtocolStack.applicationProtocols.insert(websocket, at: 0)
@@ -167,7 +185,24 @@ public final class WebSocketTransport: @unchecked Sendable {
         }
         connection.start(queue: queue)
         worker.start(queue: queue)
+
+        // A transport that cannot connect must say so. `NWConnection` reports
+        // `.failed` for a refusal and `.waiting` for an unusable path, but a
+        // SYN into a blackhole produces neither — it stays `.preparing`
+        // forever, which is how this bug hid for days behind a log that simply
+        // stopped. Whatever the next cause turns out to be, it leaves a line.
+        queue.asyncAfter(deadline: .now() + Self.readyDeadline) { [weak self] in
+            guard let self, worker.state != .ready, worker.state != .cancelled else { return }
+            Diagnostics.shared.record(
+                "wssStalled",
+                "no response from the Worker in \(Int(Self.readyDeadline))s (state: \(worker.state))")
+            self.tearDown(worker, connection)
+        }
     }
+
+    /// Shorter than OpenVPN's own ten-second retry, so the stall is recorded
+    /// against the attempt that caused it rather than the one after.
+    private static let readyDeadline: TimeInterval = 8
 
     private func tearDown(_ worker: NWConnection, _ connection: NWConnection) {
         worker.cancel()

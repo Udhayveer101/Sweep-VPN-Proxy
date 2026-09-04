@@ -351,6 +351,18 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         // ten seconds until the race timed out.
         if relayTunnel.enabled {
             addresses.formUnion(relayTunnel.workerAddresses(appGroup: appGroup))
+            // The Worker's *name*, alongside its addresses.
+            //
+            // `NEFilterSocketFlow.remoteFlowEndpoint` reports what the socket
+            // was given, and the transport dials a URL — so from macOS 15 on
+            // the flow arrives as `.name("…workers.dev")` and never as an
+            // address. Matching an address set against it always failed, the
+            // policy fell through to "the tunnel is not up yet", and the filter
+            // dropped the one connection that would have brought it up.
+            // Measured: `waiting(POSIX 53: Software caused connection abort)`
+            // on every dial, which is what a filter `.drop()` looks like from
+            // the far side of the socket.
+            if let host = relayTunnel.workerURL.host { addresses.insert(host) }
         }
         #endif
         filterStateStore.write(FilterState(tunnelInterface: nil, tunnelIsUp: up,
@@ -642,6 +654,9 @@ public enum TunnelSettingsMapper {
         if let v6Address, !plan.ipv6Routes.isEmpty {
             let v6 = NEIPv6Settings(addresses: [v6Address], networkPrefixLengths: [128])
             v6.includedRoutes = plan.ipv6Routes.map {
+                NEIPv6Route(destinationAddress: $0.address, networkPrefixLength: NSNumber(value: $0.prefix))
+            }
+            v6.excludedRoutes = plan.ipv6ExcludedRoutes.map {
                 NEIPv6Route(destinationAddress: $0.address, networkPrefixLength: NSNumber(value: $0.prefix))
             }
             s.ipv6Settings = v6

@@ -559,14 +559,38 @@ public final class VPNViewModel: ObservableObject {
         // extension raced the WireGuard ladder against servers that answer
         // nothing here, reported allRungsFailed, and the OpenVPN-over-Worker
         // route — the only one that survives this gateway — was never tried.
-        if RelaySelectionStore(appGroup: appGroup).load() != nil { return true }
+        let store = RelaySelectionStore(appGroup: appGroup)
+        let pinned = store.load()
         #else
         if hasVerifiedConfig { return true }
         #endif
         #if os(macOS)
 
         if relays.isEmpty { loadCachedRelays() }
-        if relays.isEmpty { await refreshRelays() }
+        // Refresh a list that is merely old, not only one that is missing.
+        // VPN Gate rows are volunteers' machines that come and go within hours,
+        // and both the pin below and its replacement are drawn from this list.
+        // Re-pinning from a stale list just picks the next relay that is also
+        // gone.
+        if relays.isEmpty || (relaysFetchedAt.map { Date().timeIntervalSince($0) > 3600 } ?? true) {
+            await refreshRelays()
+        }
+
+        // A pin is only good while the relay is still on the list.
+        //
+        // Nothing revalidated it before, so a relay chosen once was dialled
+        // forever. That fails in a way that names nothing: the Worker builds its
+        // egress allow-list from this same list, answers a delisted host with
+        // `0x00 not a known relay`, and all the extension sees is a connection
+        // that never carries a byte. Measured against the deployed Worker: the
+        // pinned 219.100.37.196 was refused, and it is absent from the live CSV.
+        if let pinned {
+            let live = Set(relays.flatMap { $0.endpoints.map(\.host) })
+            if pinned.endpoints.contains(where: { live.contains($0.host) }) { return true }
+            log.record(phase: "relay", level: .warn, kind: "pinnedRelayDelisted",
+                       detail: "\(pinned.name) is no longer on the list — reselecting")
+            store.clear()
+        }
         guard !relays.isEmpty else {
             // `refreshRelays` has already put the specific reason (a 403 block
             // page reads very differently from being offline) into relayStatus.
