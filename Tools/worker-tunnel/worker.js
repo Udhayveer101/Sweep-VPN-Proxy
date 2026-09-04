@@ -117,85 +117,219 @@ function tokenMatches(given, expected) {
   return diff === 0;
 }
 
-/// Everything after the 101: verify, connect, and pipe until either side ends.
-async function runTunnel(ws, host, port, token, expected) {
-  const fail = (reason) => { try { ws.send(new Uint8Array([0x00])); ws.close(1008, reason); } catch {} };
-
-  // Attach the message listener before anything is awaited. An accepted
-  // WebSocket dispatches frames immediately and drops those that arrive with
-  // no listener attached — the client sends its handshake the moment it sees
-  // 0x01, which lands inside the connect await. Queue until the socket exists.
-  let writer = null;
-  const pending = [];
-  ws.addEventListener("message", (event) => {
-    // `event.data` is not always a plain ArrayBuffer here: a Blob or a typed
-    // array both slip through `new Uint8Array(d)` as ZERO bytes, which silently
-    // empties every packet and looks exactly like the far end never replying.
-    const d = event.data;
-    let bytes;
-    if (typeof d === "string") bytes = new TextEncoder().encode(d);
-    else if (d instanceof ArrayBuffer) bytes = new Uint8Array(d);
-    else if (ArrayBuffer.isView(d)) bytes = new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
-    else { queueBlob(d); return; }
-    push(bytes);
-  });
-
-  const push = (bytes) => {
-    if (!bytes.byteLength) return;
-    if (!writer) { pending.push(bytes); return; }
-    writer.write(bytes).catch(() => { try { ws.close(1011, "write failed"); } catch {} });
-  };
-  // A Blob has to be read asynchronously; keep the ordering by chaining.
-  let blobChain = Promise.resolve();
-  const queueBlob = (blob) => {
-    blobChain = blobChain.then(async () => {
-      try { push(new Uint8Array(await blob.arrayBuffer())); } catch {}
-    });
-  };
-
-  if (!tokenMatches(token, expected)) return fail("forbidden");
-  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return fail("bad target");
-  if (!(await isAllowed(host))) return fail("not a known relay");
-
-  let socket;
-  try {
-    socket = connect({ hostname: host, port });
-    await socket.opened;
-    writer = socket.writable.getWriter();
-    for (const b of pending) writer.write(b).catch(() => {});
-    pending.length = 0;
-    // Deliberately not logged. `console.log(host, port)` here wrote which relay
-    // this user picked into Workers logs, and the read loop below logged a line
-    // per chunk — between them, the relay choice and a byte-size/timing trace of
-    // the session. That is precisely the metadata a VPN exists to not produce,
-    // and it was being produced by the operator rather than the network.
-    ws.send(new Uint8Array([0x01]));
-  } catch {
-    return fail("connect failed");
+/// The relay leg, owned by a Durable Object rather than by a request.
+///
+/// It used to be a fire-and-forget `runTunnel()` in the request handler, on the
+/// theory that an accepted WebSocket keeps the context alive. It does not, not
+/// reliably: the field log shows the stream ending every three to six seconds
+/// with no close frame at all — not the `1000 "eof"` the read loop sends when
+/// the *relay* hangs up, but the Cloudflare side being torn down mid-stream.
+/// Every one of those cost a full OpenVPN renegotiation, which is what the user
+/// experienced as the internet dying every few seconds.
+///
+/// A Durable Object holds its socket for its own lifetime, so the loop is no
+/// longer something the runtime can reap. It also outlives any one client
+/// connection, which buys the thing the old design could not have at any price:
+/// when the client's leg drops, the relay's TCP session — and so the OpenVPN
+/// session riding on it — stays up. The client redials the same session id and
+/// re-attaches to the live socket. No renegotiation, no visible gap.
+export class RelaySession {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.ws = null;
+    this.socket = null;
+    this.writer = null;
+    this.target = null;      // "host:port", so a reattach cannot be redirected
+    this.dead = false;
+    this.parked = [];        // relay -> client bytes with nowhere to go yet
+    this.parkedBytes = 0;
+    this.pending = [];       // client -> relay bytes that arrived before the writer
+    this.blobChain = Promise.resolve();
   }
-  const teardown = () => {
-    try { writer.close(); } catch {}
-    try { socket.close(); } catch {}
-  };
-  ws.addEventListener("close", teardown);
-  ws.addEventListener("error", teardown);
 
-  const reader = socket.readable.getReader();
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done || ws.readyState !== 1) break;
-      // Copy exactly this chunk's bytes out of the pooled buffer.
-      ws.send(value.buffer.byteLength === value.byteLength
-        ? value.buffer
-        : value.slice().buffer);
+  /// How long a session survives with no client attached. Long enough to ride
+  /// out a redial and a network blip, short enough that an abandoned session
+  /// does not hold a relay socket open for the operator to answer for.
+  static get graceMs() { return 30_000; }
+
+  /// Past this, the client is not coming back fast enough to matter and the
+  /// buffer is doing more harm than the reconnect it was protecting.
+  static get maxParkedBytes() { return 512 * 1024; }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const host = url.searchParams.get("h");
+    const port = Number(url.searchParams.get("p"));
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    // Same rule as before: return the 101 promptly. Everything else happens
+    // after it, or the runtime kills the request as hung.
+    this.attach(server, host, port);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  attach(ws, host, port) {
+    const target = `${host}:${port}`;
+    if (this.dead) return this.refuse(ws, "session gone");
+    // A resumed session may only resume the relay it started on. The session id
+    // is the client's to choose, and this is what stops a chosen id from being
+    // a way to point someone else's live socket somewhere new.
+    if (this.target && this.target !== target) return this.refuse(ws, "wrong target");
+
+    // A redial that arrives while an older leg is still open replaces it; the
+    // old one is hung up rather than left to leak.
+    if (this.ws && this.ws !== ws) {
+      const stale = this.ws;
+      this.ws = null;
+      try { stale.close(1000, "replaced"); } catch {}
     }
-  } catch {
-    // fall through
-  } finally {
-    try { ws.close(1000, "eof"); } catch {}
-    teardown();
+    this.ws = ws;
+    ws.addEventListener("message", (event) => this.fromClient(event.data));
+    ws.addEventListener("close", () => this.park(ws));
+    ws.addEventListener("error", () => this.park(ws));
+
+    if (this.socket) {
+      // Reattach: the relay never noticed we were gone.
+      this.state.storage.deleteAlarm();
+      try {
+        ws.send(new Uint8Array([0x01]));
+      } catch { return; }
+      this.flushParked();
+      return;
+    }
+    this.target = target;
+    this.open(host, port);
   }
+
+  refuse(ws, reason) {
+    try {
+      ws.send(new Uint8Array([0x00]));
+      ws.close(1008, reason);
+    } catch {}
+  }
+
+  async open(host, port) {
+    try {
+      this.socket = connect({ hostname: host, port });
+      await this.socket.opened;
+      this.writer = this.socket.writable.getWriter();
+      for (const b of this.pending) this.writer.write(b).catch(() => {});
+      this.pending.length = 0;
+      // Deliberately not logged. `console.log(host, port)` here wrote which relay
+      // this user picked into Workers logs, and the read loop below logged a line
+      // per chunk — between them, the relay choice and a byte-size/timing trace of
+      // the session. That is precisely the metadata a VPN exists to not produce,
+      // and it was being produced by the operator rather than the network.
+      this.ws?.send(new Uint8Array([0x01]));
+    } catch {
+      this.socket = null;
+      if (this.ws) this.refuse(this.ws, "connect failed");
+      this.destroy();
+      return;
+    }
+    this.pump();
+  }
+
+  /// Relay -> client. Keeps reading while no client is attached, so a reconnect
+  /// finds the stream where it left off instead of a hole.
+  async pump() {
+    const reader = this.socket.readable.getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done || this.dead) break;
+        // Chunks are views into a pooled buffer. Sending one directly can put
+        // the whole backing ArrayBuffer on the wire and corrupt the stream, so
+        // each chunk is copied to exactly its own bytes.
+        const bytes = value.buffer.byteLength === value.byteLength
+          ? value.buffer
+          : value.slice().buffer;
+        if (this.ws && this.ws.readyState === 1) {
+          this.ws.send(bytes);
+        } else if (!this.park_overflowed(bytes.byteLength)) {
+          this.parked.push(bytes);
+        } else {
+          break;
+        }
+      }
+    } catch {
+      // fall through
+    } finally {
+      try { this.ws?.close(1000, "eof"); } catch {}
+      this.destroy();
+    }
+  }
+
+  park_overflowed(n) {
+    this.parkedBytes += n;
+    return this.parkedBytes > RelaySession.maxParkedBytes;
+  }
+
+  flushParked() {
+    for (const b of this.parked) {
+      try { this.ws.send(b); } catch { return; }
+    }
+    this.parked.length = 0;
+    this.parkedBytes = 0;
+  }
+
+  /// `event.data` is not always a plain ArrayBuffer here: a Blob or a typed
+  /// array both slip through `new Uint8Array(d)` as ZERO bytes, which silently
+  /// empties every packet and looks exactly like the far end never replying.
+  fromClient(d) {
+    if (typeof d === "string") return this.push(new TextEncoder().encode(d));
+    if (d instanceof ArrayBuffer) return this.push(new Uint8Array(d));
+    if (ArrayBuffer.isView(d)) {
+      return this.push(new Uint8Array(d.buffer, d.byteOffset, d.byteLength));
+    }
+    // A Blob has to be read asynchronously; keep the ordering by chaining.
+    this.blobChain = this.blobChain.then(async () => {
+      try { this.push(new Uint8Array(await d.arrayBuffer())); } catch {}
+    });
+  }
+
+  push(bytes) {
+    if (!bytes.byteLength) return;
+    if (!this.writer) { this.pending.push(bytes); return; }
+    this.writer.write(bytes).catch(() => this.destroy());
+  }
+
+  /// The client went away. Keep the relay socket — that is the whole point —
+  /// and give the client a window to come back before giving up on it.
+  park(ws) {
+    if (this.ws !== ws) return;   // a later attach already replaced this one
+    this.ws = null;
+    if (this.dead) return;
+    this.state.storage.setAlarm(Date.now() + RelaySession.graceMs);
+  }
+
+  async alarm() {
+    if (!this.ws) this.destroy();
+  }
+
+  destroy() {
+    if (this.dead) return;
+    this.dead = true;
+    this.parked.length = 0;
+    try { this.writer?.close(); } catch {}
+    try { this.socket?.close(); } catch {}
+    try { this.ws?.close(1000, "eof"); } catch {}
+    this.state.storage.deleteAlarm();
+  }
+}
+
+/// Refuse in the shape the client expects: a 101, the 0x00 status byte, then a
+/// 1008 close. Answering with a plain HTTP error instead would leave the client
+/// waiting on its status deadline for a verdict it could have had at once.
+function refused(reason) {
+  const [client, server] = Object.values(new WebSocketPair());
+  server.accept();
+  try {
+    server.send(new Uint8Array([0x00]));
+    server.close(1008, reason);
+  } catch {}
+  return new Response(null, { status: 101, webSocket: client });
 }
 
 export default {
@@ -206,20 +340,24 @@ export default {
       if (request.headers.get("Upgrade") !== "websocket") {
         return new Response("expected a websocket upgrade", { status: 426 });
       }
-      const [client, server] = Object.values(new WebSocketPair());
-      server.accept();
-      // Fire-and-forget, deliberately not `ctx.waitUntil`: an accepted
-      // WebSocket already keeps the context alive, and handing waitUntil an
-      // unbounded read loop trips the runtime's hang detector, which cancels
-      // the request and closes the client's socket with code 1005.
-      runTunnel(
-        server,
-        url.searchParams.get("h"),
-        Number(url.searchParams.get("p")),
-        url.searchParams.get("t"),
-        env.TUNNEL_TOKEN,
-      );
-      return new Response(null, { status: 101, webSocket: client });
+      // The cheap, stateless checks stay out here: no point spinning up a
+      // Durable Object for a request that has the wrong token.
+      const host = url.searchParams.get("h");
+      const port = Number(url.searchParams.get("p"));
+      if (!tokenMatches(url.searchParams.get("t"), env.TUNNEL_TOKEN)) {
+        return refused("forbidden");
+      }
+      if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+        return refused("bad target");
+      }
+      if (!(await isAllowed(host))) return refused("not a known relay");
+
+      // `s` names the session. The client reuses it to re-attach to a live
+      // relay socket after its own leg drops; a client that does not send one
+      // gets a fresh, unresumable session.
+      const session = url.searchParams.get("s") || crypto.randomUUID();
+      const id = env.RELAY.idFromName(session);
+      return env.RELAY.get(id).fetch(request);
     }
 
     // Everything else mirrors the relay list, so one Worker covers both the

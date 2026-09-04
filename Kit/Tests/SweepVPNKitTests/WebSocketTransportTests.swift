@@ -66,6 +66,30 @@ final class WebSocketTransportTests: XCTestCase {
         wait(for: [unusable], timeout: 9)
     }
 
+    /// The redial budget only helps if it fits inside the window the rest of the
+    /// stack allows. Spend longer than OpenVPN 3's own retry and the core gives
+    /// up on the relay before the reattach that would have saved it lands, which
+    /// is the exact failure the Durable Object exists to remove.
+    func testTheRedialBudgetFitsInsideTheStatusDeadline() {
+        let spent = Double(WebSocketTransport.redialBudget) * WebSocketTransport.redialBackoff
+        XCTAssertLessThan(spent, WebSocketTransport.statusDeadline)
+        XCTAssertGreaterThan(WebSocketTransport.redialBudget, 1)
+    }
+
+    /// The Worker matches a redial to a live relay socket by this id alone. If
+    /// it ever varied per attempt, every reattach would silently become a fresh
+    /// relay connection and a full OpenVPN renegotiation — the thing that was
+    /// happening every few seconds before.
+    func testTheSessionIdIsStableAcrossRedials() {
+        let transport = WebSocketTransport(token: "t", host: "203.0.113.1", port: 443,
+                                           appGroup: "sweep.test.\(UUID().uuidString)")
+        let session = UUID().uuidString
+        let first = transport.tunnelPath(session: session)
+        let second = transport.tunnelPath(session: session)
+        XCTAssertEqual(first, second)
+        XCTAssertTrue(first.contains("s=\(session)"), first)
+    }
+
     func testRelayAnswersThroughTheWorkerTunnel() throws {
         let token = ProcessInfo.processInfo.environment["SWEEP_TUNNEL_TOKEN"] ?? ""
         try XCTSkipIf(token.isEmpty, "set SWEEP_TUNNEL_TOKEN to run the live tunnel test")

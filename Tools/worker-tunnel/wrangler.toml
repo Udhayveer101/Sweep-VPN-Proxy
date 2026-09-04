@@ -1,3 +1,15 @@
 name = "sweep-relay-mirror"
 main = "worker.js"
 compatibility_date = "2026-09-01"
+
+# The relay leg lives in a Durable Object so its socket outlives the request
+# that opened it — and outlives the client's connection, which is what lets a
+# dropped client leg re-attach instead of renegotiating OpenVPN.
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "RelaySession"
+
+# SQLite-backed classes are the ones available on the Workers Free plan.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelaySession"]
