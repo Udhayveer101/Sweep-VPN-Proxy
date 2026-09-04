@@ -78,7 +78,10 @@ public final class WebSocketTransport: @unchecked Sendable {
         let ready = DispatchSemaphore(value: 0)
         listener.stateUpdateHandler = { state in
             if case .ready = state { ready.signal() }
-            if case .failed = state { ready.signal() }
+            if case .failed(let error) = state {
+                Diagnostics.shared.record("wssListenerFailed", "\(error)")
+                ready.signal()
+            }
         }
         listener.start(queue: queue)
         _ = ready.wait(timeout: .now() + 5)
@@ -108,6 +111,10 @@ public final class WebSocketTransport: @unchecked Sendable {
     }
 
     private func bridge(_ connection: NWConnection) {
+        // Proves the core actually dialled loopback. Its absence next to a
+        // `relayTunnelUp` means the bytes never left OpenVPN towards us, which
+        // is a different bug from anything on the Worker leg.
+        Diagnostics.shared.record("wssDialled")
         guard let url = tunnelURL() else { connection.cancel(); return }
         let task = session.webSocketTask(with: url)
         task.resume()

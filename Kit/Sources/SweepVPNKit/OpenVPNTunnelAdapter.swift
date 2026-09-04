@@ -134,8 +134,10 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         }
         guard inserted else {
             Self.log.error("profile carried no `remote` line — connecting directly")
+            Diagnostics.shared.record("relayTunnelUnrewritten", "no remote line — DIRECT")
             return profile
         }
+        Diagnostics.shared.record("relayTunnelRewritten", "remote 127.0.0.1:\(localPort)")
         return rewritten.joined(separator: "\n")
     }
 
