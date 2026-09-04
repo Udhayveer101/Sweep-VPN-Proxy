@@ -16,15 +16,23 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         public var onInbound: @Sendable ([Data], [NSNumber]) -> Void
         public var onExhausted: @Sendable (TunnelErrorKind) -> Void
         public var onEvent: @Sendable (String, String) -> Void
+        /// How long a relay actually carried the tunnel before it dropped.
+        /// Ordering the pool by this is the difference between redialling the
+        /// relay that just died at ten seconds and picking the one that held
+        /// five minutes.
+        public var onRelayLifetime: @Sendable (ServerID, TimeInterval) -> Void
 
         public init(onAuthenticated: @escaping @Sendable (TunnelAdapter, Server) -> Void,
                     onInbound: @escaping @Sendable ([Data], [NSNumber]) -> Void,
                     onExhausted: @escaping @Sendable (TunnelErrorKind) -> Void,
-                    onEvent: @escaping @Sendable (String, String) -> Void = { _, _ in }) {
+                    onEvent: @escaping @Sendable (String, String) -> Void = { _, _ in },
+                    onRelayLifetime: @escaping @Sendable (ServerID, TimeInterval) -> Void
+                        = { _, _ in }) {
             self.onAuthenticated = onAuthenticated
             self.onInbound = onInbound
             self.onExhausted = onExhausted
             self.onEvent = onEvent
+            self.onRelayLifetime = onRelayLifetime
         }
     }
 
@@ -58,6 +66,9 @@ public final class ConnectionCoordinator: @unchecked Sendable {
     private var racing: [ProtocolRung: TunnelAdapter] = [:]
     private var winner: TunnelAdapter?
     private var server: Server?
+    /// When the live tunnel started carrying traffic, so its length can be
+    /// charged to the relay when it ends.
+    private var winnerSince: Date?
     private var raceDeadline: DispatchWorkItem?
 
     /// What the coordinator learned about this network, for the caller to persist.
@@ -201,6 +212,7 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         // rather than leaving it top of the pool to be redialled.
         dialling = [rung: server]
         sweeps = 0
+        winnerSince = Date()
         callbacks.onEvent("rungWon", rung.shortName)
         callbacks.onAuthenticated(adapter, server)
     }
@@ -208,7 +220,16 @@ public final class ConnectionCoordinator: @unchecked Sendable {
     private func rungFailed(_ rung: ProtocolRung) {
         // Whichever relay this rung was on has just proved it cannot carry the
         // tunnel right now. Charge the failure to it, not to the protocol.
-        if let host = dialling.removeValue(forKey: rung) { burned.insert(host.id) }
+        let dropped = dialling.removeValue(forKey: rung)
+        if let dropped { burned.insert(dropped.id) }
+        // A relay that was carrying the tunnel has just told us, by dying, how
+        // long it was good for. A relay that never got there scores zero, which
+        // is the honest number.
+        if let dropped, winner?.rung == rung || winner == nil {
+            let lasted = winnerSince.map { Date().timeIntervalSince($0) } ?? 0
+            if winner?.rung == rung { winnerSince = nil }
+            callbacks.onRelayLifetime(dropped.id, lasted)
+        }
 
         guard winner == nil else {
             // The live tunnel died. Hand over to another relay rather than

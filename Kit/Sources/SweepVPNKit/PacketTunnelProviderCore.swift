@@ -76,6 +76,9 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// Where the user's chosen public relay is kept, if the platform target
     /// supports the OpenVPN rungs.
     open var relayStore: RelaySelectionStore? { nil }
+    /// How long each relay has held a tunnel, folded into `Server.reliability`
+    /// so the pool is ordered by what survives rather than only by what is fast.
+    open var relayStabilityStore: RelayStabilityStore? { RelayStabilityStore(appGroup: appGroup) }
     /// The shared app group, for the settings that live outside the keychain.
     open var appGroup: String { AppGroupID.resolved }
 
@@ -161,7 +164,8 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         // rather than racing a ladder the relay is not part of.
         // The whole pool, not just the pin: a relay that drops mid-session has
         // to have somewhere to hand over to, or the tunnel dies with it.
-        let relayPool = relayStore?.loadAll() ?? []
+        let relayPool = relayStabilityStore
+            .map { $0.applied(to: relayStore?.loadAll() ?? []) } ?? (relayStore?.loadAll() ?? [])
         let relay = relayPool.first
         let bundle = try store.loadBundle()
         guard bundle != nil || relay != nil else { throw ConfigError.noServers }
@@ -234,6 +238,9 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
                 },
                 onEvent: { [weak self] kind, detail in
                     self?.diagnostics.record(kind, detail)
+                },
+                onRelayLifetime: { [weak self] id, seconds in
+                    self?.relayStabilityStore?.record(id, lasted: seconds)
                 }))
         self.coordinator = coordinator
 

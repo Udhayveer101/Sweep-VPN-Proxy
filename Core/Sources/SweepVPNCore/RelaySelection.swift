@@ -78,3 +78,69 @@ public struct RelaySelectionStore: Sendable {
         defaults?.removeObject(forKey: poolKey)
     }
 }
+
+/// How long each relay has actually held a tunnel, so the pool can be ordered
+/// by the thing that matters rather than only by how fast it answers a ping.
+///
+/// `Server.reliability` has been in the score since the beginning
+/// (`ServerScoring.score`, weight 0.6) and described as an "on-device rolling
+/// measure", but nothing ever wrote it — every relay sat at the default 1 and
+/// the term did nothing. This is what writes it. A VPN Gate relay is a
+/// volunteer's machine: two relays with identical RTT are not remotely
+/// equivalent if one holds five minutes and the other drops at ten seconds, and
+/// RTT cannot tell them apart.
+public struct RelayStabilityStore: Sendable {
+    private let suiteName: String?
+    private let key = "sweep.relayStability"
+
+    public init(appGroup: String) { self.suiteName = appGroup }
+    public init(suiteName: String?) { self.suiteName = suiteName }
+
+    private var defaults: UserDefaults? { suiteName.flatMap { UserDefaults(suiteName: $0) } }
+
+    /// A relay that holds this long is as good as the measure can say. Chosen
+    /// against the measured lifetimes: the volunteer relays that were dying in
+    /// one to ten minutes should spread across the range, not all pin at 1.
+    public static let idealSeconds: Double = 300
+
+    /// Weight on the newest sample. High, because a relay's behaviour today
+    /// says much more than what it did an hour ago.
+    private static let alpha = 0.4
+
+    public func loadAll() -> [String: Double] {
+        (defaults?.dictionary(forKey: key) as? [String: Double]) ?? [:]
+    }
+
+    /// Fold one observed session length into the relay's rolling average.
+    public func record(_ id: String, lasted seconds: Double) {
+        guard let defaults, seconds.isFinite, seconds >= 0 else { return }
+        var all = loadAll()
+        let previous = all[id]
+        all[id] = previous.map { $0 + Self.alpha * (seconds - $0) } ?? seconds
+        // Unbounded growth here would be a slow leak in a shared suite; the pool
+        // is sixteen and the list churns, so keep it near that order.
+        if all.count > 64, let oldestWeakest = all.min(by: { $0.value < $1.value })?.key {
+            all.removeValue(forKey: oldestWeakest)
+        }
+        defaults.set(all, forKey: key)
+    }
+
+    /// 0…1 for the score. Unmeasured relays stay at 1 — optimism is right for a
+    /// relay nobody has tried, and the first session it drops corrects it.
+    public func reliability(for id: String) -> Double {
+        guard let seconds = loadAll()[id] else { return 1 }
+        return min(1, max(0, seconds / Self.idealSeconds))
+    }
+
+    /// The pool with `reliability` filled in, ready for `ServerCatalog`.
+    public func applied(to servers: [Server]) -> [Server] {
+        let all = loadAll()
+        guard !all.isEmpty else { return servers }
+        return servers.map { server in
+            guard let seconds = all[server.id] else { return server }
+            var copy = server
+            copy.reliability = min(1, max(0, seconds / Self.idealSeconds))
+            return copy
+        }
+    }
+}

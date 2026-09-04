@@ -35,6 +35,11 @@ public enum VPNGate {
         /// Advertised line speed in bits/sec.
         public var speedBps: Double?
         public var sessions: Int?
+        /// How long the relay has been up, as the operator's own daemon reports
+        /// it (milliseconds). A weak signal, but the only one about *durability*
+        /// the list carries at all, and durability is what a volunteer relay is
+        /// short of.
+        public var uptimeMs: Double?
         /// Operator's own declaration of what they retain. Free text, and
         /// unverifiable — shown to the user as the operator's claim, not as
         /// a fact.
@@ -106,6 +111,7 @@ public enum VPNGate {
             advertisedPingMs: field("Ping").flatMap(Double.init),
             speedBps: field("Speed").flatMap(Double.init),
             sessions: field("NumVpnSessions").flatMap(Int.init),
+            uptimeMs: field("Uptime").flatMap(Double.init),
             logType: field("LogType"),
             operatorName: field("Operator"),
             openVPNProfile: profile,
@@ -171,6 +177,12 @@ public enum VPNGate {
         let speedCeiling = 1_000_000_000.0
         return relays.map { r in
             let normalizedSpeed = min((r.speedBps ?? 0) / speedCeiling, 1)
+            // A relay that has been up six hours has shown more than one that
+            // appeared ten minutes ago. Deliberately a nudge, floored at 0.5 so
+            // it can never outweigh a measured RTT — and it is replaced outright
+            // by `RelayStabilityStore` as soon as we have held a session on it.
+            let uptimeHours = (r.uptimeMs ?? 0) / 3_600_000
+            let seededReliability = max(0.5, min(1, uptimeHours / 6))
             let endpoint = ServerEndpoint(host: r.ip, port: r.port, rung: r.proto.rung,
                                           openVPNProfile: r.openVPNProfile)
             return Server(
@@ -186,6 +198,7 @@ public enum VPNGate {
                 dnsServers: [],
                 ipv4Address: "",
                 load: 1 - normalizedSpeed,
+                reliability: seededReliability,
                 requiresAccount: false,
                 provider: r.operatorName,
                 cityName: r.countryName,
