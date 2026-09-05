@@ -252,20 +252,41 @@ export class RelaySession {
         const bytes = value.buffer.byteLength === value.byteLength
           ? value.buffer
           : value.slice().buffer;
-        if (this.ws && this.ws.readyState === 1) {
-          this.ws.send(bytes);
-        } else if (!this.park_overflowed(bytes.byteLength)) {
-          this.parked.push(bytes);
-        } else {
-          break;
-        }
+        // A client leg that is on its way out still reports readyState 1, and
+        // the send then throws. That throw used to escape into the loop's catch
+        // and take `finally` -> destroy() with it, so a *client* blip killed the
+        // relay's TCP session — the one thing this object exists to keep. The
+        // field signature was exact: the client redials, re-attaches, and is
+        // handed `1000 "eof"` a fraction of a second later, costing a full
+        // OpenVPN renegotiation every few seconds. A failed send is a leg that
+        // is gone, which is what `parked` is for.
+        if (!this.sendOrPark(bytes)) break;
       }
     } catch {
-      // fall through
+      // fall through: the relay itself ended or errored
     } finally {
       try { this.ws?.close(1000, "eof"); } catch {}
       this.destroy();
     }
+  }
+
+  /// Relay bytes to the client if a leg is up, else hold them for the redial.
+  /// False only when the hold-buffer is full, which is the one case where
+  /// giving up beats waiting.
+  sendOrPark(bytes) {
+    if (this.ws && this.ws.readyState === 1) {
+      try {
+        this.ws.send(bytes);
+        return true;
+      } catch {
+        // The leg is gone but its close event has not landed yet. Drop it here
+        // so nothing else tries to use it, and park this chunk with the rest.
+        this.park(this.ws);
+      }
+    }
+    if (this.park_overflowed(bytes.byteLength)) return false;
+    this.parked.push(bytes);
+    return true;
   }
 
   park_overflowed(n) {
@@ -273,11 +294,19 @@ export class RelaySession {
     return this.parkedBytes > RelaySession.maxParkedBytes;
   }
 
+  /// Hand the client everything the relay said while it was away, oldest
+  /// first. Bytes are dropped from the queue only once they are actually on
+  /// the wire: the old version cleared nothing on a mid-flush throw, so the
+  /// chunks it *had* sent were replayed on the next attach — a duplicated span
+  /// inside an OpenVPN stream, which the peer answers with NETWORK_EOF_ERROR
+  /// or AUTH_FAILED rather than anything that names the real cause.
   flushParked() {
-    for (const b of this.parked) {
+    while (this.parked.length) {
+      const b = this.parked[0];
       try { this.ws.send(b); } catch { return; }
+      this.parked.shift();
+      this.parkedBytes -= b.byteLength;
     }
-    this.parked.length = 0;
     this.parkedBytes = 0;
   }
 

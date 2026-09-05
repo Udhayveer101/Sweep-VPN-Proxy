@@ -96,6 +96,26 @@ final class RelayHandoverTests: XCTestCase {
         XCTAssertEqual(c.activeServer?.id, ServerID("good"))
     }
 
+    /// Every relay authenticates and then dies seconds later — the exact shape
+    /// of the field log, where the ladder handed over roughly every five
+    /// seconds and printed `1/14 relays burned` on every single line. Clearing
+    /// the burn ledger on the *win* meant nothing ever accumulated, so the pool
+    /// was never exhausted, `maxSweeps` never engaged, and the loop had no
+    /// bottom. A relay that dies this fast must stay burned.
+    func testRelaysThatDieRightAfterAuthenticatingStillExhaustThePool() {
+        let pool = [relay("a"), relay("b"), relay("c")]
+        let log = DialLog()
+        let gaveUp = expectation(description: "the pool is exhausted rather than cycled forever")
+        let c = coordinator(
+            pool: pool,
+            behaviour: { _ in .authenticateThenDrop(after: 0.02, dropAfter: 0.05) },
+            dialled: log,
+            onExhausted: { _ in gaveUp.fulfill() })
+        c.start(signals: NetworkSignals())
+        wait(for: [gaveUp], timeout: 20)
+        _ = c
+    }
+
     /// The pool is swept a bounded number of times: a network where nothing
     /// works still fails closed rather than spinning on dead relays forever.
     func testAPoolThatNeverWorksStillFailsClosed() {

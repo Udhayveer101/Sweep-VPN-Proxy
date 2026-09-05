@@ -204,18 +204,28 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         if rung.looksLikeWeb, failed.contains(where: { !$0.looksLikeWeb }) {
             updatedMemory.noteHostile(now: now)
         }
-        // A relay that authenticated resets the ledger: the next drop gets the
-        // full pool again rather than whatever was left over from this connect.
-        burned.removeAll()
+        // Deliberately *not* clearing the burn ledger here. Authenticating is
+        // cheap — a VPN Gate relay that is about to drop the tunnel four
+        // seconds later authenticates just as readily as one that will carry it
+        // for an hour — so clearing on the win meant every handover reset the
+        // count to zero. The field log is unambiguous: `1/14 relays burned`, on
+        // every line, forever. Nothing ever accumulated, so the pool kept
+        // re-serving relays that had already failed, `maxSweeps` never engaged
+        // and the ladder never descended. The ledger is cleared in `rungFailed`
+        // instead, and only for a relay that actually held the tunnel.
         // Keep the winner's relay on the ledger, not clear it: this is the
         // entry that lets a later drop be charged to the relay that dropped us
         // rather than leaving it top of the pool to be redialled.
         dialling = [rung: server]
-        sweeps = 0
         winnerSince = Date()
         callbacks.onEvent("rungWon", rung.shortName)
         callbacks.onAuthenticated(adapter, server)
     }
+
+    /// How long a relay has to hold the tunnel before its eventual drop counts
+    /// as churn rather than as a failure. Comfortably above the few seconds a
+    /// dud survives, comfortably below the minutes a working one manages.
+    static let healthyRelaySeconds: TimeInterval = 45
 
     private func rungFailed(_ rung: ProtocolRung) {
         // Whichever relay this rung was on has just proved it cannot carry the
@@ -229,6 +239,15 @@ public final class ConnectionCoordinator: @unchecked Sendable {
             let lasted = winnerSince.map { Date().timeIntervalSince($0) } ?? 0
             if winner?.rung == rung { winnerSince = nil }
             callbacks.onRelayLifetime(dropped.id, lasted)
+            // A relay that carried the tunnel for a real span and then dropped
+            // is ordinary churn, and the pool deserves a clean slate. One that
+            // died within seconds of authenticating proved nothing, and letting
+            // it clear the ledger is what kept the pool cycling through known-
+            // dead relays instead of exhausting them and recycling honestly.
+            if lasted >= Self.healthyRelaySeconds {
+                burned = [dropped.id]
+                sweeps = 0
+            }
         }
 
         guard winner == nil else {
