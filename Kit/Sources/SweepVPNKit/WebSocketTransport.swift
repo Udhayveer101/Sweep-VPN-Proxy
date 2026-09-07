@@ -196,6 +196,14 @@ public final class WebSocketTransport: @unchecked Sendable {
         /// matches a redial against.
         let session = UUID().uuidString
         var socket: MinimalWebSocket?
+        /// Which dial attempt is current. Every callback carries the generation
+        /// it was armed by, so the ones belonging to an attempt we have already
+        /// moved on from cannot fire a second failure for the same event —
+        /// which is exactly what a dropped leg used to do: the socket's error
+        /// callback asked for a redial and `NWConnection`'s `.failed` burned the
+        /// relay a moment later, so the redial never ran and every blip cost a
+        /// relay.
+        var generation = 0
         var attempts = 0
         var pumping = false
         var closed = false
@@ -214,6 +222,24 @@ public final class WebSocketTransport: @unchecked Sendable {
     static let redialBudget = 4
     static let redialBackoff: TimeInterval = 0.15
 
+    /// What a leg ending means for the relay behind it.
+    enum Disposition: Equatable {
+        /// Our leg to the Worker died. The relay's session is still parked in
+        /// the Durable Object, so redialling resumes it and OpenVPN sees nothing.
+        case ourLeg
+        /// The Worker is telling us about the relay: it hung up (1000 "eof") or
+        /// the Worker will not carry it (1008). Redialling cannot change that.
+        case relayGone
+    }
+
+    /// A close frame carries the Worker's verdict; its absence — including the
+    /// synthetic 1006 an abnormal end is reported as, and a bare transport
+    /// error — means our own leg dropped.
+    static func disposition(closeCode: Int?) -> Disposition {
+        guard let closeCode, closeCode != 1006 else { return .ourLeg }
+        return .relayGone
+    }
+
     private func bridge(_ connection: NWConnection) {
         // Proves the core actually dialled loopback. Its absence next to a
         // `relayTunnelUp` means the bytes never left OpenVPN towards us, which
@@ -226,6 +252,8 @@ public final class WebSocketTransport: @unchecked Sendable {
 
     private func dial(_ leg: Leg) {
         guard !leg.closed else { return }
+        leg.generation += 1
+        let generation = leg.generation
         guard let worker = workerConnection(), let name = workerURL.host else {
             // No resolved Worker address means this relay cannot be dialled at
             // all. Cancelling in silence left OpenVPN 3 staring at a loopback
@@ -249,15 +277,28 @@ public final class WebSocketTransport: @unchecked Sendable {
                         // different fixes, so the reason is recorded rather
                         // than inferred later.
                         Diagnostics.shared.record("wssHandshakeFailed", "\(error)")
-                        self.giveUp(leg, worker)
+                        // An HTTP answer we did not want is the Worker's
+                        // decision and will be the same next time; anything
+                        // else is transport, and transport is what redialling
+                        // is for.
+                        if case MinimalWebSocket.WebSocketError.handshakeFailed = error {
+                            self.giveUp(leg, worker)
+                        } else {
+                            self.legFailed(leg, worker, generation)
+                        }
                         return
                     }
                     Diagnostics.shared.record("wssUpgraded")
-                    self.awaitStatus(socket, worker, leg)
+                    self.awaitStatus(socket, worker, leg, generation)
                 }
             case .failed(let error):
+                // Our socket to the Worker, not the relay. `POSIXErrorCode 60`
+                // here is a path that went away under a live session, and the
+                // relay on the other side of the Durable Object is still there
+                // — burning it, as this used to, threw away a good relay and
+                // made OpenVPN renegotiate for a fault it never saw.
                 Diagnostics.shared.record("wssFailed", "\(error)")
-                self.giveUp(leg, worker)
+                self.legFailed(leg, worker, generation)
             case .waiting(let error):
                 // Not fatal on its own, but on this network it is how a blocked
                 // path presents, and it is the state URLSession never surfaced.
@@ -278,7 +319,7 @@ public final class WebSocketTransport: @unchecked Sendable {
             Diagnostics.shared.record(
                 "wssStalled",
                 "no response from the Worker in \(Int(Self.readyDeadline))s (state: \(worker.state))")
-            self.giveUp(leg, worker)
+            self.legFailed(leg, worker, generation)
         }
     }
 
@@ -298,7 +339,20 @@ public final class WebSocketTransport: @unchecked Sendable {
     /// RESOLVE, WAIT, CONNECTING, GET_CONFIG, ASSIGN_IP, and about two seconds
     /// of dead internet, every few seconds in the field log — now costs a
     /// reconnect the core never sees.
+    /// This attempt's leg to the Worker failed. Redial it; the relay is not at
+    /// fault and must not be burned until the redials are exhausted.
+    ///
+    /// The generation check is what makes this idempotent: a leg drop is
+    /// reported twice — once by the socket, once by `NWConnection`'s state — and
+    /// acting on both meant scheduling a redial and then tearing the leg down
+    /// before it could run.
+    private func legFailed(_ leg: Leg, _ worker: NWConnection?, _ generation: Int) {
+        guard leg.generation == generation, !leg.closed else { return }
+        redial(leg, worker)
+    }
+
     private func redial(_ leg: Leg, _ worker: NWConnection?) {
+        leg.socket?.stopKeepalive()
         worker?.cancel()
         leg.socket = nil
         guard !leg.closed else { return }
@@ -310,13 +364,18 @@ public final class WebSocketTransport: @unchecked Sendable {
             return
         }
         leg.attempts += 1
-        queue.asyncAfter(deadline: .now() + Self.redialBackoff) { [weak self] in
+        // Backing off geometrically keeps a four-attempt budget inside OpenVPN
+        // 3's own ten-second retry (0.15 + 0.3 + 0.6 + 1.2 s) while still
+        // giving a path that is merely re-routing time to come back.
+        let delay = Self.redialBackoff * pow(2, Double(leg.attempts - 1))
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             self?.dial(leg)
         }
     }
 
     private func tearDown(_ leg: Leg, _ worker: NWConnection?) {
         leg.closed = true
+        leg.socket?.stopKeepalive()
         leg.outbound.removeAll()
         worker?.cancel()
         leg.connection.cancel()
@@ -332,7 +391,8 @@ public final class WebSocketTransport: @unchecked Sendable {
     /// The Worker's first frame is a one-byte status: 0x01 connected. Nothing
     /// may be forwarded before it, or the relay sees our handshake interleaved
     /// with a connection that does not exist.
-    private func awaitStatus(_ socket: MinimalWebSocket, _ worker: NWConnection, _ leg: Leg) {
+    private func awaitStatus(_ socket: MinimalWebSocket, _ worker: NWConnection, _ leg: Leg,
+                             _ generation: Int) {
         let seenStatus = OSAllocatedUnfairLock(initialState: false)
         let openedAt = Date()
 
@@ -370,6 +430,20 @@ public final class WebSocketTransport: @unchecked Sendable {
                         "the relay session survived the drop; OpenVPN never saw it")
                 }
                 leg.socket = socket
+                // The status deadline is not cancelled here: it already
+                // no-ops once `seenStatus` is set, and a `DispatchWorkItem` is
+                // not `Sendable` to capture in this callback.
+                // A leg that goes quiet is the failure this transport could not
+                // see: nothing else here notices until the kernel gives up on
+                // its retransmissions, a minute or more later, with the tunnel
+                // dead throughout.
+                socket.startKeepalive(on: self.queue) { [weak self] in
+                    guard let self else { return }
+                    Diagnostics.shared.record(
+                        "wssIdle",
+                        "no byte from the Worker in \(Int(MinimalWebSocket.idleDeadline))s; redialling")
+                    self.legFailed(leg, worker, generation)
+                }
                 // Anything OpenVPN sent while the leg was down goes first, in
                 // order, or the relay sees a hole in its stream.
                 for pending in leg.outbound { socket.send(pending) }
@@ -405,14 +479,15 @@ public final class WebSocketTransport: @unchecked Sendable {
             // only the coordinator can move off it. A stream that ends with no
             // close frame is the opposite case: our leg, and redialling it is
             // the whole point.
-            if let code = socket.closeCode, code != 1006 {
+            if Self.disposition(closeCode: socket.closeCode) == .relayGone {
                 Diagnostics.shared.record(
                     "wssRelayFinished",
-                    "the Worker closed \(code); handing over rather than redialling a relay that is gone")
+                    "the Worker closed \(socket.closeCode.map(String.init) ?? "?"); "
+                        + "handing over rather than redialling a relay that is gone")
                 self.giveUp(leg, worker)
                 return
             }
-            self.redial(leg, worker)
+            self.legFailed(leg, worker, generation)
         })
     }
 

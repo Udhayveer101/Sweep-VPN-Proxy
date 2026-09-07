@@ -1,5 +1,6 @@
 #if os(macOS)
 import XCTest
+import Network
 @testable import SweepVPNKit
 
 /// The framer is hand-written, so the frame parser gets the one check that
@@ -51,6 +52,48 @@ final class MinimalWebSocketTests: XCTestCase {
         XCTAssertEqual(MinimalWebSocket.rangeOfHeaderTerminator(in: crlf)?.upperBound, 18)
         let lf = Data("HTTP/1.1 101 x\n\nAB".utf8)
         XCTAssertEqual(MinimalWebSocket.rangeOfHeaderTerminator(in: lf)?.upperBound, 16)
+    }
+
+    // MARK: - Liveness
+
+    /// The failure this exists for: the leg's path goes away, nothing arrives,
+    /// and before the keepalive the only thing that noticed was the kernel's
+    /// retransmission timer a minute later.
+    func testAQuietLegIsDeclaredDead() {
+        let queue = DispatchQueue(label: "test.ws.keepalive")
+        // Nothing listens on discard here, so nothing will ever arrive — which
+        // is the case under test.
+        let connection = NWConnection(host: .ipv4(.loopback), port: 9, using: .tcp)
+        let socket = MinimalWebSocket(connection: connection, host: "example", path: "/")
+        let dead = expectation(description: "reported dead")
+        socket.startKeepalive(on: queue, interval: 0.05, idleAfter: 0.2) { dead.fulfill() }
+        wait(for: [dead], timeout: 2)
+        socket.stopKeepalive()
+        connection.cancel()
+    }
+
+    func testAStoppedKeepaliveStaysQuiet() {
+        let queue = DispatchQueue(label: "test.ws.keepalive.stop")
+        let connection = NWConnection(host: .ipv4(.loopback), port: 9, using: .tcp)
+        let socket = MinimalWebSocket(connection: connection, host: "example", path: "/")
+        let fired = expectation(description: "must not fire")
+        fired.isInverted = true
+        socket.startKeepalive(on: queue, interval: 0.05, idleAfter: 0.1) { fired.fulfill() }
+        socket.stopKeepalive()
+        wait(for: [fired], timeout: 0.5)
+        connection.cancel()
+    }
+
+    // MARK: - Whose failure it was
+
+    /// A close frame is the Worker's verdict on the relay; its absence is our
+    /// own leg dropping. Treating the second as the first is what burned a good
+    /// relay on every network blip.
+    func testCloseCodeDecidesWhetherTheRelayIsGone() {
+        XCTAssertEqual(WebSocketTransport.disposition(closeCode: 1000), .relayGone)
+        XCTAssertEqual(WebSocketTransport.disposition(closeCode: 1008), .relayGone)
+        XCTAssertEqual(WebSocketTransport.disposition(closeCode: 1006), .ourLeg)
+        XCTAssertEqual(WebSocketTransport.disposition(closeCode: nil), .ourLeg)
     }
 }
 #endif

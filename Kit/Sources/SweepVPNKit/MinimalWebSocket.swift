@@ -1,6 +1,7 @@
 #if os(macOS)
 import Foundation
 import Network
+import os
 import SweepVPNCore
 
 /// A WebSocket client written out by hand, over a plain TLS connection.
@@ -58,6 +59,26 @@ final class MinimalWebSocket: @unchecked Sendable {
     private var fragment = Data()
     /// Response bytes read during the upgrade, before framing starts.
     private var handshakeBuffer = Data()
+
+    /// When anything last arrived from the peer — relay bytes or a pong.
+    private let activity = OSAllocatedUnfairLock(initialState: Date())
+    private var keepalive: DispatchSourceTimer?
+
+    /// Ping cadence. Well inside every NAT idle timeout worth naming, and
+    /// cheap: two frames a minute per leg.
+    static let pingInterval: TimeInterval = 15
+    /// No inbound byte at all for this long means the leg is dead however
+    /// healthy the socket still claims to be.
+    ///
+    /// The guarantee this leans on is OpenVPN's, not the Worker's: the relay
+    /// pushes `keepalive`, so a live session puts a PING on this leg every ten
+    /// seconds or so and forty is four missed ones. Whether Cloudflare answers
+    /// our ping frames with a pong is therefore not load-bearing — the ping is
+    /// there to keep a NAT mapping warm, and a pong, if one comes, is one more
+    /// thing that refreshes the clock. Being wrong here is cheap in any case: a
+    /// redial re-attaches to the same relay session inside the Durable Object,
+    /// which OpenVPN does not see.
+    static let idleDeadline: TimeInterval = 40
 
     init(connection: NWConnection, host: String, path: String) {
         self.connection = connection
@@ -125,6 +146,48 @@ final class MinimalWebSocket: @unchecked Sendable {
         return data.range(of: Data("\n\n".utf8))
     }
 
+    // MARK: - Liveness
+
+    /// Ping the peer on a timer, and report the leg dead when nothing has come
+    /// back for `idleDeadline`.
+    ///
+    /// Without this the only thing that noticed a Worker leg whose path had
+    /// gone away was the kernel's retransmission timer, which reports
+    /// `ETIMEDOUT` after a minute or more — measured in the field as
+    /// `POSIXErrorCode 60` arriving long after the tunnel had stopped carrying
+    /// traffic. A ping every fifteen seconds turns that into a bounded, honest
+    /// detection that the redial path can actually act on.
+    /// The intervals are parameters only so the timing can be driven in a test;
+    /// nothing in the app passes anything but the defaults.
+    func startKeepalive(on queue: DispatchQueue,
+                        interval: TimeInterval = MinimalWebSocket.pingInterval,
+                        idleAfter: TimeInterval = MinimalWebSocket.idleDeadline,
+                        onDead: @escaping @Sendable () -> Void) {
+        guard keepalive == nil else { return }
+        activity.withLock { $0 = Date() }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + interval, repeating: interval,
+                       leeway: .milliseconds(10))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let idle = Date().timeIntervalSince(self.activity.withLock { $0 })
+            if idle >= idleAfter {
+                self.stopKeepalive()
+                onDead()
+                return
+            }
+            self.connection.send(content: Self.frame(Data(), opcode: 0x9),
+                                 completion: .contentProcessed { _ in })
+        }
+        timer.resume()
+        keepalive = timer
+    }
+
+    func stopKeepalive() {
+        keepalive?.cancel()
+        keepalive = nil
+    }
+
     // MARK: - Sending
 
     /// One unfragmented binary frame. Client frames are always masked.
@@ -187,9 +250,12 @@ final class MinimalWebSocket: @unchecked Sendable {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
             [weak self] data, _, isComplete, error in
             guard let self else { return }
-            if let error { onClose(error); return }
-            if let data { self.inbound.append(contentsOf: data) }
-            if isComplete && data == nil { onClose(nil); return }
+            if let error { self.stopKeepalive(); onClose(error); return }
+            if let data {
+                self.activity.withLock { $0 = Date() }
+                self.inbound.append(contentsOf: data)
+            }
+            if isComplete && data == nil { self.stopKeepalive(); onClose(nil); return }
             self.receive(onMessage: onMessage, onClose: onClose)
         }
     }
@@ -234,6 +300,7 @@ final class MinimalWebSocket: @unchecked Sendable {
                 } else {
                     closeSummary = "close, no code"
                 }
+                stopKeepalive()
                 onClose(nil)
                 return true
             case 0x9:

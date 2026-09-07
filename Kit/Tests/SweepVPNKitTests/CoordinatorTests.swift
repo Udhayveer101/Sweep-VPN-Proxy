@@ -11,6 +11,9 @@ final class FakeAdapter: TunnelAdapter, @unchecked Sendable {
         case hang
         /// Comes up, then loses the peer — the live-tunnel-drop case.
         case authenticateThenDrop(after: TimeInterval, dropAfter: TimeInterval)
+        /// Comes up, then the relay refuses it — VPN Gate's answer to a
+        /// re-auth on a machine that has just dropped you.
+        case authenticateThenReject(after: TimeInterval, dropAfter: TimeInterval)
     }
 
     let rung: ProtocolRung
@@ -47,6 +50,14 @@ final class FakeAdapter: TunnelAdapter, @unchecked Sendable {
                 onAuthenticated()
                 DispatchQueue.global().asyncAfter(deadline: .now() + dropDelay) {
                     onFailure(.allRungsFailed)
+                }
+            }
+        case .authenticateThenReject(let delay, let dropDelay):
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                guard !self.stopped else { return }
+                onAuthenticated()
+                DispatchQueue.global().asyncAfter(deadline: .now() + dropDelay) {
+                    onFailure(.authenticationFailed)
                 }
             }
         }
@@ -304,7 +315,38 @@ extension ConnectionCoordinatorTests {
         coordinator.start(signals: NetworkSignals())
         wait(for: [authenticated], timeout: 5)
     }
+
+    /// The mirror of the test above: an AUTH_FAILED from the relay that was
+    /// carrying the tunnel is not worth the one same-relay redial, because VPN
+    /// Gate answers an immediate re-auth the same way every time. Spending it
+    /// there cost the ladder a rung and produced a second, identical failure.
+    func testAuthFailureDoesNotSpendTheSameRelayRedial() {
+        let exhausted = XCTestExpectation(description: "ladder ran out")
+        let attempts = Counter()
+        var constants = AutoModeConstants()
+        constants.raceStagger = 0.02
+        constants.raceDeadline = 1.0
+        constants.slowRungDeadline = 6.0
+        let engine = AutoModeEngine(constants: constants, preference: .forced(.openVPNTCP),
+                                    enabledRungs: [.openVPNTCP])
+        let coordinator = ConnectionCoordinator(
+            engine: engine, catalog: ServerCatalog(servers: [server()]), memory: .init(),
+            constants: constants,
+            build: { rung, _ in
+                _ = attempts.next()
+                return FakeAdapter(rung: rung,
+                                   behaviour: .authenticateThenReject(after: 0.05, dropAfter: 0.05))
+            },
+            callbacks: .init(onAuthenticated: { _, _ in },
+                             onInbound: { _, _ in },
+                             onExhausted: { _ in exhausted.fulfill() }))
+
+        coordinator.start(signals: NetworkSignals())
+        wait(for: [exhausted], timeout: 5)
+        XCTAssertEqual(attempts.next(), 1, "the refused relay must not be redialled")
+    }
 }
+
 
 final class Counter: @unchecked Sendable {
     private var value = 0

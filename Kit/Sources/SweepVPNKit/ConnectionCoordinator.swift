@@ -176,8 +176,8 @@ public final class ConnectionCoordinator: @unchecked Sendable {
                     guard let self, self.winner?.rung == rung else { return }
                     self.callbacks.onInbound(packets, protocols)
                 },
-                onFailure: { [weak self] _ in
-                    self?.queue.async { self?.rungFailed(rung) }
+                onFailure: { [weak self] kind in
+                    self?.queue.async { self?.rungFailed(rung, kind: kind) }
                 })
         } catch {
             callbacks.onEvent("rungUnavailable", rung.shortName)
@@ -227,7 +227,7 @@ public final class ConnectionCoordinator: @unchecked Sendable {
     /// dud survives, comfortably below the minutes a working one manages.
     static let healthyRelaySeconds: TimeInterval = 45
 
-    private func rungFailed(_ rung: ProtocolRung) {
+    private func rungFailed(_ rung: ProtocolRung, kind: TunnelErrorKind = .allRungsFailed) {
         // Whichever relay this rung was on has just proved it cannot carry the
         // tunnel right now. Charge the failure to it, not to the protocol.
         let dropped = dialling.removeValue(forKey: rung)
@@ -261,14 +261,14 @@ public final class ConnectionCoordinator: @unchecked Sendable {
                 winner = nil
                 server = nil
                 racing.removeValue(forKey: rung)
-                retryOrDescend(rung)
+                retryOrDescend(rung, kind: kind)
             }
             return
         }
         racing.removeValue(forKey: rung)?.stop()
         failed.insert(rung)
         callbacks.onEvent("rungFailed", rung.shortName)
-        if racing.isEmpty { retryOrDescend(rung) }
+        if racing.isEmpty { retryOrDescend(rung, kind: kind) }
     }
 
     /// Move this rung onto the next relay, or give up on it and walk the ladder.
@@ -278,12 +278,18 @@ public final class ConnectionCoordinator: @unchecked Sendable {
     /// the ladder behaves exactly as it did before pools existed — including
     /// leaving `attempted` intact, which is what the network memory reads to
     /// decide that this network blocks UDP.
-    private func retryOrDescend(_ rung: ProtocolRung) {
+    private func retryOrDescend(_ rung: ProtocolRung,
+                                kind: TunnelErrorKind = .allRungsFailed) {
         let carriers = catalog.ranked().map(\.0).filter { $0.supports(rung) }
         guard carriers.count > 1 else {
             // No pool. A rung that had a live tunnel gets the single redial it
             // has always had; anything else walks the ladder unchanged.
-            if winner == nil, retriedAfterLoss.insert(rung).inserted, hadLiveTunnel.contains(rung) {
+            // A relay that answered the redial with AUTH_FAILED will answer the
+            // next one the same way — VPN Gate refuses an immediate re-auth to
+            // the machine that just dropped you. Spending the one redial there
+            // costs the ladder a rung for nothing.
+            if winner == nil, kind != .authenticationFailed,
+               retriedAfterLoss.insert(rung).inserted, hadLiveTunnel.contains(rung) {
                 return retry(rung)
             }
             return descend(now: Date())
