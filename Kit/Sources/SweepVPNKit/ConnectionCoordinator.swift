@@ -52,6 +52,22 @@ public final class ConnectionCoordinator: @unchecked Sendable {
     /// The relay each racing rung is currently dialling, so a failure can be
     /// charged to the right one.
     private var dialling: [ProtocolRung: Server] = [:]
+    /// Which attempt for a rung is current.
+    ///
+    /// A retired adapter still speaks: `stop()` makes OpenVPN 3 emit
+    /// DISCONNECTED and tears the Worker leg down, and both route back here as
+    /// a failure — arriving *after* the replacement attempt has been armed.
+    /// Acting on that stale report re-entered `retryOrDescend`, so two callers
+    /// armed the same rung and two adapters started. `racing` is keyed by rung,
+    /// so the second one overwrote the first: the first was never stopped,
+    /// never stoppable, and spent the rest of the session dialling relays,
+    /// burning them and failing legs under a rung it no longer owned. That is
+    /// the duplicate `rungStarted`/`relayTunnelUp` pair, the stray `wssFailed`,
+    /// and the throughput collapse that followed it.
+    ///
+    /// Every callback carries the generation it was armed by and is ignored
+    /// unless it is still current, so a retired attempt cannot reach the ladder.
+    private var generation: [ProtocolRung: Int] = [:]
     /// Full sweeps of the relay pool since the last success. Bounded so a
     /// network where nothing works still fails closed instead of spinning.
     private var sweeps = 0
@@ -161,8 +177,22 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         return usable.first { !burned.contains($0.id) } ?? usable.first
     }
 
+    /// Retire the attempt on this rung: stop the adapter and invalidate its
+    /// callbacks. Every path that abandons an adapter goes through here, so
+    /// there is exactly one place that can leave one running.
+    @discardableResult
+    private func discard(_ rung: ProtocolRung) -> TunnelAdapter? {
+        generation[rung] = (generation[rung] ?? 0) + 1
+        let adapter = racing.removeValue(forKey: rung)
+        adapter?.stop()
+        return adapter
+    }
+
     private func startAdapter(for rung: ProtocolRung) {
         guard winner == nil else { return }
+        // One attempt per rung in flight. Without this, a second caller arming
+        // the same rung silently orphans the adapter already running on it.
+        guard racing[rung] == nil else { return }
         guard let host = nextServer(for: rung) else {
             callbacks.onEvent("rungSkipped", rung.shortName)
             queue.async { [weak self] in self?.rungFailed(rung) }
@@ -170,20 +200,30 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         }
         dialling[rung] = host
 
+        let generation = (self.generation[rung] ?? 0) + 1
+        self.generation[rung] = generation
+
         do {
             let adapter = try build(rung, host)
             racing[rung] = adapter
             callbacks.onEvent("rungStarted", rung.shortName)
             adapter.start(
                 onAuthenticated: { [weak self] in
-                    self?.queue.async { self?.commit(rung: rung, server: host) }
+                    self?.queue.async {
+                        guard let self, self.generation[rung] == generation else { return }
+                        self.commit(rung: rung, server: host)
+                    }
                 },
                 onInbound: { [weak self] packets, protocols in
-                    guard let self, self.winner?.rung == rung else { return }
+                    guard let self, self.winner?.rung == rung,
+                          self.generation[rung] == generation else { return }
                     self.callbacks.onInbound(packets, protocols)
                 },
                 onFailure: { [weak self] kind in
-                    self?.queue.async { self?.rungFailed(rung, kind: kind) }
+                    self?.queue.async {
+                        guard let self, self.generation[rung] == generation else { return }
+                        self.rungFailed(rung, kind: kind)
+                    }
                 })
         } catch {
             callbacks.onEvent("rungUnavailable", rung.shortName)
@@ -198,7 +238,7 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         raceDeadline?.cancel(); raceDeadline = nil
         winner = adapter
         self.server = server
-        for (other, loser) in racing where other != rung { loser.stop() }
+        for other in racing.keys where other != rung { discard(other) }
         racing = [rung: adapter]
         let now = Date()
         engine.noteConnected(rung: rung, now: now)
@@ -263,15 +303,14 @@ public final class ConnectionCoordinator: @unchecked Sendable {
             if winner?.rung == rung {
                 hadLiveTunnel.insert(rung)
                 callbacks.onEvent("activeRungLost", rung.shortName)
-                winner?.stop()
+                discard(rung)
                 winner = nil
                 server = nil
-                racing.removeValue(forKey: rung)
                 retryOrDescend(rung, kind: kind)
             }
             return
         }
-        racing.removeValue(forKey: rung)?.stop()
+        discard(rung)
         failed.insert(rung)
         callbacks.onEvent("rungFailed", rung.shortName)
         if racing.isEmpty { retryOrDescend(rung, kind: kind) }
@@ -328,11 +367,10 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         guard winner == nil else { return }
         callbacks.onEvent("raceTimedOut", "")
         let stalled = Array(racing.keys)
-        for (rung, adapter) in racing {
-            adapter.stop()
+        for rung in stalled {
+            discard(rung)
             if let host = dialling.removeValue(forKey: rung) { burned.insert(host.id) }
         }
-        racing.removeAll()
         // A relay that never finished its handshake is a burned relay, not a
         // burned protocol — the next one down the pool deserves the same rung.
         for rung in stalled { failed.insert(rung) }
@@ -367,8 +405,7 @@ public final class ConnectionCoordinator: @unchecked Sendable {
 
     public func stop() {
         raceDeadline?.cancel(); raceDeadline = nil
-        for (_, adapter) in racing { adapter.stop() }
-        racing.removeAll()
+        for rung in racing.keys { discard(rung) }
         winner = nil
     }
 
@@ -447,12 +484,14 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         burned.insert(active.id)
         callbacks.onRelayLifetime(active.id, now.timeIntervalSince(since))
         hadLiveTunnel.insert(rung)
-        winner?.stop()
+        // `discard` before `retry`: stopping the adapter is what makes OpenVPN
+        // 3 report DISCONNECTED, and that report used to arrive as a second
+        // failure for this rung and arm a second attempt alongside this one.
+        discard(rung)
         winner = nil
         server = nil
         winnerSince = nil
         dialling.removeValue(forKey: rung)
-        racing.removeValue(forKey: rung)
         retry(rung)
     }
 
@@ -471,9 +510,18 @@ public final class ConnectionCoordinator: @unchecked Sendable {
             onAuthenticated: { [weak self] in
                 guard let self else { return }
                 self.queue.async {
+                    // Retire every attempt that is not the one taking over,
+                    // rather than dropping them out of `racing` still running.
+                    for other in self.racing.keys where other != rung { self.discard(other) }
+                    if let old = previous?.rung, old != rung { self.discard(old) }
                     previous?.stop()
                     self.winner = candidate
                     self.server = host
+                    self.dialling = [rung: host]
+                    // Without this the relay carrying the tunnel after a ladder
+                    // switch has no start time, and every throughput check
+                    // silently bails instead of ever handing over.
+                    self.winnerSince = Date()
                     self.racing = [rung: candidate]
                     self.engine.noteConnected(rung: rung, now: Date())
                     self.engine.noteSuccessfulSwitch()

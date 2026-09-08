@@ -14,6 +14,13 @@ final class FakeAdapter: TunnelAdapter, @unchecked Sendable {
         /// Comes up, then the relay refuses it — VPN Gate's answer to a
         /// re-auth on a machine that has just dropped you.
         case authenticateThenReject(after: TimeInterval, dropAfter: TimeInterval)
+        /// Comes up, and reports a failure when it is *stopped* — which is what
+        /// the real OpenVPN adapter does: `sweep_ovpn_stop` makes the core emit
+        /// DISCONNECTED, and the Worker leg tearing down trips `onUnusable`.
+        /// Every other behaviour here goes quiet on `stop`, which is politer
+        /// than the field and is why the duplicate-attempt bug lived in tests
+        /// that all passed.
+        case authenticateThenFailOnStop(after: TimeInterval)
     }
 
     let rung: ProtocolRung
@@ -21,6 +28,8 @@ final class FakeAdapter: TunnelAdapter, @unchecked Sendable {
     private(set) var stopped = false
     private(set) var sentPackets: [Data] = []
     private var onInbound: (@Sendable ([Data], [NSNumber]) -> Void)?
+    private var onFailure: (@Sendable (TunnelErrorKind) -> Void)?
+    private var failsOnStop = false
 
     init(rung: ProtocolRung, behaviour: Behaviour) {
         self.rung = rung
@@ -31,6 +40,7 @@ final class FakeAdapter: TunnelAdapter, @unchecked Sendable {
                onInbound: @escaping @Sendable ([Data], [NSNumber]) -> Void,
                onFailure: @escaping @Sendable (TunnelErrorKind) -> Void) {
         self.onInbound = onInbound
+        self.onFailure = onFailure
         switch behaviour {
         case .authenticate(let delay):
             DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
@@ -60,11 +70,21 @@ final class FakeAdapter: TunnelAdapter, @unchecked Sendable {
                     onFailure(.authenticationFailed)
                 }
             }
+        case .authenticateThenFailOnStop(let delay):
+            failsOnStop = true
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                guard !self.stopped else { return }
+                onAuthenticated()
+            }
         }
     }
 
     func send(packets: [Data], protocols: [NSNumber]) { sentPackets += packets }
-    func stop() { stopped = true }
+    func stop() {
+        let announce = !stopped && failsOnStop
+        stopped = true
+        if announce { onFailure?(.allRungsFailed) }
+    }
     func reassert() {}
     var lastHandshakeAgeSeconds: Int64 { stopped ? -1 : 0 }
     var transferred: (tx: UInt64, rx: UInt64) { (0, 0) }

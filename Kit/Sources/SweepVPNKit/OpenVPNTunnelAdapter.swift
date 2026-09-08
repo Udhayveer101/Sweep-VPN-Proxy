@@ -53,6 +53,9 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     private var _pushed: PushedTunnelSettings?
     private var connectedAt: Date?
     private var finished = false
+    /// Retired by the coordinator. Terminal: nothing may un-latch `finished`
+    /// afterwards, or a reconnect event would let a retired adapter speak again.
+    private var stopped = false
     /// Previous liveness sample: the inbound byte count and when it was taken.
     /// Liveness here is "did anything arrive since last time", because OpenVPN
     /// has no periodic handshake to age out.
@@ -234,6 +237,19 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     }
 
     public func stop() {
+        // Latch *before* tearing anything down. `sweep_ovpn_stop` makes OpenVPN 3
+        // emit DISCONNECTED, and the transport's teardown trips `onUnusable`;
+        // both route to `fail`, so without this an adapter the coordinator has
+        // already retired still reported a failure for its rung — arriving
+        // after the replacement attempt had been armed, which started a second
+        // adapter for the same rung and left the first one running unowned.
+        lock.lock()
+        stopped = true
+        finished = true
+        onAuthenticated = nil
+        onInbound = nil
+        onFailure = nil
+        lock.unlock()
         transport?.stop()
         transport = nil
         guard let handle else { return }
@@ -247,6 +263,7 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         // has to be released or that attempt's failure is swallowed and the
         // coordinator waits forever on an adapter that is already dead.
         lock.lock()
+        guard !stopped else { lock.unlock(); return }
         finished = false
         lastRxSample = nil
         // Anything buffered belongs to the session that just ended; injecting it
@@ -381,8 +398,9 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
             }
             lock.lock()
             connectedAt = Date()
+            let announce = stopped ? nil : onAuthenticated
             lock.unlock()
-            onAuthenticated?()
+            announce?()
 
         case "AUTH_FAILED", "CERT_VERIFY_FAIL", "TLS_VERSION_MIN":
             fail(.authenticationFailed)
@@ -405,8 +423,9 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         lock.lock()
         if finished { lock.unlock(); return }
         finished = true
+        let report = onFailure
         lock.unlock()
-        onFailure?(kind)
+        report?(kind)
     }
 }
 #endif
