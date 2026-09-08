@@ -45,6 +45,8 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// to true would put a post-quantum glyph on a tunnel that has no PQ material.
     private var pqActive = false
     private var healthTimer: DispatchSourceTimer?
+    /// Previous inbound byte count and when it was read, for the rate.
+    private var lastRxSample: (bytes: UInt64, at: Date)?
     private var probeTimer: DispatchSourceTimer?
     private let prober = ServerProber()
     private var handshakeDeadline: DispatchWorkItem?
@@ -79,6 +81,9 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     /// How long each relay has held a tunnel, folded into `Server.reliability`
     /// so the pool is ordered by what survives rather than only by what is fast.
     open var relayStabilityStore: RelayStabilityStore? { RelayStabilityStore(appGroup: appGroup) }
+    /// How much bandwidth each relay has actually delivered, folded into
+    /// `Server.load` so the pool is ordered by the thing the user notices.
+    open var relayThroughputStore: RelayThroughputStore? { RelayThroughputStore(appGroup: appGroup) }
     /// The shared app group, for the settings that live outside the keychain.
     open var appGroup: String { AppGroupID.resolved }
 
@@ -164,8 +169,12 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         // rather than racing a ladder the relay is not part of.
         // The whole pool, not just the pin: a relay that drops mid-session has
         // to have somewhere to hand over to, or the tunnel dies with it.
-        let relayPool = relayStabilityStore
-            .map { $0.applied(to: relayStore?.loadAll() ?? []) } ?? (relayStore?.loadAll() ?? [])
+        // Two independent measures, both from live sessions rather than from
+        // what the operator advertises: how long the relay lasts, and how fast
+        // it actually was while it did.
+        var relayPool = relayStore?.loadAll() ?? []
+        if let stability = relayStabilityStore { relayPool = stability.applied(to: relayPool) }
+        if let throughput = relayThroughputStore { relayPool = throughput.applied(to: relayPool) }
         let relay = relayPool.first
         let bundle = try store.loadBundle()
         guard bundle != nil || relay != nil else { throw ConfigError.noServers }
@@ -487,6 +496,7 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         guard let healthy = coordinator.sampleLiveness() else { return }
         // rttMs is measured by the prober, not inferred here; the engine reads
         // only lossFraction and handshakeOK.
+        sampleThroughput(coordinator)
         let health = LinkHealth(rttMs: 0, lossFraction: healthy ? 0 : 1, handshakeOK: healthy)
         if !healthy, machine.state.forwardingAllowed {
             publishFilterState(up: false, server: coordinator.activeServer)
@@ -495,6 +505,28 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
             machine.transition(to: .connected(rung: rung, server: server.id))
         }
         coordinator.observe(health: health)
+    }
+
+    /// Turn the tunnel's own byte counters into a rate for the relay carrying
+    /// it. Free — the counters are already there for liveness — and it is the
+    /// only throughput figure that reflects the whole chain the user is
+    /// actually on, rather than what a relay advertises or how fast it answers
+    /// a TCP handshake.
+    ///
+    /// Only inbound: it is what a download feels like, and the outbound side of
+    /// a browsing session is mostly ACKs.
+    private func sampleThroughput(_ coordinator: ConnectionCoordinator) {
+        let rx = coordinator.transferred.rx
+        let now = Date()
+        defer { lastRxSample = (rx, now) }
+        guard let previous = lastRxSample, let relay = coordinator.activeServer else { return }
+        let elapsed = now.timeIntervalSince(previous.at)
+        // A counter that went backwards means a new session on a new relay;
+        // there is no rate to read across that boundary.
+        guard elapsed > 0, rx >= previous.bytes else { return }
+        let rate = Double(rx - previous.bytes) / elapsed
+        relayThroughputStore?.record(relay.id, bytesPerSecond: rate)
+        coordinator.noteThroughput(bytesPerSecond: rate, now: now)
     }
 
     /// Keep the server ranking honest: re-measure occasionally and on network

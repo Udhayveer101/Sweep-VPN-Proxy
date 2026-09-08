@@ -70,6 +70,12 @@ public final class ConnectionCoordinator: @unchecked Sendable {
     /// charged to the relay when it ends.
     private var winnerSince: Date?
     private var raceDeadline: DispatchWorkItem?
+    /// Consecutive throughput samples under the floor, so one quiet interval
+    /// (the user simply not loading anything) never costs a handover.
+    private var slowSamples = 0
+    /// When the last throughput-driven handover happened, so a uniformly slow
+    /// network cannot turn the pool into a carousel.
+    private var lastVoluntarySwitch: Date?
 
     /// What the coordinator learned about this network, for the caller to persist.
     public private(set) var updatedMemory: NetworkMemory
@@ -381,6 +387,73 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         default:
             break
         }
+    }
+
+    /// Below this, a relay is not carrying a usable connection. 2 Mbps: enough
+    /// that ordinary browsing on a healthy relay never trips it, low enough
+    /// that the relays the user experiences as "the VPN is slow" do.
+    static let slowRelayBytesPerSecond: Double = 250_000
+    /// Two consecutive samples, so a genuinely idle interval is not mistaken
+    /// for a slow relay.
+    static let slowSamplesBeforeSwitch = 2
+    /// A relay gets a fair run before its throughput is held against it.
+    static let voluntarySwitchDwell: TimeInterval = 60
+    /// And the pool is not re-cut more often than this.
+    static let voluntarySwitchCooldown: TimeInterval = 180
+
+    /// Feed the live tunnel's measured throughput.
+    ///
+    /// A relay that is authenticated and delivering a trickle is invisible to
+    /// every check we have: bytes *are* moving, so `sampleLiveness` calls it
+    /// healthy and nothing ever hands over. That is exactly the state the user
+    /// experiences as "connected but slow". With a pool, the answer is to stop
+    /// using this relay and go pick another one.
+    public func noteThroughput(bytesPerSecond: Double, now: Date = Date()) {
+        queue.async { [weak self] in
+            self?.considerFasterRelay(bytesPerSecond, now: now)
+        }
+    }
+
+    private func considerFasterRelay(_ bytesPerSecond: Double, now: Date) {
+        guard let rung = winner?.rung, let active = server, let since = winnerSince else {
+            slowSamples = 0
+            return
+        }
+        guard bytesPerSecond < Self.slowRelayBytesPerSecond else {
+            slowSamples = 0
+            return
+        }
+        slowSamples += 1
+        guard slowSamples >= Self.slowSamplesBeforeSwitch else { return }
+        guard now.timeIntervalSince(since) >= Self.voluntarySwitchDwell else { return }
+        if let last = lastVoluntarySwitch,
+           now.timeIntervalSince(last) < Self.voluntarySwitchCooldown { return }
+        // Only worth doing if there is somewhere better to go. With a single
+        // relay this is just churn, and the ladder already handles a rung that
+        // cannot carry traffic at all.
+        let carriers = catalog.ranked().map(\.0).filter { $0.supports(rung) }
+        guard carriers.contains(where: { $0.id != active.id && !burned.contains($0.id) })
+        else { return }
+
+        slowSamples = 0
+        lastVoluntarySwitch = now
+        callbacks.onEvent("relayTooSlow",
+                          "\(Int(bytesPerSecond / 1024)) KB/s, handing over")
+        // Hand over through the same path a drop takes: burn it so the pool
+        // moves past it, record what it actually managed, and re-arm the rung.
+        // Deliberately not routed through `rungFailed` — a relay that held the
+        // tunnel this long would clear the burn ledger there, and the whole
+        // point here is that we do not want to come back to it.
+        burned.insert(active.id)
+        callbacks.onRelayLifetime(active.id, now.timeIntervalSince(since))
+        hadLiveTunnel.insert(rung)
+        winner?.stop()
+        winner = nil
+        server = nil
+        winnerSince = nil
+        dialling.removeValue(forKey: rung)
+        racing.removeValue(forKey: rung)
+        retry(rung)
     }
 
     /// A rung change keeps the old adapter alive until the new one authenticates,

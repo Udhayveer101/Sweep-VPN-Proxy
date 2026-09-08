@@ -144,3 +144,77 @@ public struct RelayStabilityStore: Sendable {
         }
     }
 }
+
+/// How much bandwidth each relay has actually delivered, so the pool can be
+/// ordered by the thing the user is complaining about.
+///
+/// `ServerScoring` has always had a `load` term (weight 0.4) and `VPNGate`
+/// seeds it from the relay's *advertised* speed — a number the operator
+/// declares and nobody checks. `ServerProber` then measures connect-RTT only,
+/// so two relays that answer a TCP handshake in the same 150 ms rank equal even
+/// when one delivers 20 Mbps through the Worker and the other 300 Kbps. RTT
+/// cannot tell them apart; this can, because it is taken from the live tunnel's
+/// own byte counters rather than from extra probe traffic.
+///
+/// The measurement overwrites `load` rather than adding a scoring term: the
+/// seed it replaces means the same thing, so the existing weight already
+/// carries it.
+public struct RelayThroughputStore: Sendable {
+    private let suiteName: String?
+    private let key = "sweep.relayThroughput"
+
+    public init(appGroup: String) { self.suiteName = appGroup }
+    public init(suiteName: String?) { self.suiteName = suiteName }
+
+    private var defaults: UserDefaults? { suiteName.flatMap { UserDefaults(suiteName: $0) } }
+
+    /// The rate at which a relay is as good as this measure can say, in bytes
+    /// per second. 25 Mbps — deliberately not a 1 Gbps ceiling like the
+    /// advertised-speed seed uses, because real throughput through
+    /// OpenVPN-over-WSS-over-Worker to a volunteer relay lands between roughly
+    /// 0.5 and 50 Mbps. Normalising that range against 1 Gbps squashes every
+    /// relay to a load of ~0.99 and the term stops discriminating at all.
+    public static let idealBytesPerSecond: Double = 3_125_000
+
+    /// Weight on the newest sample, matching `RelayStabilityStore`: what a
+    /// relay is doing now matters far more than what it did an hour ago.
+    private static let alpha = 0.4
+
+    public func loadAll() -> [String: Double] {
+        (defaults?.dictionary(forKey: key) as? [String: Double]) ?? [:]
+    }
+
+    /// Fold one observed rate into the relay's rolling average.
+    public func record(_ id: String, bytesPerSecond: Double) {
+        guard let defaults, bytesPerSecond.isFinite, bytesPerSecond >= 0 else { return }
+        var all = loadAll()
+        let previous = all[id]
+        all[id] = previous.map { $0 + Self.alpha * (bytesPerSecond - $0) } ?? bytesPerSecond
+        // Same bound as the stability store — an unbounded dictionary in a
+        // shared suite is a slow leak, and the pool is sixteen.
+        if all.count > 64, let weakest = all.min(by: { $0.value < $1.value })?.key {
+            all.removeValue(forKey: weakest)
+        }
+        defaults.set(all, forKey: key)
+    }
+
+    /// 0…1 where 1 is "as fast as we score", for callers that want the raw figure.
+    public func normalized(for id: String) -> Double? {
+        loadAll()[id].map { min(1, max(0, $0 / Self.idealBytesPerSecond)) }
+    }
+
+    /// The pool with `load` replaced by measured throughput where we have it.
+    /// Relays nobody has carried traffic on keep their advertised-speed seed,
+    /// which is the right prior — optimistic, and corrected by the first
+    /// session that actually uses them.
+    public func applied(to servers: [Server]) -> [Server] {
+        let all = loadAll()
+        guard !all.isEmpty else { return servers }
+        return servers.map { server in
+            guard let rate = all[server.id] else { return server }
+            var copy = server
+            copy.load = 1 - min(1, max(0, rate / Self.idealBytesPerSecond))
+            return copy
+        }
+    }
+}

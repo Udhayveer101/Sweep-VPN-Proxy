@@ -57,6 +57,11 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     /// Liveness here is "did anything arrive since last time", because OpenVPN
     /// has no periodic handshake to age out.
     private var lastRxSample: (bytes: UInt64, at: Date)?
+    /// Inbound packets waiting to cross to the provider as one batch, and
+    /// whether a flush is already on its way. Guarded by `lock`.
+    private var inboundPackets: [Data] = []
+    private var inboundProtocols: [NSNumber] = []
+    private var inboundFlushScheduled = false
 
     /// What the relay assigned. Nil until the tunnel is up.
     public var pushedSettings: PushedTunnelSettings? {
@@ -244,6 +249,10 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         lock.lock()
         finished = false
         lastRxSample = nil
+        // Anything buffered belongs to the session that just ended; injecting it
+        // after the reconnect would be replaying stale packets.
+        inboundPackets.removeAll(keepingCapacity: true)
+        inboundProtocols.removeAll(keepingCapacity: true)
         lock.unlock()
         sweep_ovpn_reconnect(handle)
     }
@@ -289,11 +298,53 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
 
     // MARK: - Callbacks from the shim
 
+    /// The shim hands us one packet per call. Passing each straight on meant a
+    /// separate `onInbound` → `stateQueue` hop → `packetFlow.writePackets` for
+    /// every single packet, so a saturated download paid the whole per-call cost
+    /// thousands of times a second on one serial queue. `writePackets` takes
+    /// arrays; a burst that arrives together should cross as one.
+    ///
+    /// The flush is scheduled once per burst and drains whatever accumulated by
+    /// the time it runs, so a trickle still leaves immediately (one packet, one
+    /// hop, as before) and only a burst coalesces. Ordering is preserved: the
+    /// buffer is FIFO and the flush is serialised on `queue`.
     private func received(_ bytes: UnsafeRawPointer, _ len: Int, _ family: Int32) {
         guard len > 0 else { return }
         let data = Data(bytes: bytes, count: len)
         let proto = NSNumber(value: family == AF_INET6 ? AF_INET6 : AF_INET)
-        onInbound?([data], [proto])
+
+        lock.lock()
+        inboundPackets.append(data)
+        inboundProtocols.append(proto)
+        let alreadyScheduled = inboundFlushScheduled
+        inboundFlushScheduled = true
+        // A burst that outruns the flush must not grow without bound; past this
+        // the link is already the bottleneck and dropping is what the tunnel
+        // does anyway.
+        let overflowed = inboundPackets.count > Self.maxBufferedInbound
+        lock.unlock()
+
+        if overflowed { flushInbound() ; return }
+        guard !alreadyScheduled else { return }
+        queue.async { [weak self] in self?.flushInbound() }
+    }
+
+    /// Packets held while a flush is pending. Bounded so a burst cannot grow
+    /// the buffer without limit.
+    private static let maxBufferedInbound = 128
+
+    private func flushInbound() {
+        lock.lock()
+        let packets = inboundPackets
+        let protocols = inboundProtocols
+        inboundPackets.removeAll(keepingCapacity: true)
+        inboundProtocols.removeAll(keepingCapacity: true)
+        inboundFlushScheduled = false
+        let deliver = onInbound
+        lock.unlock()
+
+        guard !packets.isEmpty else { return }
+        deliver?(packets, protocols)
     }
 
     private func pushed(_ json: String) {

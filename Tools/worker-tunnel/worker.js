@@ -155,7 +155,16 @@ export class RelaySession {
 
   /// Past this, the client is not coming back fast enough to matter and the
   /// buffer is doing more harm than the reconnect it was protecting.
-  static get maxParkedBytes() { return 512 * 1024; }
+  ///
+  /// 512 KB was too tight to survive a redial on a fast relay: the client's
+  /// redial budget allows several attempts at 150 ms each, and a relay pushing
+  /// even 20 Mbps fills half a megabyte in about a fifth of a second. Hitting
+  /// the cap destroys the session, which costs a full OpenVPN renegotiation —
+  /// so the ceiling meant to protect throughput was the thing collapsing it,
+  /// and only ever on the fast relays worth keeping. 4 MB covers the whole
+  /// redial window at rates this path can actually reach, and an abandoned
+  /// session is still bounded by `graceMs`.
+  static get maxParkedBytes() { return 4 * 1024 * 1024; }
 
   async fetch(request) {
     const url = new URL(request.url);

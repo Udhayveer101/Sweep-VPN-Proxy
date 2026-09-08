@@ -196,32 +196,38 @@ final class MinimalWebSocket: @unchecked Sendable {
     }
 
     static func frame(_ payload: Data, opcode: UInt8 = 0x2) -> Data {
-        var out = Data([0x80 | opcode])
         let mask = UInt8(0x80)
+        var header: [UInt8] = [0x80 | opcode]
         switch payload.count {
         case ..<126:
-            out.append(mask | UInt8(payload.count))
+            header.append(mask | UInt8(payload.count))
         case ..<65536:
-            out.append(mask | 126)
-            out.append(UInt8(payload.count >> 8))
-            out.append(UInt8(payload.count & 0xFF))
+            header.append(mask | 126)
+            header.append(UInt8(payload.count >> 8))
+            header.append(UInt8(payload.count & 0xFF))
         default:
-            out.append(mask | 127)
+            header.append(mask | 127)
             for shift in stride(from: 56, through: 0, by: -8) {
-                out.append(UInt8((payload.count >> shift) & 0xFF))
+                header.append(UInt8((payload.count >> shift) & 0xFF))
             }
         }
         let maskingKey = (0..<4).map { _ in UInt8.random(in: 0...255) }
-        out.append(contentsOf: maskingKey)
-        // Masked in one pass over contiguous storage. `payload.enumerated()`
-        // with a per-byte `Data.append` was the send half of the same quadratic
-        // cost as the receive buffer, and it ran on every packet.
-        var masked = [UInt8](repeating: 0, count: payload.count)
-        payload.withUnsafeBytes { raw in
-            let src = raw.bindMemory(to: UInt8.self)
-            for i in 0..<src.count { masked[i] = src[i] ^ maskingKey[i & 3] }
+        header.append(contentsOf: maskingKey)
+
+        // One allocation the size of the finished frame, masked straight into
+        // it. The previous version built a separate `[UInt8]` for the masked
+        // payload and then appended it, so every outbound packet paid a second
+        // full-length copy on top of `out`'s own growth — on the tunnel's hot
+        // path, for every packet the device sends.
+        var out = Data(count: header.count + payload.count)
+        out.withUnsafeMutableBytes { rawOut in
+            let dst = rawOut.bindMemory(to: UInt8.self)
+            for i in 0..<header.count { dst[i] = header[i] }
+            payload.withUnsafeBytes { rawIn in
+                let src = rawIn.bindMemory(to: UInt8.self)
+                for i in 0..<src.count { dst[header.count + i] = src[i] ^ maskingKey[i & 3] }
+            }
         }
-        out.append(contentsOf: masked)
         return out
     }
 
