@@ -220,6 +220,11 @@ public final class WebSocketTransport: @unchecked Sendable {
         /// matches a redial against.
         let session = UUID().uuidString
         var socket: MinimalWebSocket?
+        /// The leg owns its Worker connection so `tearDown` can cancel it.
+        /// `stop()` has no worker to hand in, so without this the socket to
+        /// Cloudflare outlived the transport and reported its close into a
+        /// deallocated `self` — the `wssVerdictOrphaned` in the logs.
+        var worker: NWConnection?
         /// Which dial attempt is current. Every callback carries the generation
         /// it was armed by, so the ones belonging to an attempt we have already
         /// moved on from cannot fire a second failure for the same event —
@@ -287,6 +292,7 @@ public final class WebSocketTransport: @unchecked Sendable {
             giveUp(leg, nil)
             return
         }
+        leg.worker = worker
         let socket = MinimalWebSocket(connection: worker, host: name,
                                       path: tunnelPath(session: leg.session,
                                                        resuming: leg.attempts > 0))
@@ -404,6 +410,8 @@ public final class WebSocketTransport: @unchecked Sendable {
         leg.socket = nil
         leg.outbound.removeAll()
         worker?.cancel()
+        leg.worker?.cancel()
+        leg.worker = nil
         leg.connection.cancel()
         legs.removeAll { $0 === leg }
     }

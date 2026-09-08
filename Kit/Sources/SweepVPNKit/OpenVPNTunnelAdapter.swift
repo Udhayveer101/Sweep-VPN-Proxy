@@ -47,7 +47,8 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
 
     private var onAuthenticated: (@Sendable () -> Void)?
     private var onInbound: (@Sendable ([Data], [NSNumber]) -> Void)?
-    private var onFailure: (@Sendable (TunnelErrorKind) -> Void)?
+    /// Internal so tests can observe verdicts without standing up the core.
+    var onFailure: (@Sendable (TunnelErrorKind) -> Void)?
 
     private let lock = NSLock()
     private var _pushed: PushedTunnelSettings?
@@ -56,6 +57,10 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     /// Retired by the coordinator. Terminal: nothing may un-latch `finished`
     /// afterwards, or a reconnect event would let a retired adapter speak again.
     private var stopped = false
+    /// Set only while a reconnect *we* asked for is in flight. OpenVPN 3 emits
+    /// RECONNECTING both when we call `reassert` and when the relay hangs up on
+    /// it; only the second kind means the relay is gone.
+    private var selfReconnecting = false
     /// Previous liveness sample: the inbound byte count and when it was taken.
     /// Liveness here is "did anything arrive since last time", because OpenVPN
     /// has no periodic handshake to age out.
@@ -257,7 +262,6 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
     }
 
     public func reassert() {
-        guard let handle else { return }
         // `finished` latches so the several events OpenVPN 3 emits on the way
         // down are reported once. A reconnect starts a new attempt, so the latch
         // has to be released or that attempt's failure is swallowed and the
@@ -265,12 +269,14 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         lock.lock()
         guard !stopped else { lock.unlock(); return }
         finished = false
+        selfReconnecting = true
         lastRxSample = nil
         // Anything buffered belongs to the session that just ended; injecting it
         // after the reconnect would be replaying stale packets.
         inboundPackets.removeAll(keepingCapacity: true)
         inboundProtocols.removeAll(keepingCapacity: true)
         lock.unlock()
+        guard let handle else { return }
         sweep_ovpn_reconnect(handle)
     }
 
@@ -381,7 +387,9 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         lock.unlock()
     }
 
-    private func event(_ name: String, _ info: String) {
+    /// Internal rather than private so the tests can drive the core's state
+    /// names directly; there is no other way to reach this switch.
+    func event(_ name: String, _ info: String) {
         // The OpenVPN core's own state names are the only account of where a
         // handshake stopped. Without them a stalled connect is indistinguishable
         // from a dead relay, and both look like a 45-second timeout.
@@ -397,6 +405,7 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
                 return
             }
             lock.lock()
+            selfReconnecting = false
             connectedAt = Date()
             let announce = stopped ? nil : onAuthenticated
             lock.unlock()
@@ -404,6 +413,18 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
 
         case "AUTH_FAILED", "CERT_VERIFY_FAIL", "TLS_VERSION_MIN":
             fail(.authenticationFailed)
+
+        case "RECONNECTING":
+            // OpenVPN 3 absorbs a dead relay into its own reconnect loop and
+            // only says this. Left alone it grinds through `connTimeout` (30s)
+            // while the tunnel is black — that is the freeze. The coordinator
+            // has a standby authenticated and idle, so say the relay is gone
+            // and let it cut over instead of waiting for the core to give up.
+            lock.lock()
+            let asked = selfReconnecting
+            lock.unlock()
+            guard !asked else { break }
+            fail(.allRungsFailed)
 
         case "CLIENT_HALT", "CONNECTION_TIMEOUT", "CONNECT_FAILED",
              "CONFIG_ERROR", "TRANSPORT_ERROR", "DISCONNECTED":
