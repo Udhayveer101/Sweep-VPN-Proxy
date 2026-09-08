@@ -34,13 +34,13 @@ final class PushedTunnelSettingsTests: XCTestCase {
     func testZeroMTUFallsBackToSomethingUsable() throws {
         let p = try decode(realPush)
         XCTAssertEqual(p.mtu, 0)
-        XCTAssertEqual(p.effectiveMTU, 1400)
-        XCTAssertEqual(try p.validated().mtu, 1400)
+        XCTAssertEqual(p.effectiveMTU, 1280)
+        XCTAssertEqual(try p.validated().mtu, 1280)
     }
 
     func testAbsurdMTUIsClamped() {
-        XCTAssertEqual(PushedTunnelSettings(mtu: 70000).effectiveMTU, 1400)
-        XCTAssertEqual(PushedTunnelSettings(mtu: 40).effectiveMTU, 1400)
+        XCTAssertEqual(PushedTunnelSettings(mtu: 70000).effectiveMTU, 1280)
+        XCTAssertEqual(PushedTunnelSettings(mtu: 40).effectiveMTU, 1280)
         XCTAssertEqual(PushedTunnelSettings(mtu: 1400).effectiveMTU, 1400)
         XCTAssertEqual(PushedTunnelSettings(mtu: 1500).effectiveMTU, 1500)
     }
@@ -105,7 +105,7 @@ final class PushedTunnelSettingsTests: XCTestCase {
         XCTAssertEqual(plan.ipv4Address, "10.211.1.13")
         XCTAssertEqual(plan.ipv4Routes.count, 1)
         XCTAssertEqual(plan.dnsServers, ["10.211.254.254", "8.8.8.8"])
-        XCTAssertEqual(plan.mtu, 1400)
+        XCTAssertEqual(plan.mtu, 1280)
         XCTAssertTrue(plan.forwardingEnabled)
     }
 

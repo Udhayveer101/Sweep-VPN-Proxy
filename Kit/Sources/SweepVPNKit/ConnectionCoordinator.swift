@@ -86,12 +86,21 @@ public final class ConnectionCoordinator: @unchecked Sendable {
     /// charged to the relay when it ends.
     private var winnerSince: Date?
     private var raceDeadline: DispatchWorkItem?
-    /// Consecutive throughput samples under the floor, so one quiet interval
-    /// (the user simply not loading anything) never costs a handover.
-    private var slowSamples = 0
-    /// When the last throughput-driven handover happened, so a uniformly slow
-    /// network cannot turn the pool into a carousel.
-    private var lastVoluntarySwitch: Date?
+    /// A second relay on the *same* rung, already authenticated and idle,
+    /// waiting to take over the moment the live one hangs up.
+    ///
+    /// VPN Gate volunteers FIN on their own schedule — the transport's own
+    /// measurements put it at 62 s idle, 92 s live — so a drop is not an
+    /// exception on this rung, it is the normal course of a session. Dialling
+    /// the replacement only *after* the drop costs a whole OpenVPN handshake
+    /// (TLS + PUSH_REPLY, 5-15 s of dead tunnel) every single time. Having it
+    /// already up turns that into a swap.
+    ///
+    /// It cannot live in `racing`, which is keyed by rung and holds exactly the
+    /// attempt that owns it.
+    private var standby: (adapter: TunnelAdapter, host: Server, rung: ProtocolRung)?
+    private var standbyPending: Server?
+    private var standbyTimer: DispatchWorkItem?
 
     /// What the coordinator learned about this network, for the caller to persist.
     public private(set) var updatedMemory: NetworkMemory
@@ -163,6 +172,100 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         raceDeadline?.cancel()
         raceDeadline = deadline
         queue.asyncAfter(deadline: .now() + timeout, execute: deadline)
+    }
+
+    /// ponytail: a fixed lead time (`AutoModeConstants.standbyLeadTime`).
+    /// `onRelayLifetime` and `RelayStability` already collect what each relay
+    /// actually manages — derive it per-relay if the fixed number turns out to
+    /// be wrong for some pool.
+
+    /// Bring up a replacement relay alongside the live one. Only ever one, only
+    /// for a rung that is actually carrying the tunnel, and only when the pool
+    /// has somewhere else to go.
+    private func armStandby(for rung: ProtocolRung) {
+        guard standby == nil, standbyPending == nil else { return }
+        guard winner?.rung == rung, let active = server else { return }
+        let carriers = catalog.ranked().map(\.0).filter { $0.supports(rung) }
+        guard let host = carriers.first(where: { $0.id != active.id && !burned.contains($0.id) })
+        else { return }
+        guard let candidate = try? build(rung, host) else { return }
+
+        standbyPending = host
+        callbacks.onEvent("standbyArming", "\(rung.shortName) on a second relay")
+        candidate.start(
+            onAuthenticated: { [weak self] in
+                self?.queue.async {
+                    guard let self, self.standbyPending?.id == host.id,
+                          self.winner?.rung == rung else {
+                        // We moved on while it was negotiating. Nothing here is
+                        // worth keeping, and leaving it running would hold a
+                        // relay the pool may need.
+                        candidate.stop()
+                        return
+                    }
+                    self.standbyPending = nil
+                    self.standby = (candidate, host, rung)
+                    self.callbacks.onEvent("standbyReady", rung.shortName)
+                }
+            },
+            // Silent until promoted: while another relay is carrying the
+            // tunnel, the settings in force belong to *it*, so these packets
+            // would be routed against the wrong address. The identity check is
+            // the same one `switchTo` uses, and it starts passing the instant
+            // `promoteStandby` makes this adapter the winner.
+            onInbound: { [weak self] packets, protocols in
+                guard let self, self.winner === candidate else { return }
+                self.callbacks.onInbound(packets, protocols)
+            },
+            onFailure: { [weak self] _ in
+                self?.queue.async {
+                    guard let self else { return }
+                    candidate.stop()
+                    if self.standbyPending?.id == host.id { self.standbyPending = nil }
+                    if self.standby?.host.id == host.id { self.standby = nil }
+                    // A relay that could not even come up as a standby is not a
+                    // relay we want to fail over to.
+                    self.burned.insert(host.id)
+                    self.callbacks.onEvent("standbyFailed", rung.shortName)
+                    self.scheduleStandby(for: rung)
+                }
+            })
+    }
+
+    /// Re-arm the standby window for a rung that is carrying the tunnel.
+    private func scheduleStandby(for rung: ProtocolRung) {
+        standbyTimer?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.armStandby(for: rung) }
+        standbyTimer = work
+        queue.asyncAfter(deadline: .now() + constants.standbyLeadTime, execute: work)
+    }
+
+    /// Drop whatever standby exists. Called wherever the live tunnel changes
+    /// underneath it, so a standby never outlives the winner it was warmed for.
+    private func clearStandby() {
+        standbyTimer?.cancel(); standbyTimer = nil
+        standbyPending = nil
+        standby?.adapter.stop()
+        standby = nil
+    }
+
+    /// Swap the waiting relay in for the one that just died. Returns false when
+    /// there is nothing warmed, and the caller falls back to dialling.
+    private func promoteStandby(_ rung: ProtocolRung) -> Bool {
+        guard let ready = standby, ready.rung == rung else { return false }
+        standbyTimer?.cancel(); standbyTimer = nil
+        standby = nil
+        standbyPending = nil
+        // The dead adapter is already discarded by the caller; take its slot.
+        racing[rung] = ready.adapter
+        winner = ready.adapter
+        server = ready.host
+        dialling = [rung: ready.host]
+        winnerSince = Date()
+        callbacks.onEvent("standbyPromoted", "\(rung.shortName) took over without a handshake")
+        callbacks.onAuthenticated(ready.adapter, ready.host)
+        scheduleStandby(for: rung)
+        return true
     }
 
     /// The best relay for this rung that has not already failed this session.
@@ -266,6 +369,9 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         winnerSince = Date()
         callbacks.onEvent("rungWon", rung.shortName)
         callbacks.onAuthenticated(adapter, server)
+        // This relay will hang up on its own schedule. Start warming the next
+        // one now, so the drop costs a swap instead of a handshake.
+        scheduleStandby(for: rung)
     }
 
     /// How long a relay has to hold the tunnel before its eventual drop counts
@@ -306,6 +412,11 @@ public final class ConnectionCoordinator: @unchecked Sendable {
                 discard(rung)
                 winner = nil
                 server = nil
+                // If a replacement is already authenticated, take it. This is
+                // the difference between a seam and the 20-35 s hole the field
+                // log shows.
+                if promoteStandby(rung) { return }
+                clearStandby()
                 retryOrDescend(rung, kind: kind)
             }
             return
@@ -405,6 +516,7 @@ public final class ConnectionCoordinator: @unchecked Sendable {
 
     public func stop() {
         raceDeadline?.cancel(); raceDeadline = nil
+        clearStandby()
         for rung in racing.keys { discard(rung) }
         winner = nil
     }
@@ -426,74 +538,29 @@ public final class ConnectionCoordinator: @unchecked Sendable {
         }
     }
 
-    /// Below this, a relay is not carrying a usable connection. 2 Mbps: enough
-    /// that ordinary browsing on a healthy relay never trips it, low enough
-    /// that the relays the user experiences as "the VPN is slow" do.
-    static let slowRelayBytesPerSecond: Double = 250_000
-    /// Two consecutive samples, so a genuinely idle interval is not mistaken
-    /// for a slow relay.
-    static let slowSamplesBeforeSwitch = 2
-    /// A relay gets a fair run before its throughput is held against it.
-    static let voluntarySwitchDwell: TimeInterval = 60
-    /// And the pool is not re-cut more often than this.
-    static let voluntarySwitchCooldown: TimeInterval = 180
-
     /// Feed the live tunnel's measured throughput.
     ///
-    /// A relay that is authenticated and delivering a trickle is invisible to
-    /// every check we have: bytes *are* moving, so `sampleLiveness` calls it
-    /// healthy and nothing ever hands over. That is exactly the state the user
-    /// experiences as "connected but slow". With a pool, the answer is to stop
-    /// using this relay and go pick another one.
-    public func noteThroughput(bytesPerSecond: Double, now: Date = Date()) {
-        queue.async { [weak self] in
-            self?.considerFasterRelay(bytesPerSecond, now: now)
-        }
-    }
-
-    private func considerFasterRelay(_ bytesPerSecond: Double, now: Date) {
-        guard let rung = winner?.rung, let active = server, let since = winnerSince else {
-            slowSamples = 0
-            return
-        }
-        guard bytesPerSecond < Self.slowRelayBytesPerSecond else {
-            slowSamples = 0
-            return
-        }
-        slowSamples += 1
-        guard slowSamples >= Self.slowSamplesBeforeSwitch else { return }
-        guard now.timeIntervalSince(since) >= Self.voluntarySwitchDwell else { return }
-        if let last = lastVoluntarySwitch,
-           now.timeIntervalSince(last) < Self.voluntarySwitchCooldown { return }
-        // Only worth doing if there is somewhere better to go. With a single
-        // relay this is just churn, and the ladder already handles a rung that
-        // cannot carry traffic at all.
-        let carriers = catalog.ranked().map(\.0).filter { $0.supports(rung) }
-        guard carriers.contains(where: { $0.id != active.id && !burned.contains($0.id) })
-        else { return }
-
-        slowSamples = 0
-        lastVoluntarySwitch = now
-        callbacks.onEvent("relayTooSlow",
-                          "\(Int(bytesPerSecond / 1024)) KB/s, handing over")
-        // Hand over through the same path a drop takes: burn it so the pool
-        // moves past it, record what it actually managed, and re-arm the rung.
-        // Deliberately not routed through `rungFailed` — a relay that held the
-        // tunnel this long would clear the burn ledger there, and the whole
-        // point here is that we do not want to come back to it.
-        burned.insert(active.id)
-        callbacks.onRelayLifetime(active.id, now.timeIntervalSince(since))
-        hadLiveTunnel.insert(rung)
-        // `discard` before `retry`: stopping the adapter is what makes OpenVPN
-        // 3 report DISCONNECTED, and that report used to arrive as a second
-        // failure for this rung and arm a second attempt alongside this one.
-        discard(rung)
-        winner = nil
-        server = nil
-        winnerSince = nil
-        dialling.removeValue(forKey: rung)
-        retry(rung)
-    }
+    /// This used to tear the tunnel down and re-cut the pool when the measured
+    /// rate sat under 2 Mbps for two ten-second samples. It was wrong in a way
+    /// that only shows up in the field: **you cannot tell a slow relay from an
+    /// unsaturated one using passive byte counters.** A game pushing 40 KB/s
+    /// over a perfectly healthy relay reads identically to a relay throttling
+    /// us to 40 KB/s, so the check fired on every low-bandwidth session it was
+    /// supposed to protect — a guaranteed teardown each time the cooldown
+    /// expired, and a hard one: `discard` first, then dial a fresh relay, with
+    /// the tunnel down for the whole new OpenVPN handshake. Worse, the sample
+    /// was taken without a health guard, so a window in which the Worker leg
+    /// had *already died* scored ~0 and was charged to the relay (the field log
+    /// shows `relayTooSlow: 10 KB/s` seven seconds after `wssFailed`).
+    ///
+    /// Measuring throughput is still worth doing — `RelayThroughputStore` ranks
+    /// relays with it at connect time, where comparing recorded history is a
+    /// fair question. Acting on it mid-session is not, so this now only keeps
+    /// the counter honest and hands over nothing.
+    ///
+    /// ponytail: passive-only. Restoring a live switch needs a real saturation
+    /// signal (a backlogged write queue, or a deliberate probe), not a rate.
+    public func noteThroughput(bytesPerSecond: Double, now: Date = Date()) {}
 
     /// A rung change keeps the old adapter alive until the new one authenticates,
     /// so the tunnel never drops to "open" in between — and if the new rung
@@ -515,6 +582,8 @@ public final class ConnectionCoordinator: @unchecked Sendable {
                     for other in self.racing.keys where other != rung { self.discard(other) }
                     if let old = previous?.rung, old != rung { self.discard(old) }
                     previous?.stop()
+                    // The standby was warmed for the rung we are leaving.
+                    self.clearStandby()
                     self.winner = candidate
                     self.server = host
                     self.dialling = [rung: host]

@@ -496,7 +496,7 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         guard let healthy = coordinator.sampleLiveness() else { return }
         // rttMs is measured by the prober, not inferred here; the engine reads
         // only lossFraction and handshakeOK.
-        sampleThroughput(coordinator)
+        sampleThroughput(coordinator, healthy: healthy)
         let health = LinkHealth(rttMs: 0, lossFraction: healthy ? 0 : 1, handshakeOK: healthy)
         if !healthy, machine.state.forwardingAllowed {
             publishFilterState(up: false, server: coordinator.activeServer)
@@ -515,7 +515,7 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
     ///
     /// Only inbound: it is what a download feels like, and the outbound side of
     /// a browsing session is mostly ACKs.
-    private func sampleThroughput(_ coordinator: ConnectionCoordinator) {
+    private func sampleThroughput(_ coordinator: ConnectionCoordinator, healthy: Bool) {
         let rx = coordinator.transferred.rx
         let now = Date()
         defer { lastRxSample = (rx, now) }
@@ -524,10 +524,23 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         // A counter that went backwards means a new session on a new relay;
         // there is no rate to read across that boundary.
         guard elapsed > 0, rx >= previous.bytes else { return }
-        let rate = Double(rx - previous.bytes) / elapsed
-        relayThroughputStore?.record(relay.id, bytesPerSecond: rate)
-        coordinator.noteThroughput(bytesPerSecond: rate, now: now)
+        // A window in which the tunnel was not working is not a measurement of
+        // the relay. This guard was missing, so a dead Worker leg scored ~0 and
+        // the EWMA in `RelayThroughputStore` demoted a relay for the crime of
+        // being attached when our own leg died.
+        guard healthy else { return }
+        let delta = rx - previous.bytes
+        // Nor is an idle window. Recording the zero poisons the ranking with a
+        // number about the *user*, not the relay: a session spent reading one
+        // page would permanently rank a good relay below an untried one.
+        guard delta >= Self.throughputSampleFloor else { return }
+        relayThroughputStore?.record(relay.id, bytesPerSecond: Double(delta) / elapsed)
     }
+
+    /// Bytes that have to arrive in a health interval before the window says
+    /// anything about the relay. Deliberately low — this separates "nothing
+    /// happened" from "something happened", not fast from slow.
+    static let throughputSampleFloor: UInt64 = 64 * 1024
 
     /// Keep the server ranking honest: re-measure occasionally and on network
     /// change so "fastest" means fastest *here, now*.

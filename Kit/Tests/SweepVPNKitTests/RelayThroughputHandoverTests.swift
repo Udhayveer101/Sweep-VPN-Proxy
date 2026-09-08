@@ -2,12 +2,17 @@ import XCTest
 import SweepVPNCore
 @testable import SweepVPNKit
 
-/// A relay that authenticates and then delivers a trickle is invisible to every
-/// check the tunnel has: bytes *are* moving, so `sampleLiveness` calls it
-/// healthy, no failure is ever reported, and the coordinator happily sits on it
-/// forever. That is the state the user reports as "connected but the internet is
-/// slow". These guard the handover that gets off it — and, just as importantly,
-/// the guards that stop it turning the pool into a carousel.
+/// The coordinator used to tear the tunnel down and re-cut the pool when the
+/// measured rate sat under 2 Mbps for two samples. It could not work, and the
+/// reason is worth keeping in a test rather than only in a commit message:
+/// **passive byte counters cannot tell a slow relay from an unsaturated one.**
+/// A game pushing 40 KB/s over a healthy relay produces exactly the numbers a
+/// throttled relay does, so the check fired hardest on the low-bandwidth
+/// sessions it was meant to protect — a hard teardown, with the tunnel down for
+/// a whole OpenVPN handshake, every time the cooldown expired.
+///
+/// This guards the absence of that behaviour. Throughput is still measured; it
+/// ranks relays at connect time, where comparing history is a fair question.
 final class RelayThroughputHandoverTests: XCTestCase {
 
     private func relay(_ id: String, load: Double) -> Server {
@@ -61,95 +66,42 @@ final class RelayThroughputHandoverTests: XCTestCase {
         return (c, log, up)
     }
 
-    /// The whole point: two sub-floor samples, past the dwell, with somewhere
-    /// better to go.
-    func testASustainedTrickleHandsOverToAnotherRelay() {
+    /// A sustained trickle is a fact about the *session*, not the relay, and
+    /// must never cost the user their tunnel.
+    func testASustainedTrickleNeverCostsTheTunnel() {
         let (c, log, up) = connectedPool()
         c.start(signals: NetworkSignals())
         wait(for: [up], timeout: 5)
         XCTAssertEqual(c.activeServer?.id, ServerID("slow"))
+        let dialsAtConnect = log.all.count
 
-        // Well past `voluntarySwitchDwell`, so the relay has had its fair run.
-        let later = Date().addingTimeInterval(120)
-        c.noteThroughput(bytesPerSecond: 20_000, now: later)
-        c.noteThroughput(bytesPerSecond: 20_000, now: later)
+        // Far past every threshold the old check used: well beyond the dwell,
+        // many consecutive samples, all of them deep under the old floor. This
+        // is what a game looks like.
+        let later = Date().addingTimeInterval(300)
+        for _ in 0..<10 { c.noteThroughput(bytesPerSecond: 20_000, now: later) }
 
-        let moved = XCTestExpectation(description: "handed over to the other relay")
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
-            if c.activeServer?.id == ServerID("fast") { moved.fulfill() }
-        }
-        wait(for: [moved], timeout: 5)
-        XCTAssertEqual(log.all.last, ServerID("fast"))
-    }
-
-    /// One quiet interval is the user not loading anything, not a bad relay.
-    func testASingleSlowSampleIsNotEnough() {
-        let (c, _, up) = connectedPool()
-        c.start(signals: NetworkSignals())
-        wait(for: [up], timeout: 5)
-
-        c.noteThroughput(bytesPerSecond: 20_000, now: Date().addingTimeInterval(120))
-        Thread.sleep(forTimeInterval: 0.6)
-        XCTAssertEqual(c.activeServer?.id, ServerID("slow"),
-                       "one sample under the floor must not cost a handover")
-    }
-
-    /// A relay only just connected has not earned a verdict yet — the opening
-    /// seconds of a session are slow for reasons that are not the relay's.
-    func testATrickleBeforeTheDwellIsIgnored() {
-        let (c, _, up) = connectedPool()
-        c.start(signals: NetworkSignals())
-        wait(for: [up], timeout: 5)
-
-        let soon = Date().addingTimeInterval(5)
-        c.noteThroughput(bytesPerSecond: 20_000, now: soon)
-        c.noteThroughput(bytesPerSecond: 20_000, now: soon)
-        Thread.sleep(forTimeInterval: 0.6)
-        XCTAssertEqual(c.activeServer?.id, ServerID("slow"))
-    }
-
-    /// A relay doing real work is left alone however long the session runs.
-    func testAHealthyRateNeverTriggersAHandover() {
-        let (c, _, up) = connectedPool()
-        c.start(signals: NetworkSignals())
-        wait(for: [up], timeout: 5)
-
-        let later = Date().addingTimeInterval(120)
-        for _ in 0..<6 { c.noteThroughput(bytesPerSecond: 1_500_000, now: later) }
-        Thread.sleep(forTimeInterval: 0.6)
-        XCTAssertEqual(c.activeServer?.id, ServerID("slow"))
-    }
-
-    /// With one relay there is nowhere better to go, and dropping the tunnel to
-    /// redial the same machine is strictly worse than a slow tunnel.
-    func testASingleRelayIsNeverAbandonedForBeingSlow() {
-        let log = DialLog()
-        let up = expectation(description: "connected")
-        up.assertForOverFulfill = false
-        let c = coordinator(pool: [relay("only", load: 0.1)], dialled: log,
-                            onAuthenticated: { _, _ in up.fulfill() })
-        c.start(signals: NetworkSignals())
-        wait(for: [up], timeout: 5)
-
-        let later = Date().addingTimeInterval(120)
-        for _ in 0..<4 { c.noteThroughput(bytesPerSecond: 10_000, now: later) }
-        Thread.sleep(forTimeInterval: 0.6)
-        XCTAssertEqual(c.activeServer?.id, ServerID("only"))
-        XCTAssertEqual(log.all, [ServerID("only")], "no redial of the only relay there is")
-    }
-
-    /// A uniformly slow network must not cycle the pool on every sample pair —
-    /// each handover costs a reconnect, so unchecked it is worse than the slow
-    /// relay it is running from.
-    func testTheCooldownStopsThePoolBecomingACarousel() {
-        let (c, log, up) = connectedPool()
-        c.start(signals: NetworkSignals())
-        wait(for: [up], timeout: 5)
-
-        let later = Date().addingTimeInterval(120)
-        for _ in 0..<10 { c.noteThroughput(bytesPerSecond: 10_000, now: later) }
         Thread.sleep(forTimeInterval: 1.5)
-        XCTAssertLessThanOrEqual(log.all.count, 2,
-                                 "ten slow samples inside the cooldown is one handover, not five")
+        XCTAssertEqual(c.activeServer?.id, ServerID("slow"),
+                       "a low-bandwidth session must not be mistaken for a bad relay")
+        XCTAssertEqual(log.all.count, dialsAtConnect,
+                       "no relay may be dialled on throughput grounds")
+    }
+
+    /// A rate of literally zero — an idle user, or a leg that has already died —
+    /// is the case that produced `relayTooSlow: 10 KB/s` seven seconds after
+    /// `wssFailed` in the field log.
+    func testAnIdleSessionNeverCostsTheTunnel() {
+        let (c, log, up) = connectedPool()
+        c.start(signals: NetworkSignals())
+        wait(for: [up], timeout: 5)
+        let dialsAtConnect = log.all.count
+
+        let later = Date().addingTimeInterval(300)
+        for _ in 0..<10 { c.noteThroughput(bytesPerSecond: 0, now: later) }
+
+        Thread.sleep(forTimeInterval: 1.5)
+        XCTAssertEqual(c.activeServer?.id, ServerID("slow"))
+        XCTAssertEqual(log.all.count, dialsAtConnect)
     }
 }

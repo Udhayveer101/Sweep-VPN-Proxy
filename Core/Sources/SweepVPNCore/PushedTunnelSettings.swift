@@ -58,8 +58,16 @@ public struct PushedTunnelSettings: Codable, Sendable, Equatable {
     /// MTU to install, clamped to something a tunnel can actually carry. A
     /// relay that pushes 0 (VPN Gate does) or something absurd must not be
     /// allowed to produce an unusable interface.
+    ///
+    /// The fallback is 1280, not 1400, because of what the packet is wrapped in
+    /// on the rungs that need this: inner IP inside OpenVPN inside a WebSocket
+    /// frame inside TLS inside the outer TCP/IP, which is 110-140 bytes of
+    /// headers before anything of ours is on the wire. At 1400 every full-size
+    /// packet fragments at the outer layer, and on a TCP-over-TCP path a lost
+    /// fragment costs far more than the payload it carried. 1280 is also the
+    /// IPv6 minimum, so nothing downstream has to special-case it.
     public var effectiveMTU: Int {
-        (576...1500).contains(mtu) ? mtu : 1400
+        (576...1500).contains(mtu) ? mtu : 1280
     }
 
     // MARK: - Validation

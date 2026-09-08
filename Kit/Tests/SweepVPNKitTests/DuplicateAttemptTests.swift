@@ -29,53 +29,11 @@ final class DuplicateAttemptTests: XCTestCase {
         var all: [ServerID] { lock.lock(); defer { lock.unlock() }; return ids }
     }
 
-    /// A throughput handover stops the live adapter and arms the next relay.
-    /// The stopped adapter's DISCONNECTED must not arm a second one.
-    func testAHandoverStartsExactlyOneReplacementAttempt() {
-        let pool = (0..<6).map { relay("r\($0)", load: Double($0) / 10) }
-        let dials = Dials()
-        var constants = AutoModeConstants()
-        constants.raceStagger = 0.01
-        constants.raceDeadline = 0.5
-        constants.slowRungDeadline = 0.5
-        let up = expectation(description: "connected")
-        up.assertForOverFulfill = false
-
-        let c = ConnectionCoordinator(
-            engine: AutoModeEngine(constants: constants,
-                                   preference: .forced(.openVPNTCP),
-                                   enabledRungs: [.openVPNTCP]),
-            catalog: ServerCatalog(servers: pool, rungs: [.openVPNTCP]),
-            memory: NetworkMemory(),
-            constants: constants,
-            build: { rung, server in
-                dials.append(server.id)
-                return FakeAdapter(rung: rung,
-                                   behaviour: .authenticateThenFailOnStop(after: 0.02))
-            },
-            callbacks: .init(onAuthenticated: { _, _ in up.fulfill() },
-                             onInbound: { _, _ in },
-                             onExhausted: { _ in }))
-
-        c.start(signals: NetworkSignals())
-        wait(for: [up], timeout: 5)
-        XCTAssertEqual(dials.all.count, 1, "the connect itself dialled more than one relay")
-
-        // Two sub-floor samples, past the dwell: a voluntary handover.
-        let later = Date().addingTimeInterval(120)
-        c.noteThroughput(bytesPerSecond: 9 * 1024, now: later)
-        c.noteThroughput(bytesPerSecond: 9 * 1024, now: later)
-
-        let settled = expectation(description: "settled")
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) { settled.fulfill() }
-        wait(for: [settled], timeout: 5)
-
-        // One handover, one new relay. Two means the stopped adapter armed an
-        // attempt of its own alongside the intended one — the duplicate tunnel.
-        XCTAssertEqual(dials.all.count, 2,
-                       "one handover dialled \(dials.all.count) relays: \(dials.all)")
-        XCTAssertEqual(Set(dials.all).count, dials.all.count, "a relay was dialled twice")
-    }
+    // The throughput-driven handover that used to trigger this shape has been
+    // removed — it could not distinguish a slow relay from an unsaturated one,
+    // and fired on exactly the low-bandwidth sessions it was meant to help. The
+    // invariant it guarded is unchanged and is covered below, via the live
+    // tunnel drop, which is the path that actually happens in the field.
 
     /// The same shape from the other direction: the live tunnel dies. The
     /// coordinator stops the adapter as part of handling that, and the stop's

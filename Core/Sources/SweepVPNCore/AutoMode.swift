@@ -28,6 +28,13 @@ public struct AutoModeConstants: Sendable, Equatable {
     /// Must stay below the provider's handshake deadline, which is the outer bound.
     public var slowRungDeadline: TimeInterval = 25
     public var serverSwitchMinGainMs: Double = 25
+    /// How long a relay carries the tunnel before its replacement is warmed
+    /// alongside it. On third-party relays a drop is the normal course of a
+    /// session — VPN Gate volunteers FIN at 62 s idle, 92 s live by our own
+    /// measurement — so the replacement has to be authenticated *before* the
+    /// drop or every one of them costs a full OpenVPN handshake of dead tunnel.
+    /// Under the shortest observed FIN, so the standby is ready in time.
+    public var standbyLeadTime: TimeInterval = 40
     public init() {}
 }
 

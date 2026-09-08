@@ -90,6 +90,77 @@ final class WebSocketTransportTests: XCTestCase {
         XCTAssertTrue(first.contains("s=\(session)"), first)
     }
 
+    /// `stop()` used to cancel only the listener. Every leg already bridged
+    /// kept running — its loopback socket, its Worker connection and its
+    /// WebSocket — while the transport that owned them was released. When the
+    /// Worker then closed with `1000 "eof"`, the handler reached for a `self`
+    /// that no longer existed and bailed, so the relay-gone verdict never
+    /// reached the coordinator and nothing handed over. That is the 20-35 s of
+    /// dead tunnel in the field log, and the `?` in `relay ? dropped the
+    /// session` is the deallocated transport signing its own name.
+    ///
+    /// A leg must not outlive the transport that owns it. The stand-in Worker
+    /// here accepts and then says nothing, which is what keeps the leg alive
+    /// long enough for `stop()` to be the thing that ends it — an unroutable
+    /// address would have the leg tear itself down and prove nothing.
+    func testStoppingTheTransportTearsDownLegsItAlreadyBridged() throws {
+        // A silent stand-in for the Worker, so the leg stays up.
+        let sinkParams = NWParameters.tcp
+        sinkParams.allowLocalEndpointReuse = true
+        let sink = try NWListener(using: sinkParams)
+        let accepted = expectation(description: "the leg reached the stand-in Worker")
+        accepted.assertForOverFulfill = false
+        let listening = expectation(description: "stand-in Worker listening")
+        final class Held: @unchecked Sendable { var connections: [NWConnection] = [] }
+        let held = Held()
+        sink.newConnectionHandler = { connection in
+            connection.start(queue: .global())
+            held.connections.append(connection)
+            accepted.fulfill()
+        }
+        sink.stateUpdateHandler = { if case .ready = $0 { listening.fulfill() } }
+        sink.start(queue: .global())
+        defer { sink.cancel() }
+        wait(for: [listening], timeout: 5)
+        let sinkPort = try XCTUnwrap(sink.port?.rawValue)
+        XCTAssertGreaterThan(sinkPort, 0)
+
+        let group = "sweep.test.\(UUID().uuidString)"
+        RelayTunnelSettings.cache(workerAddresses: ["127.0.0.1"], appGroup: group)
+        let transport = WebSocketTransport(
+            workerURL: URL(string: "https://127.0.0.1:\(sinkPort)/tcp")!,
+            token: "t", host: "203.0.113.1", port: 443, appGroup: group)
+        let localPort = try transport.start()
+
+        let ended = expectation(description: "the leg was torn down by stop()")
+        // Teardown surfaces both as a completed read and as a cancelled state.
+        ended.assertForOverFulfill = false
+        let connection = NWConnection(host: "127.0.0.1",
+                                      port: NWEndpoint.Port(rawValue: localPort)!,
+                                      using: .tcp)
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 1) {
+                    data, _, isComplete, error in
+                    if isComplete || error != nil || (data?.isEmpty ?? true) { ended.fulfill() }
+                }
+            case .failed, .cancelled:
+                ended.fulfill()
+            default:
+                break
+            }
+        }
+        connection.start(queue: .global())
+        defer { connection.cancel() }
+
+        wait(for: [accepted], timeout: 5)
+        // The leg is up and waiting on a Worker that will never answer. Only
+        // stop() can end it now.
+        transport.stop()
+        wait(for: [ended], timeout: 5)
+    }
+
     func testRelayAnswersThroughTheWorkerTunnel() throws {
         let token = ProcessInfo.processInfo.environment["SWEEP_TUNNEL_TOKEN"] ?? ""
         try XCTSkipIf(token.isEmpty, "set SWEEP_TUNNEL_TOKEN to run the live tunnel test")

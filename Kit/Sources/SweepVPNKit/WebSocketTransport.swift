@@ -51,6 +51,17 @@ public final class WebSocketTransport: @unchecked Sendable {
     private let appGroup: String
     private let queue = DispatchQueue(label: "vpn.sweep.wstransport")
     private var listener: NWListener?
+    /// Every leg this transport has bridged and not yet torn down.
+    /// `stop()` used to cancel only the listener, so a leg outlived the
+    /// transport that owned it: its socket still received the Worker's
+    /// `1000 "eof"`, but by then `self` was gone and the handler bailed at its
+    /// `guard let self`. The relay-gone verdict was dropped on the floor and
+    /// the coordinator — the only thing that can move to another relay — never
+    /// heard about it, which is the 20-35 s of dead tunnel in the field log
+    /// (`relay ? dropped the session`, where the `?` is the missing `self`).
+    /// Owning the legs is what makes `stop()` mean stop. Only `queue` touches
+    /// this, like every other leg field.
+    private var legs: [Leg] = []
 
     public init(workerURL: URL = WebSocketTransport.defaultWorkerURL,
                 token: String, host: String, port: UInt16,
@@ -109,6 +120,13 @@ public final class WebSocketTransport: @unchecked Sendable {
     public func stop() {
         listener?.cancel()
         listener = nil
+        // Cancelling the listener only stops *new* legs. The ones already
+        // bridged have to be torn down here, or they outlive this object and
+        // report their verdicts into a deallocated `self`.
+        queue.async { [self] in
+            for leg in legs { tearDown(leg, nil) }
+            legs.removeAll()
+        }
     }
 
     // MARK: - One connection
@@ -176,7 +194,13 @@ public final class WebSocketTransport: @unchecked Sendable {
         }
 
         // No `NWProtocolWebSocket`: see `MinimalWebSocket` for the measurements.
-        return NWConnection(to: .hostPort(host: .ipv4(ipv4), port: NWEndpoint.Port(rawValue: 443)!),
+        // The URL's port when it carries one, 443 otherwise. Hardcoding 443
+        // meant a `workerURL` naming any other port was silently dialled on the
+        // wrong one — which in production is always 443, but made the leg
+        // untestable against a stand-in.
+        let port = workerURL.port.flatMap { UInt16(exactly: $0) } ?? 443
+        return NWConnection(to: .hostPort(host: .ipv4(ipv4),
+                                          port: NWEndpoint.Port(rawValue: port)!),
                             using: params)
     }
 
@@ -246,6 +270,7 @@ public final class WebSocketTransport: @unchecked Sendable {
         // is a different bug from anything on the Worker leg.
         Diagnostics.shared.record("wssDialled")
         let leg = Leg(connection)
+        legs.append(leg)
         connection.start(queue: queue)
         dial(leg)
     }
@@ -376,14 +401,20 @@ public final class WebSocketTransport: @unchecked Sendable {
     private func tearDown(_ leg: Leg, _ worker: NWConnection?) {
         leg.closed = true
         leg.socket?.stopKeepalive()
+        leg.socket = nil
         leg.outbound.removeAll()
         worker?.cancel()
         leg.connection.cancel()
+        legs.removeAll { $0 === leg }
     }
 
     /// Tear down *and* say the relay is unusable, so the coordinator burns it
     /// and hands over instead of leaving OpenVPN 3 to retry it.
     private func giveUp(_ leg: Leg, _ worker: NWConnection?) {
+        // `legFailed` has always guarded on `closed`; this did not, so a close
+        // frame arriving from a leg we had already given up on burned a second
+        // relay — one the tunnel was not even using by then.
+        guard !leg.closed else { return }
         tearDown(leg, worker)
         onUnusable?()
     }
@@ -472,7 +503,16 @@ public final class WebSocketTransport: @unchecked Sendable {
                     ?? "relay \(self?.host ?? "?") dropped the session "
                         + "(\(socket.closeSummary ?? "stream ended, no close frame")) "
                         + "after \(Int(Date().timeIntervalSince(openedAt)))s")
-            guard let self else { return }
+            guard let self else {
+                // Unreachable now that `stop()` tears its legs down, but a
+                // silently dropped verdict is what cost the last two sessions.
+                // If it ever happens again it says so in the log instead of
+                // looking like the tunnel simply went quiet.
+                Diagnostics.shared.record(
+                    "wssVerdictOrphaned",
+                    "a leg outlived its transport; the relay verdict was lost")
+                return
+            }
             // The Worker closes 1000 "eof" when the *relay* hung up, and 1008
             // when it will not carry this relay at all. Neither is our leg
             // failing, so neither is worth a redial — the relay is gone and
