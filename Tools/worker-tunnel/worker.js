@@ -259,6 +259,11 @@ export class RelaySession {
       ws.send(new Uint8Array([0x00]));
       ws.close(1008, reason);
     } catch {}
+    // Drop the leg, or `destroy()` closes it a second time with `1000 "eof"`
+    // and the client is told the destination hung up when in fact it was
+    // refused — the two need very different responses from the client, and the
+    // reason it needs is the one that was being overwritten.
+    if (this.ws === ws) this.ws = null;
   }
 
   async open(host, port) {
@@ -274,9 +279,21 @@ export class RelaySession {
       // the session. That is precisely the metadata a VPN exists to not produce,
       // and it was being produced by the operator rather than the network.
       this.ws?.send(new Uint8Array([0x01]));
-    } catch {
+    } catch (e) {
       this.socket = null;
-      if (this.ws) this.refuse(this.ws, "connect failed");
+      // The reason travels to the client that asked for this destination and
+      // nowhere else — it is not logged, so it names nothing the operator
+      // should not see, and a client staring at "connect failed" has no way to
+      // tell a refused destination from a dead host. Measured cases worth
+      // recognising: Cloudflare will not let a Worker `connect()` back into its
+      // own network, so any Cloudflare-fronted destination — example.com and
+      // api.ipify.org among them — answers "consider using fetch instead" and
+      // is simply not reachable this way. Ordinary hosts are.
+      //
+      // Capped well under the 123-byte WebSocket close-reason limit: `close()`
+      // throws past it, and a throw here means no close frame at all, which
+      // reaches the client as a hang rather than as a refusal.
+      if (this.ws) this.refuse(this.ws, `connect failed: ${e?.message ?? e}`.slice(0, 110));
       this.destroy();
       return;
     }
