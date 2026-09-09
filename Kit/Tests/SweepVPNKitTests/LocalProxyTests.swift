@@ -146,6 +146,51 @@ final class LocalProxyTests: XCTestCase {
         XCTAssertNotEqual(worker, LocalProxy.Upstream.socks5(host: "127.0.0.1", port: 9050))
     }
 
+    /// Changing the upstream on a running proxy must not rebind the socket.
+    /// `NWListener.cancel()` is asynchronous, so a stop-then-start on the same
+    /// port raced its own cancel and lost with "Address already in use" —
+    /// leaving the toggle on and nothing listening. The tell is the socket
+    /// leaving the listening state at all: a live proxy that reports stopped or
+    /// failed while being reconfigured has already dropped the port.
+    func testChangingUpstreamNeverDropsTheListener() throws {
+        let settings = RelayTunnelSettings(
+            enabled: true,
+            workerURL: try XCTUnwrap(URL(string: "https://example.workers.dev")),
+            token: "t")
+        let proxy = try XCTUnwrap(LocalProxy(port: 18082, upstream: .direct))
+
+        let listening = expectation(description: "listening")
+        listening.assertForOverFulfill = false
+        proxy.start(upstream: .direct) { state in
+            if case .listening = state { listening.fulfill() }
+        }
+        wait(for: [listening], timeout: 5)
+        defer { proxy.stop() }
+
+        // The switch the app makes when the Worker toggle is flipped.
+        let seen = StateRecorder()
+        proxy.start(upstream: .worker(settings)) { seen.record($0) }
+
+        // Long enough for an asynchronous cancel to land, had one been asked for.
+        let settled = expectation(description: "settled")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { settled.fulfill() }
+        wait(for: [settled], timeout: 5)
+
+        XCTAssertEqual(proxy.state, .listening(port: 18082),
+                       "the proxy stopped listening while only its upstream changed")
+        XCTAssertTrue(seen.states.allSatisfy { if case .listening = $0 { return true } else { return false } },
+                      "the socket left the listening state: \(seen.states)")
+    }
+
+    /// The state callback fires on the listener's queue, so the test's own view
+    /// of it needs a lock rather than an array.
+    private final class StateRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var seen: [LocalProxy.State] = []
+        func record(_ s: LocalProxy.State) { lock.lock(); seen.append(s); lock.unlock() }
+        var states: [LocalProxy.State] { lock.lock(); defer { lock.unlock() }; return seen }
+    }
+
     /// A proxy configured for the Worker must still be constructible and bind
     /// loopback, or the Settings toggle would fail with no state to show.
     func testProxyStartsWithWorkerUpstream() throws {

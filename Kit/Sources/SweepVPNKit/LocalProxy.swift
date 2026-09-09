@@ -49,6 +49,8 @@ public final class LocalProxy: @unchecked Sendable {
     }
 
     private let port: NWEndpoint.Port
+    /// Read on the listener's queue by every accepted connection, written from
+    /// the main actor when a setting changes.
     private var upstream: Upstream
     private var listener: NWListener?
     private var onState: (@Sendable (State) -> Void)?
@@ -64,6 +66,21 @@ public final class LocalProxy: @unchecked Sendable {
                       onState: @escaping @Sendable (State) -> Void) {
         self.onState = onState
         if let upstream { self.upstream = upstream }
+
+        // Changing where connections go does not need a new socket, and taking
+        // one anyway was the bug: `stop()` cancels the listener asynchronously,
+        // so rebinding the same port in the same breath raced that cancel and
+        // usually lost — "Address already in use", then the half-built listener
+        // reporting cancelled. The toggle stayed on, the UI still claimed to be
+        // listening, and the browser got a refused connection.
+        //
+        // Connections already spliced keep the upstream they were dialled with;
+        // only new ones follow the change, which is what a user changing a
+        // setting expects anyway.
+        if listener != nil, case .listening = state {
+            onState(state)
+            return
+        }
         stop()
         do {
             let params = NWParameters.tcp
