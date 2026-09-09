@@ -20,6 +20,11 @@ public final class LocalProxy: @unchecked Sendable {
         case direct
         /// Chain through another SOCKS5 proxy, i.e. Tor.
         case socks5(host: String, port: Int)
+        /// Carry each connection to the Cloudflare Worker, which dials the
+        /// destination itself. No relay, no packet tunnel — the Worker is the
+        /// exit. This is the mode that works on a network where App Control
+        /// kills a bare OpenVPN handshake but TLS to workers.dev passes.
+        case worker(RelayTunnelSettings)
     }
 
     public enum State: Equatable, Sendable {
@@ -161,6 +166,18 @@ public final class LocalProxy: @unchecked Sendable {
                     }
                     let port = Int(portData[portData.startIndex]) << 8
                         | Int(portData[portData.startIndex + 1])
+                    if case .worker(let settings) = self.upstream {
+                        self.connectWorker(settings, host: host, port: port) { stream in
+                            guard let stream else { self.socksFail(client, code: 0x05); return }
+                            // Bound address 0.0.0.0:0 — the real bound address
+                            // is the Worker's and is not ours to disclose.
+                            let reply = Data([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                            client.send(content: reply, completion: .contentProcessed { _ in
+                                self.splice(client, stream)
+                            })
+                        }
+                        return
+                    }
                     self.connectUpstream(host: host, port: port) { remote in
                         guard let remote else { self.socksFail(client, code: 0x05); return }
                         // Success. The bound-address field is not meaningful for a
@@ -200,6 +217,17 @@ public final class LocalProxy: @unchecked Sendable {
                 return
             }
             let host = String(target[target.startIndex..<colon])
+            if case .worker(let settings) = self.upstream {
+                self.connectWorker(settings, host: host, port: port) { stream in
+                    guard let stream else { self.httpFail(client, "502 Bad Gateway"); return }
+                    let ok = Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8)
+                    client.send(content: ok, completion: .contentProcessed { _ in
+                        if !leftover.isEmpty { stream.send(leftover) }
+                        self.splice(client, stream)
+                    })
+                }
+                return
+            }
             self.connectUpstream(host: host, port: port) { remote in
                 guard let remote else { self.httpFail(client, "502 Bad Gateway"); return }
                 let ok = Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8)
@@ -252,6 +280,37 @@ public final class LocalProxy: @unchecked Sendable {
                     if ok { done(conn) } else { conn.cancel(); done(nil) }
                 }
             }
+        case .worker:
+            // Handled by `connectWorker`, which has the client connection to
+            // splice against. Callers check for `.worker` before reaching here.
+            done(nil)
+        }
+    }
+
+    /// The Worker path needs both ends at once — a `WorkerStream` is not an
+    /// `NWConnection`, so it cannot be returned through `connectUpstream`.
+    private func connectWorker(_ settings: RelayTunnelSettings, host: String, port: Int,
+                               done: @escaping @Sendable (WorkerStream?) -> Void) {
+        WorkerStream.open(settings: settings, host: host, port: port, queue: queue, completion: done)
+    }
+
+    /// Client <-> Worker. The mixed-type twin of `splice(_:_:)`.
+    private func splice(_ client: NWConnection, _ stream: WorkerStream) {
+        stream.receive(onData: { data in
+            client.send(content: data, completion: .contentProcessed { _ in })
+        }, onClose: {
+            client.cancel()
+        })
+        pumpToWorker(client, stream)
+    }
+
+    private func pumpToWorker(_ client: NWConnection, _ stream: WorkerStream) {
+        client.receive(minimumIncompleteLength: 1, maximumLength: 32 * 1024) { data, _, done, error in
+            if let data, !data.isEmpty { stream.send(data) }
+            if done || error != nil {
+                stream.cancel(); client.cancel(); return
+            }
+            self.pumpToWorker(client, stream)
         }
     }
 

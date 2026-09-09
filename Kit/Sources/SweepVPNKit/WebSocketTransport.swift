@@ -581,7 +581,7 @@ public final class WebSocketTransport: @unchecked Sendable {
 /// The token only rate-limits our own Worker — it is not a credential that
 /// protects user data — so the app group is the right home for it rather than
 /// the keychain the tunnel secrets use.
-public struct RelayTunnelSettings: Sendable {
+public struct RelayTunnelSettings: Sendable, Equatable {
     public var enabled: Bool
     public var workerURL: URL
     public var token: String

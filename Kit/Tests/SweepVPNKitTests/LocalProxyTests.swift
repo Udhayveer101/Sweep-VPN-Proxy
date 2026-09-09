@@ -132,5 +132,34 @@ final class LocalProxyTests: XCTestCase {
         let got = try exchange(port: 11082, send: [req], expecting: 20)
         XCTAssertTrue((String(data: got, encoding: .utf8) ?? "").contains("405"))
     }
+
+    /// `.worker` must be a real, distinct upstream — not silently equal to
+    /// `.direct`, which would send traffic straight at the blocked network and
+    /// look like the proxy working.
+    func testWorkerUpstreamIsDistinct() throws {
+        let settings = RelayTunnelSettings(
+            enabled: true,
+            workerURL: try XCTUnwrap(URL(string: "https://example.workers.dev")),
+            token: "t")
+        let worker = LocalProxy.Upstream.worker(settings)
+        XCTAssertNotEqual(worker, LocalProxy.Upstream.direct)
+        XCTAssertNotEqual(worker, LocalProxy.Upstream.socks5(host: "127.0.0.1", port: 9050))
+    }
+
+    /// A proxy configured for the Worker must still be constructible and bind
+    /// loopback, or the Settings toggle would fail with no state to show.
+    func testProxyStartsWithWorkerUpstream() throws {
+        let settings = RelayTunnelSettings(
+            enabled: true,
+            workerURL: try XCTUnwrap(URL(string: "https://example.workers.dev")),
+            token: "t")
+        let proxy = try XCTUnwrap(LocalProxy(port: 18081, upstream: .worker(settings)))
+        let listening = expectation(description: "listening")
+        proxy.start(upstream: .worker(settings)) { state in
+            if case .listening = state { listening.fulfill() }
+        }
+        wait(for: [listening], timeout: 5)
+        proxy.stop()
+    }
 }
 #endif
