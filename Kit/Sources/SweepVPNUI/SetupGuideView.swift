@@ -19,7 +19,7 @@ public struct SetupGuideView: View {
     private var steps: [Step] {
         [
             Step(title: "Create an offline signing key",
-                 detail: "Sweep refuses any server list that is not signed by a key you hold. Generate one, then paste the printed public key into SWEEP_CONFIG_SIGNING_KEY in project.yml.",
+                 detail: "Sweep refuses any server list that is not signed by a key you hold. Generate one, then paste the printed public key into SWEEP_CONFIG_SIGNING_KEY in Config/Local.xcconfig.",
                  command: "swift run --package-path Tools/sweep-sign sweep-sign keygen sweep-config.key"),
             Step(title: "Set up a server",
                  detail: "Run the provisioning script on a machine with a public IP. It installs WireGuard, an in-tunnel resolver, and a default-deny firewall.",

@@ -1,9 +1,24 @@
 # Sweep VPN — iOS + macOS
 
-Implementation of the architecture researched in the VPN Obsidian vault
-(`~/VPN`). Security-first personal VPN: WireGuard data plane, kernel IKEv2
-fallback, fail-closed kill switch, offline-signed control plane, frosted-glass
-client.
+A personal VPN client you run against your own server: WireGuard data plane,
+kernel IKEv2 fallback, fail-closed kill switch, offline-signed control plane.
+
+**It ships with no servers and no accounts, and that is the point.** There is no
+Sweep service behind this — no endpoint of ours to trust, meter, or subpoena.
+You point it at a VPS you control, or at the public VPN Gate relays with the
+tradeoff spelled out below. Nothing in a build reaches for infrastructure
+belonging to whoever published it.
+
+## Getting it
+
+**Download a build** — see [Releases](../../releases). macOS 14+, Apple silicon
+and Intel. Signed and notarized, so it opens normally.
+
+**Or build it** — `make config`, fill in `Config/Local.xcconfig`, then
+`make install-macos`. Details under [Setup](#setup).
+
+Either way, read [First run](#first-run): out of the box the app has nowhere to
+connect to, and getting it somewhere is three or four steps.
 
 ## Layout
 | Path | What |
@@ -18,11 +33,11 @@ client.
 
 ## Build
 ```bash
-brew install xcodegen
+make config         # once, then fill in Config/Local.xcconfig
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
 make dataplane      # rebuild the xcframework from Rust
-xcodegen generate
-xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-iOS -sdk iphonesimulator build
+make install-macos  # build, sign, and install to /Applications
+make ios            # simulator build
 ```
 
 ## Tests
@@ -103,9 +118,9 @@ connects to a relay, pushes a real IPv4/UDP DNS query through the tunnel and
 waits for the reply.
 
 If your ISP blocks `vpngate.net` by category (Indian residential ISPs return a
-403 block page), set a mirror URL in the picker. A Cloudflare Worker that
-fetches the CSV and returns it is about fifteen lines and is reachable from a
-domain no category filter knows.
+403 block page), set a mirror URL in the picker — `Tools/worker-tunnel/deploy.sh`
+puts one on your own Cloudflare account and prints what to paste. See
+[If your network blocks it](#if-your-network-blocks-it).
 
 ## What ships (Tier 1)
 - Rungs 1–5 and 7 in the packet tunnel (boringtun core), rung 6 as a kernel profile.
@@ -129,14 +144,81 @@ outside it throws `rungNotImplemented` rather than silently substituting a
 different transport. Rungs 3 and 4 additionally need a TLS certificate on the
 server before `sweepbridge` will serve them.
 
-## Blockers that need a human
-1. **Apple Developer account.** The `packet-tunnel-provider` entitlement, an App
-   Group, and provisioning profiles must be created in the developer portal, and
-   `DEVELOPMENT_TEAM` set in `project.yml`. Until then the tunnel cannot run on a
-   device — the simulator cannot host a NetworkExtension at all.
-2. **A VPS.** `./Tools/sweep-fleet.sh add <label> <user@host> <CC> [city]`
-   provisions the box, reads its keys back and re-signs the bundle in one step.
-   See `Server/FREE-SERVERS.md` for the free-tier options and their real limits.
-3. **Signing key.** `sweep-sign keygen sweep-config.key`, then set
-   `SWEEP_CONFIG_SIGNING_KEY` in `project.yml` to the printed public key. With no
-   key pinned the app refuses to connect by design.
+## First run
+
+A fresh install has no servers, because there is no service to hand you any. Two
+routes, and you can take both:
+
+**Your own VPS (rungs 1–7, the real thing).** `Server/FREE-SERVERS.md` covers the
+free-tier options and where each one actually falls over.
+
+```bash
+swift run --package-path Tools/sweep-sign sweep-sign keygen sweep-config.key
+# paste the printed *public* key into SWEEP_CONFIG_SIGNING_KEY in Config/Local.xcconfig
+./Tools/sweep-fleet.sh add home you@your-vps.example US "New York"
+```
+
+`sweep-fleet.sh` provisions the box, reads its keys back and re-signs the bundle
+in one step. The private half stays in `sweep-config.key` and never leaves your
+machine; the app pins the public half and refuses any server list not signed by
+it, so nothing — not a compromised download host, not us — can hand it a server
+you did not put there.
+
+**Public VPN Gate relays (macOS only).** No server needed: the app fetches the
+volunteer relay list and measures it from your device. Read the two warnings in
+[Public relays](#public-relays-vpn-gate) before you rely on it — chiefly that the
+operator terminates your traffic in plaintext.
+
+### If your network blocks it
+
+Some networks block `vpngate.net` by category (Indian residential ISPs return a
+403), and some kill OpenVPN by protocol fingerprint the moment its handshake
+hits the wire, port 443 included. Both are answered by a small Cloudflare Worker
+on your own free account:
+
+```bash
+./Tools/worker-tunnel/deploy.sh
+```
+
+It prints a URL and a token. Paste them into the app under the relay list ▸
+**Mirror URL…**, or into `Config/Local.xcconfig` and rebuild. The Worker mirrors
+the relay CSV from a domain no category filter knows, and carries the relay's own
+TCP stream inside ordinary HTTPS.
+
+Deploy your own rather than sharing one. A Worker relaying other people's TCP is
+an open proxy wearing one account's name, and that account is the one that gets
+banned for whatever goes through it. No build ships one for this reason, and with
+none configured the app reports the leg off rather than quietly using someone
+else's.
+
+## Setup
+
+```bash
+brew install xcodegen
+make config           # creates Config/Local.xcconfig from the example
+```
+
+`Config/Local.xcconfig` is gitignored and holds everything that is yours rather
+than the project's — signing team, pinned key, your own Worker. Nothing in it is
+required to build; an empty value turns its feature off rather than falling back
+to a stranger's server. These are deliberately absent from `project.yml`, because
+a build configuration setting overrides the xcconfig beneath it and would win
+silently.
+
+You need an **Apple Developer account** to run it on hardware: the
+`packet-tunnel-provider` entitlement, an App Group and provisioning profiles are
+created in the developer portal, and `DEVELOPMENT_TEAM` goes in
+`Config/Local.xcconfig`. NetworkExtension entitlements cannot be ad-hoc signed,
+and the simulator cannot host a NetworkExtension at all.
+
+The `.xcodeproj` is generated, not tracked — `make project` writes it from
+`project.yml` plus your local config.
+
+## What this does not collect
+
+No account, no telemetry, no crash reporting, no analytics SDK. The diagnostics
+ring buffer is scrubbed of IPs, domains and DNS names before anything reaches it
+and never leaves the device. Secrets live in the keychain
+(`AfterFirstUnlock`, `ThisDeviceOnly`, app-group scoped). The only network calls
+a build makes on its own are to the server you configured and, if you asked for
+public relays, to `vpngate.net` or the mirror you named.
