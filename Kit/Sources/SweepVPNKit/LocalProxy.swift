@@ -85,7 +85,14 @@ public final class LocalProxy: @unchecked Sendable {
                     // toggle still reads on. This is the one place that knows.
                     EventLog.shared.record(phase: "proxy", level: .error, kind: "listenFailed",
                                            detail: e.localizedDescription)
-                case .cancelled: self.state = .stopped
+                case .cancelled:
+                    self.state = .stopped
+                    // The listener going away while the app still runs is the
+                    // shape of the bug that looks like the proxy never working:
+                    // the toggle stays on, the UI keeps its "listening" text,
+                    // and the browser gets a refused connection.
+                    EventLog.shared.record(phase: "proxy", level: .warn, kind: "listenerCancelled",
+                                           detail: "the listener went away")
                 default: break
                 }
             }
@@ -99,6 +106,9 @@ public final class LocalProxy: @unchecked Sendable {
     }
 
     public func stop() {
+        if listener != nil {
+            EventLog.shared.record(phase: "proxy", kind: "stopping", detail: "asked to stop")
+        }
         listener?.cancel()
         listener = nil
     }

@@ -181,6 +181,17 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
+    /// What the proxy is actually pointed at, for the line under the toggle.
+    /// It used to say "VPN" whenever Tor was off, which is wrong the moment the
+    /// Worker is the upstream — and wrong in the one place someone reads it.
+    public var proxyUpstreamLabel: String {
+        switch currentUpstream() {
+        case .direct: return "VPN"
+        case .socks5: return "Tor"
+        case .worker: return "Worker"
+        }
+    }
+
     public func setProxyThroughWorker(_ on: Bool) {
         var o = options
         o.proxyThroughWorker = on

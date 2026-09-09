@@ -81,7 +81,10 @@ public struct SettingsView: View {
                         get: { model.options.localProxyEnabled },
                         set: { model.setLocalProxy(enabled: $0) }))
                     if case .listening(let port) = model.proxyState {
-                        Text("SOCKS5 and HTTP CONNECT on 127.0.0.1:\(port)\(model.options.torEnabled ? " → Tor" : " → VPN")")
+                        // `\(port)` on its own renders as "1,080" — SwiftUI
+                        // gives an Int the locale's grouping separator, which
+                        // in a port number reads as a typo.
+                        Text("SOCKS5 and HTTP CONNECT on 127.0.0.1:\(String(port)) → \(model.proxyUpstreamLabel)")
                             .font(.footnote).foregroundStyle(.secondary)
                             .textSelection(.enabled)
                     } else if case .failed(let why) = model.proxyState {
