@@ -1,6 +1,7 @@
 #if os(macOS)
 import Foundation
 import Network
+import SweepVPNCore
 
 /// A loopback SOCKS5 + HTTP-CONNECT listener.
 ///
@@ -25,6 +26,16 @@ public final class LocalProxy: @unchecked Sendable {
         /// exit. This is the mode that works on a network where App Control
         /// kills a bare OpenVPN handshake but TLS to workers.dev passes.
         case worker(RelayTunnelSettings)
+
+        /// Names the upstream without naming a destination — the log is written
+        /// to disk, and which sites are proxied is not something to put there.
+        var label: String {
+            switch self {
+            case .direct: return "direct"
+            case .socks5: return "socks5"
+            case .worker: return "worker"
+            }
+        }
     }
 
     public enum State: Equatable, Sendable {
@@ -63,8 +74,17 @@ public final class LocalProxy: @unchecked Sendable {
             l.stateUpdateHandler = { [weak self] s in
                 guard let self else { return }
                 switch s {
-                case .ready: self.state = .listening(port: Int(self.port.rawValue))
-                case .failed(let e): self.state = .failed(e.localizedDescription)
+                case .ready:
+                    self.state = .listening(port: Int(self.port.rawValue))
+                    EventLog.shared.record(phase: "proxy", kind: "listening",
+                                           detail: "127.0.0.1:\(self.port.rawValue) → \(self.upstream.label)")
+                case .failed(let e):
+                    self.state = .failed(e.localizedDescription)
+                    // A proxy that never binds is silent everywhere else: the
+                    // browser says only ERR_PROXY_CONNECTION_FAILED, and the
+                    // toggle still reads on. This is the one place that knows.
+                    EventLog.shared.record(phase: "proxy", level: .error, kind: "listenFailed",
+                                           detail: e.localizedDescription)
                 case .cancelled: self.state = .stopped
                 default: break
                 }
@@ -73,6 +93,8 @@ public final class LocalProxy: @unchecked Sendable {
             listener = l
         } catch {
             state = .failed(error.localizedDescription)
+            EventLog.shared.record(phase: "proxy", level: .error, kind: "listenerRefused",
+                                   detail: error.localizedDescription)
         }
     }
 
