@@ -29,10 +29,13 @@ public final class WebSocketTransport: @unchecked Sendable {
         case noPort
     }
 
-    /// The deployed Worker. Overridable so a rebuilt Worker on another account
-    /// does not need a new build.
-    public static let defaultWorkerURL =
-        URL(string: "https://relay-worker.example.workers.dev")!
+    /// Stands in for "no Worker configured". Nothing dials it: `load()` only
+    /// ever pairs it with `enabled == false`. It exists so the settings type can
+    /// keep a non-optional URL without any build shipping a default Worker —
+    /// pointing every install at one person's account is exactly the shared
+    /// bottleneck (and shared quota, and shared blame for the egress) that this
+    /// project is not.
+    public static let unconfiguredWorkerURL = URL(string: "https://relay.invalid")!
 
     /// Called when the Worker's verdict on this relay is "unusable": it
     /// declined the host, refused the token, or never answered at all.
@@ -63,7 +66,9 @@ public final class WebSocketTransport: @unchecked Sendable {
     /// this, like every other leg field.
     private var legs: [Leg] = []
 
-    public init(workerURL: URL = WebSocketTransport.defaultWorkerURL,
+    // No default: there is no Worker to fall back to, and a default here is how
+    // a caller ends up silently dialling one it did not choose.
+    public init(workerURL: URL,
                 token: String, host: String, port: UInt16,
                 appGroup: String = AppGroupID.resolved) {
         self.appGroup = appGroup
@@ -607,16 +612,25 @@ public struct RelayTunnelSettings: Sendable {
         // window has been opened since install — would otherwise read an empty
         // token, skip the tunnel, and put OpenVPN on the wire in plaintext,
         // which is precisely what the gateway resets.
-        let url = (defaults?.string(forKey: urlKey)).flatMap(URL.init(string:))
+        let url = (defaults?.string(forKey: urlKey)).flatMap { $0.isEmpty ? nil : $0 }
+            .flatMap(URL.init(string:))
             ?? baked("SweepTunnelURL").flatMap(URL.init(string:))
-            ?? WebSocketTransport.defaultWorkerURL
-        // Default ON: on this network a direct relay connection cannot work, and
-        // an off-by-default bypass is one the user has to discover.
-        let enabled = defaults?.object(forKey: enabledKey) as? Bool ?? true
+        // Default ON: where a direct relay connection cannot work, an
+        // off-by-default bypass is one the user has to discover.
+        let wanted = defaults?.object(forKey: enabledKey) as? Bool ?? true
         let token = defaults?.string(forKey: tokenKey).flatMap { $0.isEmpty ? nil : $0 }
             ?? baked("SweepTunnelToken")
             ?? ""
-        return RelayTunnelSettings(enabled: enabled, workerURL: url, token: token)
+        // No Worker of your own means the leg is off, not that it falls back to
+        // somebody else's. Gating here rather than at each call site is what
+        // keeps `VPNConfigurator`, which only reads `enabled`, from building a
+        // configuration around a Worker that does not exist.
+        guard let url, !token.isEmpty else {
+            return RelayTunnelSettings(enabled: false,
+                                       workerURL: WebSocketTransport.unconfiguredWorkerURL,
+                                       token: "")
+        }
+        return RelayTunnelSettings(enabled: wanted, workerURL: url, token: token)
     }
 
     /// Addresses the Worker currently resolves to.

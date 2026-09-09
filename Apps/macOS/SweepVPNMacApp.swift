@@ -28,11 +28,12 @@ struct SweepVPNMacApp: App {
 
     static func refreshConfiguration(into model: VPNViewModel) async {
         // The extension cannot read the app's Info.plist, so the tunnel's Worker
-        // URL and token are copied into the shared group where it can. Done on
-        // every launch so a rebuilt Worker takes effect without extra steps.
-        if let url = AppConfig.tunnelURL, !AppConfig.tunnelToken.isEmpty {
-            let settings = RelayTunnelSettings(enabled: true, workerURL: url,
-                                               token: AppConfig.tunnelToken)
+        // URL and token live in the shared group where it can. Read back rather than rebuilding from Info.plist: a release build ships
+        // no Worker, so for anyone who installed one the only configuration that
+        // exists is what they pasted into the app, and reconstructing this from
+        // the (empty) bundle values on every launch would erase it.
+        let settings = RelayTunnelSettings.load(appGroup: AppConfig.appGroup)
+        if settings.enabled, !settings.token.isEmpty {
             settings.save(appGroup: AppConfig.appGroup)
 
             // Resolve the Worker here, where resolution actually works, and

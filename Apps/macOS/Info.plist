@@ -30,6 +30,8 @@
 	<string>$(SWEEP_CONFIG_URL)</string>
 	<key>SweepTunnelURL</key>
 	<string>$(SWEEP_TUNNEL_URL)</string>
+	<key>SweepRelayMirrorURL</key>
+	<string>$(SWEEP_RELAY_MIRROR_URL)</string>
 	<key>SweepTunnelToken</key>
 	<string>$(SWEEP_TUNNEL_TOKEN)</string>
 	<key>SweepAppGroup</key>

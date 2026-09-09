@@ -1,0 +1,32 @@
+// Copy to Config/Local.xcconfig and fill in. That file is gitignored: it holds
+// the values that are yours, not the project's.
+//
+//   cp Config/Local.xcconfig.example Config/Local.xcconfig
+//
+// Nothing here is required to build. Leave a value empty and the feature it
+// drives turns itself off rather than reaching for someone else's server.
+
+// Your Apple Developer team, for signing. Find it in Xcode > Settings > Accounts.
+DEVELOPMENT_TEAM =
+
+// Ed25519 *public* key that the app pins for the signed server bundle. Generate
+// a pair with:
+//   swift run --package-path Tools/sweep-sign sweep-sign keygen sweep-config.key
+// and paste the printed public key here. The private half stays in
+// sweep-config.key, which is gitignored and must never be committed.
+// Empty means "no pinned key", and the app refuses to load any server list.
+SWEEP_CONFIG_SIGNING_KEY =
+
+// Your own relay Worker, if you deployed one:
+//   Tools/worker-tunnel/deploy.sh
+// It prints the URL and token to paste here. Empty means the WSS relay leg is
+// off; the app still works, it just cannot get out of a network that blocks
+// OpenVPN on the wire. You can also paste these into the app at runtime
+// (Settings > Relay Worker) without rebuilding.
+SWEEP_TUNNEL_URL =
+SWEEP_TUNNEL_TOKEN =
+
+// Optional mirror for the public VPN Gate relay CSV, for ISPs that block
+// vpngate.net by category. The same deploy.sh Worker serves it at its root URL.
+// Empty falls back to vpngate.net directly.
+SWEEP_RELAY_MIRROR_URL =

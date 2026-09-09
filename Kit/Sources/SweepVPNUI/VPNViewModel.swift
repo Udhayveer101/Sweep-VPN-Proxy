@@ -83,6 +83,41 @@ public final class VPNViewModel: ObservableObject {
         .string(forKey: "sweep.relaySource") ?? ""
 
     #if os(macOS)
+    /// Your own relay Worker, editable in the running app. No build ships one,
+    /// so for anyone who installed a release rather than building it themselves
+    /// this is the only way to turn the WSS leg on — and it has to survive an
+    /// app update, which is why it lives in the app group and not in the bundle.
+    @Published public var workerURLText: String = ""
+    @Published public var workerToken: String = ""
+
+    public func loadWorkerSettings() {
+        let settings = RelayTunnelSettings.load(appGroup: appGroup)
+        guard settings.enabled else { return }   // unconfigured: leave both blank
+        workerURLText = settings.workerURL.absoluteString
+        workerToken = settings.token
+    }
+
+    /// Trimmed, because a pasted URL arrives with whitespace often enough, and a
+    /// token with a trailing newline fails the Worker's compare with no clue why.
+    public func saveWorkerSettings() {
+        let url = workerURLText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = workerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        workerURLText = url
+        workerToken = token
+        guard let parsed = URL(string: url), !url.isEmpty, !token.isEmpty else {
+            // Clearing either field turns the leg off rather than leaving half a
+            // configuration that fails at connect time.
+            RelayTunnelSettings(enabled: false,
+                                workerURL: WebSocketTransport.unconfiguredWorkerURL,
+                                token: "").save(appGroup: appGroup)
+            return
+        }
+        RelayTunnelSettings(enabled: true, workerURL: parsed, token: token)
+            .save(appGroup: appGroup)
+    }
+    #endif
+
+    #if os(macOS)
     @Published public private(set) var torState: TorController.State = .stopped
     @Published public private(set) var proxyState: LocalProxy.State = .stopped
     private var tor: TorController?

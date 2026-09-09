@@ -14,4 +14,5 @@
   <key>ITSAppUsesNonExemptEncryption</key><true/>
   <key>SweepConfigSigningKey</key><string>$(SWEEP_CONFIG_SIGNING_KEY)</string>
   <key>SweepConfigURL</key><string>$(SWEEP_CONFIG_URL)</string>
+  <key>SweepRelayMirrorURL</key><string>$(SWEEP_RELAY_MIRROR_URL)</string>
 </dict></plist>

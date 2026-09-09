@@ -33,20 +33,25 @@ public final class VPNGateFetcher: Sendable {
     /// `custom` exists for exactly that case: point it at a small proxy you run
     /// — a Cloudflare Worker that fetches the CSV and returns it is ~15 lines —
     /// and the app reaches the list from a domain no category filter knows.
-    /// Built-in mirror, tried before the official domain. It is a stateless
-    /// Cloudflare Worker (`Tools/relay-mirror/`) that refetches the same public
-    /// CSV and serves it from `*.workers.dev` — a domain the residential ISPs
-    /// that 403 `vpngate.net` do not categorise. Shipping it as a default means
-    /// the relay list works on those networks with nothing to paste. A
-    /// user-supplied mirror still overrides it.
-    public static let bundledMirror =
-        URL(string: "https://relay-worker.example.workers.dev/")!
+    /// Your own mirror, if this build was given one (`SWEEP_RELAY_MIRROR_URL`,
+    /// which `Tools/worker-tunnel/deploy.sh` prints). Tried before the official
+    /// domain, because on the networks that need a mirror the official domain
+    /// is the one returning the block page.
+    ///
+    /// There is deliberately no mirror baked in for everybody. A default would
+    /// route every install's relay-list fetch through whoever published the
+    /// build, which is their bandwidth, their Cloudflare account, and their
+    /// logs of who is asking for a VPN server list.
+    public static let bundledMirror: URL? =
+        (Bundle.main.object(forInfoDictionaryKey: "SweepRelayMirrorURL") as? String)
+            .flatMap { $0.isEmpty ? nil : $0 }
+            .flatMap(URL.init(string:))
 
     public static let officialSources: [URL] = [
         bundledMirror,
-        URL(string: "https://www.vpngate.net/api/iphone/")!,
-        URL(string: "http://www.vpngate.net/api/iphone/")!,
-    ]
+        URL(string: "https://www.vpngate.net/api/iphone/"),
+        URL(string: "http://www.vpngate.net/api/iphone/"),
+    ].compactMap { $0 }
 
     private let sources: [URL]
     private let session: URLSession

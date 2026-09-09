@@ -231,9 +231,27 @@ public struct PublicRelayPickerView: View {
             .fixedSize(horizontal: false, vertical: true)
             TextField("https://…", text: $model.relaySourceURL)
                 .textFieldStyle(.roundedBorder)
+            #if os(macOS)
+            Divider().padding(.vertical, 4)
+            Text("Relay Worker").font(.headline)
+            Text("A Worker of your own also carries the relay's own traffic inside "
+                 + "HTTPS, which is what gets a connection out of a network that "
+                 + "kills OpenVPN on sight. Run Tools/worker-tunnel/deploy.sh and "
+                 + "paste what it prints. No build ships one: a shared Worker would "
+                 + "mean everyone's traffic on one person's account.")
+            .font(.caption).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            TextField("https://sweep-relay-mirror.….workers.dev", text: $model.workerURLText)
+                .textFieldStyle(.roundedBorder)
+            SecureField("token", text: $model.workerToken)
+                .textFieldStyle(.roundedBorder)
+            #endif
             HStack {
                 Spacer()
                 Button("Fetch now") {
+                    #if os(macOS)
+                    model.saveWorkerSettings()
+                    #endif
                     showingSource = false
                     Task { await model.refreshRelays() }
                 }
@@ -242,5 +260,8 @@ public struct PublicRelayPickerView: View {
         }
         .padding(16)
         .frame(width: 340)
+        #if os(macOS)
+        .onAppear { model.loadWorkerSettings() }
+        #endif
     }
 }

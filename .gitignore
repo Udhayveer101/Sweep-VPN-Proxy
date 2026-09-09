@@ -1,17 +1,21 @@
 .build/
 target/
 DerivedData/
-*.xcodeproj/xcuserdata/
+# The Xcode project is generated from project.yml + Config/Local.xcconfig.
+# Tracking it means tracking whatever the generator resolved from the local
+# config — a signing team, a Worker URL — in a file nobody reads before pushing.
+*.xcodeproj/
 DataPlane/sweepwg/fat/
 *.key
 fleet/
 Config/sweep-config.sig.json
+Config/Local.xcconfig
 Config/*.bak
 Tools/relay-mirror/.wrangler/
 DataPlane/openvpn/openvpn3/
 DataPlane/openvpn/mbedtls/
 DataPlane/sweepovpn/build-mac/
 
-# Personal Worker token lives in project.yml as a build setting; keep local
-# override files out of the tree.
+# Wrangler caches the Cloudflare account id and the account holder's email.
+Tools/**/.wrangler/
 /tmp/tunnel_token

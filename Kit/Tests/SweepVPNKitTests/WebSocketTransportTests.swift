@@ -11,6 +11,12 @@ import Network
 /// hang detector closing the socket — and a mock would have passed through all
 /// of them. It skips when the Worker or the network is unavailable so it cannot
 /// fail the suite offline.
+/// The live tests need a Worker of their own; no build ships one. Set
+/// SWEEP_TUNNEL_URL alongside SWEEP_TUNNEL_TOKEN to run them.
+private func liveWorkerURL() -> URL {
+    URL(string: ProcessInfo.processInfo.environment["SWEEP_TUNNEL_URL"] ?? "") ?? URL(string: "https://relay.invalid")!
+}
+
 final class WebSocketTransportTests: XCTestCase {
 
     /// A VPN Gate relay that answers on TCP 443. If it retires the test skips
@@ -41,14 +47,14 @@ final class WebSocketTransportTests: XCTestCase {
         // path rather than the Worker's verdict.
         let suite = "sweep.test.\(UUID().uuidString)"
         let settings = RelayTunnelSettings(enabled: true,
-                                           workerURL: WebSocketTransport.defaultWorkerURL,
+                                           workerURL: liveWorkerURL(),
                                            token: token)
         let resolved = settings.workerAddresses(appGroup: suite)
         try XCTSkipIf(resolved.isEmpty, "could not resolve the Worker")
         RelayTunnelSettings.cache(workerAddresses: resolved, appGroup: suite)
 
-        let transport = WebSocketTransport(token: token, host: "203.0.113.1", port: 443,
-                                           appGroup: suite)
+        let transport = WebSocketTransport(workerURL: liveWorkerURL(), token: token,
+                                           host: "203.0.113.1", port: 443, appGroup: suite)
         let unusable = expectation(description: "the transport reports the relay unusable")
         transport.onUnusable = { unusable.fulfill() }
         let localPort = try transport.start()
@@ -81,7 +87,8 @@ final class WebSocketTransportTests: XCTestCase {
     /// relay connection and a full OpenVPN renegotiation — the thing that was
     /// happening every few seconds before.
     func testTheSessionIdIsStableAcrossRedials() {
-        let transport = WebSocketTransport(token: "t", host: "203.0.113.1", port: 443,
+        let transport = WebSocketTransport(workerURL: URL(string: "https://relay.invalid")!,
+                                           token: "t", host: "203.0.113.1", port: 443,
                                            appGroup: "sweep.test.\(UUID().uuidString)")
         let session = UUID().uuidString
         let first = transport.tunnelPath(session: session)
@@ -165,7 +172,8 @@ final class WebSocketTransportTests: XCTestCase {
         let token = ProcessInfo.processInfo.environment["SWEEP_TUNNEL_TOKEN"] ?? ""
         try XCTSkipIf(token.isEmpty, "set SWEEP_TUNNEL_TOKEN to run the live tunnel test")
 
-        let transport = WebSocketTransport(token: token, host: relayHost, port: relayPort)
+        let transport = WebSocketTransport(workerURL: liveWorkerURL(), token: token,
+                                           host: relayHost, port: relayPort)
         let localPort = try transport.start()
         defer { transport.stop() }
         XCTAssertGreaterThan(localPort, 0)

@@ -1,10 +1,19 @@
 export PATH := /opt/homebrew/opt/rustup/bin:$(PATH)
 RUSTUP :=
-TEAM   := P66SB4MX92
+LOCAL  := Config/Local.xcconfig
+# Signing identity and team come from your own Config/Local.xcconfig, not from
+# the repo. Override on the command line if you keep them somewhere else.
+TEAM   ?= $(shell sed -n 's/^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=[[:space:]]*//p' $(LOCAL) 2>/dev/null)
 CRATE  := DataPlane/sweepwg
 TARGETS := aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
 
-.PHONY: dataplane test project ios macos install-macos bundle-tor
+.PHONY: config dataplane test project ios macos install-macos bundle-tor
+
+# First thing to run after cloning. Creates the gitignored file that holds your
+# team, your pinned key and your own Worker.
+config:
+	@if [ -f $(LOCAL) ]; then echo "$(LOCAL) already exists, leaving it alone"; \
+	else cp $(LOCAL).example $(LOCAL); echo "created $(LOCAL) - fill it in"; fi
 
 dataplane:
 	cd $(CRATE) && $(RUSTUP) $(foreach t,$(TARGETS),cargo build --release --target $(t) &&) true
@@ -23,8 +32,11 @@ test:
 	cd Kit && swift test
 	cd $(CRATE) && $(RUSTUP) cargo test --release
 
-project:
+project: $(LOCAL)
 	xcodegen generate
+
+$(LOCAL):
+	@$(MAKE) config
 
 ios: project
 	xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-iOS -sdk iphonesimulator \
@@ -43,7 +55,9 @@ macos: project
 # from an app outside /Applications are rejected before they reach the daemon.
 # Tor ships inside the app; see Tools/bundle-tor.sh for why the dylibs must be
 # rewritten. Signed with the development identity so the bundle stays valid.
-SIGN_ID := Apple Development: udhay2009@icloud.com (T377427WD2)
+# Whichever development identity this Mac holds. Set SIGN_ID yourself if you
+# have more than one and want a particular certificate.
+SIGN_ID ?= $(shell security find-identity -v -p codesigning | sed -n 's/.*"\(Apple Development: .*\)"/\1/p' | head -1)
 
 bundle-tor:
 	@APP=$$(xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-macOS \
