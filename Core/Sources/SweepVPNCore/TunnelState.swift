@@ -70,6 +70,7 @@ public enum TunnelErrorKind: String, Equatable, Sendable, Codable {
     case configurationInvalid      // signature / version / expiry failure -> fail closed
     case noServersAvailable
     case allRungsFailed
+    case workerUnavailable        // the WSS Worker is failing; no relay is at fault
     case authenticationFailed
     case systemDenied               // user removed VPN profile / NE permission
     case internalFailure

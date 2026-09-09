@@ -49,6 +49,12 @@ const RELAY_LIST = "https://www.vpngate.net/api/iphone/";
 const ALLOW_TTL_MS = 5 * 60 * 1000;
 
 let allowCache = { at: 0, hosts: new Set() };
+/// When the Durable Objects free-tier duration budget is spent, every dispatch
+/// into the namespace throws and the client sees a 500 — measured, and it takes
+/// a `wrangler tail` to tell it apart from any other 1101. The budget resets
+/// daily, so this remembers the verdict just long enough to stop paying a
+/// failed subrequest per dial, and re-tests after it.
+let doOutUntil = 0;
 /// One in-flight refresh shared by every concurrent dial. A burst of sixteen
 /// relays failing the set must not become sixteen upstream fetches.
 let allowInFlight = null;
@@ -187,7 +193,13 @@ export class RelaySession {
   /// How long a session survives with no client attached. Long enough to ride
   /// out a redial and a network blip, short enough that an abandoned session
   /// does not hold a relay socket open for the operator to answer for.
-  static get graceMs() { return 30_000; }
+  ///
+  /// Cut from 30 s: a parked object is still billed for wall-clock, and the
+  /// Durable Objects free-tier duration budget is what this Worker actually
+  /// runs out of — measured, as a 1101 on every dial for the rest of the day.
+  /// The client's whole redial budget is under two seconds, so the twenty
+  /// seconds this gives back were only ever paid for clients that never came.
+  static get graceMs() { return 10_000; }
 
   /// Past this, the client is not coming back fast enough to matter and the
   /// buffer is doing more harm than the reconnect it was protecting.
@@ -430,6 +442,24 @@ function refused(reason) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
+/// The relay leg without a Durable Object behind it, for when the namespace
+/// will not take the call. Same `RelaySession`, so the things that were painful
+/// to get right — copying each chunk out of the pooled buffer, the Blob
+/// ordering chain, `sendOrPark` — are the ones already in use on the good path.
+///
+/// ponytail: nothing outlives the request here, so a dropped client leg costs a
+/// full OpenVPN renegotiation and the runtime may reap the context after a few
+/// seconds — the behaviour this design left behind at 230f0e1. It is the
+/// degraded mode on purpose: connected badly beats not connected. `attach`
+/// refuses `r=1` against an empty session, which is the honest answer.
+function direct(host, port, resuming) {
+  const [client, server] = Object.values(new WebSocketPair());
+  server.accept();
+  const state = { storage: { setAlarm() {}, deleteAlarm() {} } };
+  new RelaySession(state, null).attach(server, host, port, resuming);
+  return new Response(null, { status: 101, webSocket: client });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -459,9 +489,20 @@ export default {
       // `s` names the session. The client reuses it to re-attach to a live
       // relay socket after its own leg drops; a client that does not send one
       // gets a fresh, unresumable session.
+      const resuming = url.searchParams.get("r") === "1";
       const session = url.searchParams.get("s") || crypto.randomUUID();
-      const id = env.RELAY.idFromName(session);
-      return env.RELAY.get(id).fetch(request);
+      if (Date.now() > doOutUntil) {
+        try {
+          const id = env.RELAY.idFromName(session);
+          // Awaited, not returned: an un-awaited rejection escapes the handler
+          // as a 1101 and there is nothing left here to fall back from.
+          return await env.RELAY.get(id).fetch(request);
+        } catch (e) {
+          if (!/free tier|Durable Object/i.test(e?.message ?? "")) throw e;
+          doOutUntil = Date.now() + 60_000;
+        }
+      }
+      return direct(host, port, resuming);
     }
 
     // Everything else mirrors the relay list, so one Worker covers both the

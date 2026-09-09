@@ -380,6 +380,22 @@ public final class ConnectionCoordinator: @unchecked Sendable {
     static let healthyRelaySeconds: TimeInterval = 45
 
     private func rungFailed(_ rung: ProtocolRung, kind: TunnelErrorKind = .allRungsFailed) {
+        // The Worker is the one path every relay rides. When it is the thing
+        // that failed — measured: a 5xx carrying `1101`, the Durable Objects
+        // free-tier duration budget spent for the day — no relay is at fault
+        // and handing over to another cannot help. This used to fall through
+        // to the pool logic below, which burned a relay per attempt and read
+        // out as "16 relays burned" for a fault none of them had a part in.
+        if kind == .workerUnavailable {
+            dialling.removeValue(forKey: rung)
+            _ = discard(rung)
+            clearStandby()
+            winner = nil
+            server = nil
+            callbacks.onEvent("workerUnavailable", rung.shortName)
+            callbacks.onExhausted(.workerUnavailable)
+            return
+        }
         // Whichever relay this rung was on has just proved it cannot carry the
         // tunnel right now. Charge the failure to it, not to the protocol.
         let dropped = dialling.removeValue(forKey: rung)

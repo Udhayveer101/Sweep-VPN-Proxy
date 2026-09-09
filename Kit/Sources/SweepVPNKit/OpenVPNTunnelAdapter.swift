@@ -132,6 +132,9 @@ public final class OpenVPNTunnelAdapter: TunnelAdapter, @unchecked Sendable {
         // adapter failure is what makes the handover immediate instead of
         // waiting on OpenVPN 3 to notice a quiet socket.
         transport.onUnusable = { [weak self] in self?.fail(.allRungsFailed) }
+        // Same ending, different bookkeeping: the coordinator must not charge a
+        // relay for a Worker that is refusing everyone.
+        transport.onWorkerUnavailable = { [weak self] _ in self?.fail(.workerUnavailable) }
         self.transport = transport
 
         guard let rewritten = Self.pointingAtLoopback(profile, port: localPort) else {

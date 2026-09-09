@@ -95,5 +95,16 @@ final class MinimalWebSocketTests: XCTestCase {
         XCTAssertEqual(WebSocketTransport.disposition(closeCode: 1006), .ourLeg)
         XCTAssertEqual(WebSocketTransport.disposition(closeCode: nil), .ourLeg)
     }
+
+    /// A 5xx is the Worker being broken, not its verdict on the relay behind
+    /// it. Getting this wrong is what let one `1101` — the Durable Objects
+    /// free-tier duration budget, spent for the day — burn a whole relay pool.
+    func testOnlyFiveHundredsCountAsTheWorkerBeingDown() {
+        XCTAssertTrue(MinimalWebSocket.isServerError("HTTP/1.1 500 Internal Server Error"))
+        XCTAssertTrue(MinimalWebSocket.isServerError("HTTP/1.1 502 Bad Gateway"))
+        XCTAssertFalse(MinimalWebSocket.isServerError("HTTP/1.1 426 Upgrade Required"))
+        XCTAssertFalse(MinimalWebSocket.isServerError("HTTP/1.1 200 OK"))
+        XCTAssertFalse(MinimalWebSocket.isServerError("no status line"))
+    }
 }
 #endif

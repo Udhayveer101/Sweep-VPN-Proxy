@@ -6,9 +6,28 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 
+// `direct()` builds a real WebSocketPair and returns a 101 Response; the
+// platform has neither here — node's Response rejects any status under 200 —
+// and the point of the test is which of them it hands back, not what they do.
+const sent = [];
+globalThis.Response = class { constructor(body, init = {}) { Object.assign(this, init); } };
+globalThis.WebSocketPair = function () {
+  const server = {
+    readyState: 1,
+    accept() { this.accepted = true; },
+    send(b) { sent.push(b); },
+    close(code, reason) { this.closed = { code, reason }; },
+    addEventListener() {},
+  };
+  return { 0: { client: true }, 1: server };
+};
+
 const src = readFileSync(new URL("./worker.js", import.meta.url), "utf8")
-  .replace(/^import \{ connect \} from "cloudflare:sockets";$/m, "const connect = () => {};");
-const { RelaySession, isSafeDestination } = await import(
+  .replace(/^import \{ connect \} from "cloudflare:sockets";$/m,
+           "const connect = () => { throw new Error(\"no sockets in the test\"); };")
+  // `direct` is the fallback path, not part of the Worker's surface.
+  .replace(/^function direct\(/m, "export function direct(");
+const { RelaySession, isSafeDestination, direct } = await import(
   "data:text/javascript;base64," + Buffer.from(src).toString("base64"));
 
 const session = () => {
@@ -75,5 +94,30 @@ for (const p of [25, 465, 587, 2525]) {
 
 assert.equal(isSafeDestination("example.com", 0), false, "port 0");
 assert.equal(isSafeDestination("example.com", 70000), false, "port past 65535");
+
+// The Durable Objects free tier runs out of duration daily, and every dispatch
+// into the namespace throws for the rest of it. The fallback still has to give
+// the client the 101 it is waiting on — a 500 there burns a relay for a fault
+// the relay had no part in.
+{
+  sent.length = 0;
+  const res = direct("219.100.37.196", 443, false);
+  assert.equal(res.status, 101, "the fallback still upgrades");
+  assert.ok(res.webSocket, "and hands back the client half");
+}
+
+// Without a Durable Object there is no session to resume into. Quietly opening
+// a fresh socket would hand OpenVPN a stream it cannot pick up, so the refusal
+// has to be immediate and in-band: 0x00, then 1008.
+{
+  sent.length = 0;
+  const pair = new WebSocketPair();
+  const server = pair[1];
+  const s = new RelaySession({ storage: { setAlarm() {}, deleteAlarm() {} } }, null);
+  s.attach(server, "219.100.37.196", 443, true);
+  assert.equal(sent.length, 1, "one status byte");
+  assert.equal(new Uint8Array(sent[0])[0], 0x00, "and it says failed");
+  assert.deepEqual(server.closed, { code: 1008, reason: "session gone" });
+}
 
 console.log("worker relay-session self-check: ok");

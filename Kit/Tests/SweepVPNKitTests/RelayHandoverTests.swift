@@ -116,6 +116,38 @@ final class RelayHandoverTests: XCTestCase {
         _ = c
     }
 
+    /// The Worker is the one path every relay rides, so a Worker fault is not a
+    /// relay verdict. This is the September 9 field log: `wssHandshakeFailed:
+    /// HTTP/1.1 500 Internal Server Error` — `1101`, the Durable Objects
+    /// free-tier duration budget spent for the day — answered every dial alike,
+    /// and the transport reported each one as the relay's fault. The pool was
+    /// walked end to end in seconds and the user was told the network had
+    /// blocked every method, which was not what happened.
+    func testAWorkerFaultIsNotChargedToTheRelayPool() {
+        let pool = [relay("a"), relay("b"), relay("c")]
+        let log = DialLog()
+        let gaveUp = expectation(description: "fails closed on the Worker, not the pool")
+        let kind = KindBox()
+        let c = coordinator(
+            pool: pool,
+            behaviour: { _ in .failWith(.workerUnavailable, after: 0.01) },
+            dialled: log,
+            onExhausted: { kind.set($0); gaveUp.fulfill() })
+        c.start(signals: NetworkSignals())
+        wait(for: [gaveUp], timeout: 10)
+        XCTAssertEqual(kind.value, .workerUnavailable,
+                       "the user is told the Worker is down, not that the network blocked everything")
+        XCTAssertEqual(log.all.count, 1,
+                       "one relay tried: handing over cannot fix the path all of them share")
+    }
+
+    final class KindBox: @unchecked Sendable {
+        private var kind: TunnelErrorKind?
+        private let lock = NSLock()
+        func set(_ k: TunnelErrorKind) { lock.lock(); kind = k; lock.unlock() }
+        var value: TunnelErrorKind? { lock.lock(); defer { lock.unlock() }; return kind }
+    }
+
     /// The pool is swept a bounded number of times: a network where nothing
     /// works still fails closed rather than spinning on dead relays forever.
     func testAPoolThatNeverWorksStillFailsClosed() {

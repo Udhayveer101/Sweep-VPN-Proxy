@@ -8,6 +8,8 @@ final class FakeAdapter: TunnelAdapter, @unchecked Sendable {
     enum Behaviour {
         case authenticate(after: TimeInterval)
         case fail(after: TimeInterval)
+        /// Fails with a specific kind, for the paths where the kind is the point.
+        case failWith(TunnelErrorKind, after: TimeInterval)
         case hang
         /// Comes up, then loses the peer — the live-tunnel-drop case.
         case authenticateThenDrop(after: TimeInterval, dropAfter: TimeInterval)
@@ -51,6 +53,11 @@ final class FakeAdapter: TunnelAdapter, @unchecked Sendable {
             DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
                 guard !self.stopped else { return }
                 onFailure(.allRungsFailed)
+            }
+        case .failWith(let kind, let delay):
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                guard !self.stopped else { return }
+                onFailure(kind)
             }
         case .hang:
             break

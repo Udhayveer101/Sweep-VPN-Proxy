@@ -91,6 +91,8 @@ public struct Presentation: Equatable, Sendable {
             return "The signed configuration could not be verified, so the app refused to connect."
         case .noServersAvailable: return "No server in the signed list is reachable right now."
         case .allRungsFailed: return "This network blocked every connection method Sweep can use."
+        case .workerUnavailable:
+            return "Your relay Worker is not answering. It is usually the Cloudflare free-tier daily limit, which resets at midnight UTC."
         case .authenticationFailed: return "The server did not accept this device's key."
         case .systemDenied: return "The VPN profile was removed. Re-enable it in Settings."
         case .internalFailure: return "The tunnel could not start. Try again."

@@ -36,7 +36,16 @@ import SweepVPNCore
 final class MinimalWebSocket: @unchecked Sendable {
 
     enum WebSocketError: Error, Equatable {
+        /// The Worker answered, and its answer was about this request: a 426
+        /// for a missing upgrade header, a 200 from the mirror for a wrong
+        /// path. Asking again changes nothing.
         case handshakeFailed(String)
+        /// The Worker answered 5xx. That is the Worker being broken, not a
+        /// verdict on the relay behind it — the measured case is `1101` when
+        /// the Durable Objects free-tier duration budget runs out, which lasts
+        /// until UTC midnight and has nothing to do with which relay was asked
+        /// for. Burning a relay for it walks the whole pool in seconds.
+        case workerUnavailable(String)
         case closed
     }
 
@@ -129,15 +138,34 @@ final class MinimalWebSocket: @unchecked Sendable {
             self.readIndex = 0
             self.handshakeBuffer = Data()
             guard head.hasPrefix("HTTP/1.1 101") || head.hasPrefix("HTTP/1.0 101") else {
-                // The status line is the whole diagnosis when a Worker refuses:
-                // a 426 is a missing upgrade header, a 403 a bad token, a 200
-                // the mirror answering because the path was wrong.
+                // The status line is most of the diagnosis when a Worker
+                // refuses: a 426 is a missing upgrade header, a 403 a bad
+                // token, a 200 the mirror answering because the path was wrong.
                 let status = head.split(separator: "\r\n").first.map(String.init) ?? "no status line"
-                completion(WebSocketError.handshakeFailed(status))
+                // The rest of it is in the body, which was being thrown away.
+                // Cloudflare puts its reason there and nowhere else — `error
+                // code: 1101` is the difference between "the Worker threw" and
+                // any other 500, and finding that out cost a live `wrangler
+                // tail` it should not have.
+                let body = String(decoding: self.inbound.prefix(64), as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let detail = body.isEmpty ? status : "\(status) — \(body)"
+                if Self.isServerError(status) {
+                    completion(WebSocketError.workerUnavailable(detail))
+                } else {
+                    completion(WebSocketError.handshakeFailed(detail))
+                }
                 return
             }
             completion(nil)
         }
+    }
+
+    /// 5xx, read out of a status line like `HTTP/1.1 500 Internal Server Error`.
+    static func isServerError(_ statusLine: String) -> Bool {
+        let parts = statusLine.split(separator: " ")
+        guard parts.count > 1, let code = Int(parts[1]) else { return false }
+        return (500...599).contains(code)
     }
 
     /// CRLF CRLF, or the bare LF LF some servers emit.

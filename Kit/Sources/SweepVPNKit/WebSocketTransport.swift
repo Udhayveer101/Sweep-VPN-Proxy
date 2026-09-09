@@ -47,6 +47,12 @@ public final class WebSocketTransport: @unchecked Sendable {
     /// relay is what failed, and only the coordinator can move off it.
     public var onUnusable: (@Sendable () -> Void)?
 
+    /// The Worker itself is failing, so no relay is at fault and none should be
+    /// charged for it. Separate from `onUnusable` because the coordinator's
+    /// answer is different: it must stop, not move down a pool it is about to
+    /// consume sixteen relays deep for a fault none of them had a part in.
+    public var onWorkerUnavailable: (@Sendable (String) -> Void)?
+
     private let workerURL: URL
     private let token: String
     private let host: String
@@ -239,6 +245,10 @@ public final class WebSocketTransport: @unchecked Sendable {
         /// relay.
         var generation = 0
         var attempts = 0
+        /// Set when the Worker answered 5xx. Redialling is still right — the
+        /// answer may be a blip — but if the budget runs out with this set, the
+        /// verdict belongs to the Worker rather than to the relay.
+        var lastWorkerFault: String?
         var pumping = false
         var closed = false
         /// App -> relay bytes that arrived mid-redial. Small by construction:
@@ -316,10 +326,17 @@ public final class WebSocketTransport: @unchecked Sendable {
                         // An HTTP answer we did not want is the Worker's
                         // decision and will be the same next time; anything
                         // else is transport, and transport is what redialling
-                        // is for.
-                        if case MinimalWebSocket.WebSocketError.handshakeFailed = error {
+                        // is for. A 5xx is neither: the Worker is broken, which
+                        // says nothing about the relay, so it redials like
+                        // transport and — if it never clears — is reported as
+                        // the Worker's fault rather than the relay's.
+                        switch error {
+                        case MinimalWebSocket.WebSocketError.workerUnavailable(let detail):
+                            leg.lastWorkerFault = detail
+                            self.legFailed(leg, worker, generation)
+                        case MinimalWebSocket.WebSocketError.handshakeFailed:
                             self.giveUp(leg, worker)
-                        } else {
+                        default:
                             self.legFailed(leg, worker, generation)
                         }
                         return
@@ -393,6 +410,12 @@ public final class WebSocketTransport: @unchecked Sendable {
         leg.socket = nil
         guard !leg.closed else { return }
         guard leg.attempts < Self.redialBudget else {
+            if let fault = leg.lastWorkerFault {
+                Diagnostics.shared.record("wssWorkerUnavailable", fault)
+                tearDown(leg, nil)
+                onWorkerUnavailable?(fault)
+                return
+            }
             Diagnostics.shared.record(
                 "wssReattachExhausted",
                 "the Worker leg would not come back in \(Self.redialBudget) tries")
