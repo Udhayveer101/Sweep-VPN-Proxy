@@ -109,6 +109,42 @@ async function isAllowed(host) {
   return (await refreshHosts()).has(host);
 }
 
+/// Ports that make this Worker useful to a spammer rather than to its owner.
+/// Cloudflare blocks outbound 25 itself, but 465/587/2525 are the submission
+/// ports an abuse report would name, and the account carrying the blame is the
+/// one that deployed this.
+const REFUSED_PORTS = new Set([25, 465, 587, 2525]);
+
+/// Address space that is private to whoever runs the far end. Reaching it
+/// through someone else's proxy is SSRF, not browsing — 169.254.169.254 in
+/// particular is the cloud metadata endpoint.
+function isPrivateAddress(host) {
+  const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+  if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".internal")) return true;
+  if (h === "::1" || h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80:")) return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (!m) return false;
+  const octets = m.slice(1).map(Number);
+  if (octets.some((n) => n > 255)) return true;   // not an address at all
+  const [a, b] = octets;
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true;              // link-local + metadata
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;    // CGNAT
+  if (a >= 224) return true;                            // multicast + reserved
+  return false;
+}
+
+/// The destination policy for the general-exit mode. The token is the gate;
+/// this is what keeps a leaked token from being worth much.
+export function isSafeDestination(host, port) {
+  if (!host) return false;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+  if (REFUSED_PORTS.has(port)) return false;
+  return !isPrivateAddress(host);
+}
+
 /// Constant-time-ish compare, so the token cannot be recovered a byte at a time.
 function tokenMatches(given, expected) {
   if (!expected || !given || given.length !== expected.length) return false;
@@ -395,7 +431,13 @@ export default {
       if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
         return refused("bad target");
       }
-      if (!(await isAllowed(host))) return refused("not a known relay");
+      // Two ways to be an acceptable destination. A VPN Gate relay, as before —
+      // that path is what the OpenVPN rungs use and its behaviour is unchanged.
+      // Or any ordinary public host, which is the general-exit mode: the Worker
+      // stops being a way to reach a relay and becomes the exit itself.
+      if (!isSafeDestination(host, port) && !(await isAllowed(host))) {
+        return refused("destination refused");
+      }
 
       // `s` names the session. The client reuses it to re-attach to a live
       // relay socket after its own leg drops; a client that does not send one

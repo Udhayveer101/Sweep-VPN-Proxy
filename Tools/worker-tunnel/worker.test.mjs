@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 
 const src = readFileSync(new URL("./worker.js", import.meta.url), "utf8")
   .replace(/^import \{ connect \} from "cloudflare:sockets";$/m, "const connect = () => {};");
-const { RelaySession } = await import(
+const { RelaySession, isSafeDestination } = await import(
   "data:text/javascript;base64," + Buffer.from(src).toString("base64"));
 
 const session = () => {
@@ -33,7 +33,7 @@ const bytes = (n) => new Uint8Array(n).buffer;
 {
   const s = session();
   s.ws = null;
-  assert.equal(s.sendOrPark(bytes(512 * 1024 + 1)), false, "past the cap the pump stops");
+  assert.equal(s.sendOrPark(bytes(4 * 1024 * 1024 + 1)), false, "past the cap the pump stops");
 }
 
 // A flush that dies partway must not replay what it already sent: a duplicated
@@ -55,5 +55,25 @@ const bytes = (n) => new Uint8Array(n).buffer;
   assert.deepEqual(sent, [1, 2, 3], "the retry sends the tail once, and nothing twice");
   assert.equal(s.parkedBytes, 0);
 }
+
+// The destination policy for general-exit mode. The token is the gate; this is
+// what keeps a leaked token from being worth much.
+for (const [h, p] of [["example.com", 443], ["example.com", 80], ["1.1.1.1", 443]]) {
+  assert.equal(isSafeDestination(h, p), true, `${h}:${p} is an ordinary public destination`);
+}
+
+// Private space through someone else's proxy is SSRF, not browsing.
+for (const h of ["127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.1",
+                 "169.254.169.254", "0.0.0.0", "localhost", "[::1]", "::1"]) {
+  assert.equal(isSafeDestination(h, 443), false, h);
+}
+
+// Mail submission ports are what an abuse report would name.
+for (const p of [25, 465, 587, 2525]) {
+  assert.equal(isSafeDestination("example.com", p), false, String(p));
+}
+
+assert.equal(isSafeDestination("example.com", 0), false, "port 0");
+assert.equal(isSafeDestination("example.com", 70000), false, "port past 65535");
 
 console.log("worker relay-session self-check: ok");
