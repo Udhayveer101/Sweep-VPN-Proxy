@@ -222,3 +222,13 @@ and never leaves the device. Secrets live in the keychain
 (`AfterFirstUnlock`, `ThisDeviceOnly`, app-group scoped). The only network calls
 a build makes on its own are to the server you configured and, if you asked for
 public relays, to `vpngate.net` or the mirror you named.
+
+## License
+
+Apache 2.0 — see `LICENSE`.
+
+The OpenVPN 3 core this links for rungs 8–9 is dual-licensed AGPLv3 or MPL-2.0;
+this project takes the MPL-2.0 option, which is what keeps the rest of the tree
+permissive. Every bundled component and its terms are listed in
+`THIRD-PARTY-NOTICES.md`, along with the pinned upstream commit that satisfies
+MPL's source-availability requirement.
