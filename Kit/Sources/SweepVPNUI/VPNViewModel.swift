@@ -181,9 +181,22 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
+    public func setProxyThroughWorker(_ on: Bool) {
+        var o = options
+        o.proxyThroughWorker = on
+        apply(options: o)
+        syncProxyUpstream()
+    }
+
     private func currentUpstream() -> LocalProxy.Upstream {
         if options.torEnabled, torState == .running, let port = tor?.socksPort {
             return .socks5(host: "127.0.0.1", port: port)
+        }
+        if options.proxyThroughWorker {
+            let settings = RelayTunnelSettings.load(appGroup: appGroup)
+            if settings.enabled, !settings.token.isEmpty {
+                return .worker(settings)
+            }
         }
         return .direct
     }

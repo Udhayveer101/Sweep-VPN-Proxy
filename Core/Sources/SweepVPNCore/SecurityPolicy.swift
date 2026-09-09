@@ -54,6 +54,9 @@ public struct SecurityPolicyOptions: Sendable, Equatable, Codable {
     /// (or Tor) without the whole system being routed through it.
     public var localProxyEnabled: Bool = false
     public var localProxyPort: Int = 1080
+    /// Send proxied connections to the Worker rather than straight out. On a
+    /// filtered network "straight out" is the thing that does not work.
+    public var proxyThroughWorker: Bool = false
 
     /// Domains the macOS content filter drops outright. Unlike DNS-based
     /// blocking this applies to the connection itself, so it holds *even when

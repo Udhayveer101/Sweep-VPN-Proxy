@@ -87,6 +87,13 @@ public struct SettingsView: View {
                     } else if case .failed(let why) = model.proxyState {
                         Text(why).font(.footnote).foregroundStyle(.red)
                     }
+                    Toggle("Route proxy through Worker", isOn: Binding(
+                        get: { model.options.proxyThroughWorker },
+                        set: { model.setProxyThroughWorker($0) }))
+                        .disabled(!model.options.localProxyEnabled)
+                    Text("Each connection travels inside HTTPS to your Cloudflare Worker, which dials the site for you. No VPN profile needed.")
+                        .font(.footnote).foregroundStyle(.secondary)
+
                     Text("Point an individual app at this proxy to send only that app through the tunnel — or through Tor when Tor is on. It listens on this Mac only.")
                         .font(.footnote).foregroundStyle(.secondary)
 
