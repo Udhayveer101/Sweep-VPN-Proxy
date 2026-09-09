@@ -2,6 +2,7 @@
 import XCTest
 import Network
 @testable import SweepVPNKit
+import SweepVPNCore
 
 final class WorkerStreamTests: XCTestCase {
 
@@ -22,6 +23,23 @@ final class WorkerStreamTests: XCTestCase {
         let path = WorkerStream.path(host: "evil.com&p=25", port: 443, token: "t")
         XCTAssertFalse(path.contains("evil.com&p=25"))
         XCTAssertTrue(path.contains("evil.com%26p%3D25"))
+    }
+
+    /// Turning an app-local setting on must not rewrite the VPN profile: with
+    /// the kill switch on, saving it re-arms on-demand and connects the tunnel,
+    /// which is how enabling the loopback proxy came to start the VPN.
+    func testAppLocalSettingsDoNotTouchTheProfile() {
+        var a = SecurityPolicyOptions()
+        a.killSwitchEnabled = true
+        var b = a
+        b.localProxyEnabled = true
+        b.proxyThroughWorker = true
+        b.torBridges = ["bridge line"]
+        XCTAssertEqual(SecurityPolicy.profileInputs(a), SecurityPolicy.profileInputs(b))
+
+        var c = a
+        c.killSwitchEnabled = false
+        XCTAssertNotEqual(SecurityPolicy.profileInputs(a), SecurityPolicy.profileInputs(c))
     }
 
     /// Every stream gets its own session, or two connections would collide in

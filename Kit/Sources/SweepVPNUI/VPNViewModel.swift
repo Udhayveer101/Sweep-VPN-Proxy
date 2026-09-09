@@ -684,11 +684,19 @@ public final class VPNViewModel: ObservableObject {
     }
 
     public func apply(options newOptions: SecurityPolicyOptions) {
+        let profileChanged = SecurityPolicy.profileInputs(options)
+            != SecurityPolicy.profileInputs(newOptions)
         options = newOptions
         Task {
             _ = try? await configurator.send(.setSecurityOptions(newOptions))
-            try? await configurator.install(policy: SecurityPolicy(options: newOptions),
-                                            serverDescription: serverName ?? "Sweep VPN")
+            // The provider always hears about the change. The profile is only
+            // rewritten when the profile itself would differ — saving it with
+            // the kill switch on re-arms on-demand and connects the tunnel, so
+            // an app-local setting must not go anywhere near it.
+            if profileChanged {
+                try? await configurator.install(policy: SecurityPolicy(options: newOptions),
+                                                serverDescription: serverName ?? "Sweep VPN")
+            }
             await refresh()
         }
     }

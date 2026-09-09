@@ -189,4 +189,16 @@ public struct SecurityPolicy: Sendable {
 
     /// On-demand catch-all is our App-Store-legal stand-in for always-on.
     public var onDemandEnabled: Bool { options.killSwitchEnabled }
+
+    /// The only parts of the options the VPN *profile* is built from.
+    ///
+    /// Everything else — the local proxy, whether it exits through the Worker,
+    /// the bridge list — lives entirely in the app, and reinstalling a profile
+    /// for it is not merely wasted work: with the kill switch on the profile
+    /// carries an on-demand connect rule, so saving it brings the tunnel up.
+    /// Turning on a loopback proxy would connect the VPN, which is precisely
+    /// the opposite of what the Worker exit is for.
+    public static func profileInputs(_ o: SecurityPolicyOptions) -> [Bool] {
+        [o.killSwitchEnabled, o.excludeLocalNetworks]
+    }
 }
