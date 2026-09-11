@@ -1,5 +1,7 @@
 # Sweep VPN — iOS + macOS
 
+> **iOS is currently non-functional** — it needs an Apple Developer team for NetworkExtension signing. Only the macOS build is expected to work.
+
 A personal VPN client you run against your own server: WireGuard data plane,
 kernel IKEv2 fallback, fail-closed kill switch, offline-signed control plane.
 

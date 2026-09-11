@@ -40,12 +40,6 @@ final class StateMachineTests: XCTestCase {
 final class AutoModeTests: XCTestCase {
     let t0 = Date(timeIntervalSince1970: 1_700_000_000)
 
-    func testLowPowerPrefersIKEv2() {
-        var e = AutoModeEngine(enabledRungs: [.wireGuardUDP, .ikev2, .wireGuardTCP])
-        let d = e.decideStart(memory: .init(), signals: .init(isLowPowerMode: true), now: t0)
-        XCTAssertEqual(d, .connect(.ikev2))
-    }
-
     func testKnownNetworkSkipsRacing() {
         var e = AutoModeEngine()
         var mem = NetworkMemory(); mem.lastGoodRung = .wireGuardTCP
@@ -77,9 +71,9 @@ final class AutoModeTests: XCTestCase {
     }
 
     func testForcedPreferenceDisablesRacingAndSwitching() {
-        var e = AutoModeEngine(preference: .forced(.ikev2), enabledRungs: Set(ProtocolRung.allCases))
-        XCTAssertEqual(e.decideStart(memory: .init(), signals: .init(), now: t0), .connect(.ikev2))
-        e.noteConnected(rung: .ikev2, now: t0)
+        var e = AutoModeEngine(preference: .forced(.wireGuardTCP), enabledRungs: Set(ProtocolRung.allCases))
+        XCTAssertEqual(e.decideStart(memory: .init(), signals: .init(), now: t0), .connect(.wireGuardTCP))
+        e.noteConnected(rung: .wireGuardTCP, now: t0)
         let d = e.observe(health: .init(rttMs: 10, lossFraction: 0, handshakeOK: true),
                           now: t0.addingTimeInterval(600))
         XCTAssertEqual(d, .stay)
@@ -96,18 +90,18 @@ final class AutoModeTests: XCTestCase {
     }
 
     func testSustainedLossDowngradesOnlyAfterWindow() {
-        var e = AutoModeEngine(enabledRungs: [.wireGuardUDP, .ikev2])
+        var e = AutoModeEngine(enabledRungs: [.wireGuardUDP, .wireGuardTCP])
         e.noteConnected(rung: .wireGuardUDP, now: t0)
         let lossy = LinkHealth(rttMs: 50, lossFraction: 0.10, handshakeOK: true)
         XCTAssertEqual(e.observe(health: lossy, now: t0.addingTimeInterval(5)), .stay)
         XCTAssertEqual(e.observe(health: lossy, now: t0.addingTimeInterval(19)), .stay)
         XCTAssertEqual(e.observe(health: lossy, now: t0.addingTimeInterval(26)),
-                       .downgrade(to: .ikev2, reason: .highLoss))
+                       .downgrade(to: .wireGuardTCP, reason: .highLoss))
     }
 
     func testUpgradeNeedsCleanProbesDwellAndBudget() {
-        var e = AutoModeEngine(enabledRungs: [.wireGuardUDP, .ikev2])
-        e.noteConnected(rung: .ikev2, now: t0)
+        var e = AutoModeEngine(enabledRungs: [.wireGuardUDP, .wireGuardTCP])
+        e.noteConnected(rung: .wireGuardTCP, now: t0)
         let good = LinkHealth(rttMs: 30, lossFraction: 0, handshakeOK: true)
         // Inside the 120 s dwell nothing moves, however clean the link is.
         XCTAssertEqual(e.observe(health: good, now: t0.addingTimeInterval(10)), .stay)
@@ -119,7 +113,7 @@ final class AutoModeTests: XCTestCase {
 
     func testSwitchBudgetAndCooldown() {
         var e = AutoModeEngine()
-        e.noteConnected(rung: .ikev2, now: t0)
+        e.noteConnected(rung: .wireGuardTCP, now: t0)
         for i in 0..<4 { e.recordVoluntarySwitch(now: t0.addingTimeInterval(Double(i))) }
         XCTAssertFalse(e.canSwitchVoluntarily(now: t0.addingTimeInterval(200)))
         XCTAssertTrue(e.canSwitchVoluntarily(now: t0.addingTimeInterval(3700)))
@@ -191,7 +185,7 @@ final class SignedConfigTests: XCTestCase {
                      servers: [Server(id: "s1", name: "Stockholm", countryCode: "SE", publicKey: "pk",
                                       endpoints: [.init(host: "1.2.3.4", port: 51820, rung: .wireGuardUDP)],
                                       dnsServers: ["10.64.0.1"], ipv4Address: "10.64.0.2")],
-                     enabledRungs: [.wireGuardUDP, .ikev2])
+                     enabledRungs: [.wireGuardUDP, .wireGuardTCP])
     }
 
     func testValidBundleVerifies() throws {
@@ -343,7 +337,7 @@ final class IPCTests: XCTestCase {
                                     killSwitchArmed: true, pqHybridActive: true)
         let data = try IPCCodec.encode(ProviderToApp.status(status))
         XCTAssertEqual(try IPCCodec.decode(ProviderToApp.self, data), .status(status))
-        let msg = AppToProvider.setPreference(.forced(.ikev2))
+        let msg = AppToProvider.setPreference(.forced(.wireGuardTCP))
         XCTAssertEqual(try IPCCodec.decode(AppToProvider.self, try IPCCodec.encode(msg)), msg)
     }
 }
@@ -365,13 +359,11 @@ final class PostQuantumTests: XCTestCase {
     }
 
     /// Every WireGuard rung carries the same tunnel, so the hybrid PSK applies
-    /// to all of them; the kernel IKEv2 rung has no PQ story, and the OpenVPN
-    /// rungs are not our tunnel at all — their crypto is the relay's, not ours.
-    func testEveryWireGuardRungCarriesPQAndIKEv2DoesNot() {
-        for rung in ProtocolRung.allCases where rung != .ikev2 && rung.isOwnWireGuardTunnel {
+    /// to all of them; the OpenVPN rungs are not our tunnel at all — their crypto is the relay's, not ours.
+    func testEveryWireGuardRungCarriesPQAndOpenVPNDoesNot() {
+        for rung in ProtocolRung.allCases where rung.isOwnWireGuardTunnel {
             XCTAssertTrue(rung.supportsHybridPQ, "\(rung) should carry the hybrid PSK")
         }
-        XCTAssertFalse(ProtocolRung.ikev2.supportsHybridPQ)
         XCTAssertFalse(ProtocolRung.openVPNUDP.supportsHybridPQ)
         XCTAssertFalse(ProtocolRung.openVPNTCP.supportsHybridPQ)
     }

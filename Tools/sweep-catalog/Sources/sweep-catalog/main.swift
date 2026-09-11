@@ -33,7 +33,6 @@ enum Ports {
     static let tls: UInt16 = 443
     static let shadowsocks: UInt16 = 8443
     static let tcp: UInt16 = 8080
-    static let ikev2: UInt16 = 500
 }
 
 /// Description of one machine you control.
@@ -79,8 +78,8 @@ func endpoints(for s: PersonalServer) -> [ServerEndpoint] {
             result.append(.init(host: s.host, port: Ports.shadowsocks, rung: rung, secret: key))
         case .wireGuardTCP:
             result.append(.init(host: s.host, port: Ports.tcp, rung: rung))
-        case .ikev2:
-            result.append(.init(host: s.host, port: Ports.ikev2, rung: rung))
+        case .openVPNUDP, .openVPNTCP:
+            continue   // VPN Gate relays, never a personal server rung
         }
     }
     return result

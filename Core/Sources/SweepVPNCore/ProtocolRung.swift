@@ -19,8 +19,7 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
     /// Shadowsocks-2022 (AEAD, BLAKE3) carrying WireGuard on TCP/443 — no
     /// plaintext handshake at all, so nothing to fingerprint or actively probe.
     case shadowsocks2022 = 5
-    /// Kernel IKEv2/IPsec. No extension process, lowest battery, MOBIKE roaming.
-    case ikev2 = 6
+    // 6 was kernel IKEv2 — removed, never wired into the ladder. Do not reuse.
     /// Last resort: WireGuard framed on plain TCP/443, TCP-over-TCP accepted.
     case wireGuardTCP = 7
     /// OpenVPN over UDP. Unlike every rung above, this is *not* our WireGuard
@@ -38,12 +37,9 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
 
     public static func < (a: ProtocolRung, b: ProtocolRung) -> Bool { a.rawValue < b.rawValue }
 
-    /// Everything except IKEv2 runs inside the packet-tunnel extension.
-    public var usesPacketTunnel: Bool { self != .ikev2 }
-
     public var isUDP: Bool {
         switch self {
-        case .wireGuardUDP, .wireGuardUDP443, .wireGuardQUIC, .ikev2, .openVPNUDP: return true
+        case .wireGuardUDP, .wireGuardUDP443, .wireGuardQUIC, .openVPNUDP: return true
         default: return false
         }
     }
@@ -62,14 +58,12 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
         self == .wireGuardQUIC || self == .wireGuardTLS || self == .shadowsocks2022
     }
 
-    /// Only the WireGuard rungs can carry the ML-KEM-768 hybrid PSK; IKEv2 has
-    /// no PQ story on Apple's stack.
-    public var supportsHybridPQ: Bool { isOwnWireGuardTunnel && self != .ikev2 }
+    /// Only the WireGuard rungs can carry the ML-KEM-768 hybrid PSK.
+    public var supportsHybridPQ: Bool { isOwnWireGuardTunnel }
 
     /// Rough cost ranking used for battery-aware tie-breaks (1 = cheapest).
     public var overheadRank: Int {
         switch self {
-        case .ikev2: return 1
         case .wireGuardUDP, .wireGuardUDP443: return 2
         case .wireGuardQUIC: return 3
         case .shadowsocks2022: return 4
@@ -87,7 +81,6 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
         case .wireGuardQUIC: return "WireGuard over QUIC"
         case .wireGuardTLS: return "Stealth (TLS 443)"
         case .shadowsocks2022: return "Shadowsocks 2022"
-        case .ikev2: return "IKEv2 (low power)"
         case .wireGuardTCP: return "WireGuard over TCP"
         case .openVPNUDP: return "OpenVPN (UDP)"
         case .openVPNTCP: return "OpenVPN (TCP)"
@@ -101,7 +94,6 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
         case .wireGuardQUIC: return "WG/QUIC"
         case .wireGuardTLS: return "WG/TLS"
         case .shadowsocks2022: return "SS2022"
-        case .ikev2: return "IKEv2"
         case .wireGuardTCP: return "WG/TCP"
         case .openVPNUDP: return "OVPN/UDP"
         case .openVPNTCP: return "OVPN/TCP"
@@ -114,8 +106,6 @@ public enum ProtocolRung: Int, CaseIterable, Codable, Sendable, Comparable {
 public enum ProtocolPreference: Equatable, Hashable, Codable, Sendable {
     case automatic
     case fast                  // pin the cheapest UDP rungs
-    case stealth               // only rungs that look like ordinary web traffic
-    case lowPower              // kernel IKEv2
     case forced(ProtocolRung)  // power-user override
 
     /// Rungs the engine may use, in preference order.
@@ -127,8 +117,6 @@ public enum ProtocolPreference: Equatable, Hashable, Codable, Sendable {
         // the ladder falls onto on its own — it takes an explicit choice.
         case .automatic: return all.filter(\.isOwnWireGuardTunnel)
         case .fast: return all.filter { $0 == .wireGuardUDP || $0 == .wireGuardUDP443 }
-        case .stealth: return all.filter(\.looksLikeWeb)
-        case .lowPower: return all.filter { $0 == .ikev2 }
         case .forced(let r): return all.filter { $0 == r }
         }
     }
@@ -140,8 +128,6 @@ public enum ProtocolPreference: Equatable, Hashable, Codable, Sendable {
         switch self {
         case .automatic: return "Automatic"
         case .fast: return "Fast"
-        case .stealth: return "Stealth"
-        case .lowPower: return "Low power"
         case .forced(let r): return r.displayName
         }
     }

@@ -713,7 +713,7 @@ public final class VPNViewModel: ObservableObject {
     }
 
     /// Modes a user can pick directly; `forced` is set from the Advanced picker.
-    public static let selectableModes: [ProtocolPreference] = [.automatic, .fast, .stealth, .lowPower]
+    public static let selectableModes: [ProtocolPreference] = [.automatic, .fast]
 
     /// Rungs this build can run *and* has somewhere to run to, in ladder order.
     ///

@@ -66,8 +66,6 @@ public enum AdapterFactoryError: Error, Equatable {
 public enum AdapterFactory {
     /// Rungs that actually exist in this build. A rung that cannot run must fail
     /// loudly rather than look like a working tunnel.
-    /// IKEv2 is real but runs as a kernel profile (`IKEv2Configurator`), not as
-    /// a packet-tunnel adapter, so it is not in this set.
     public static let implementedRungs: Set<ProtocolRung> = {
         var rungs: Set<ProtocolRung> = [
             .wireGuardUDP, .wireGuardUDP443, .wireGuardQUIC,
@@ -83,13 +81,6 @@ public enum AdapterFactory {
     }()
 
     /// Rungs the app can offer at all.
-    ///
-    /// IKEv2 is deliberately absent. `IKEv2Configurator` exists but no code path
-    /// calls it, so offering the rung in the picker promised a fallback that
-    /// could never engage. It also installs into `NEVPNManager.shared()` — the
-    /// single system-wide personal-VPN slot — which would clobber any IKEv2
-    /// profile the user already has. Re-add it only once it is actually wired
-    /// into the ladder and that clobbering is handled.
     public static let availableRungs: Set<ProtocolRung> = implementedRungs
 
     public static func make(rung: ProtocolRung, server: Server, privateKeyBase64: String,

@@ -3,34 +3,22 @@ import XCTest
 
 final class ProtocolLadderTests: XCTestCase {
     func testLadderIsOrderedAndComplete() {
-        XCTAssertEqual(ProtocolRung.allCases.map(\.rawValue), Array(1...9))
+        XCTAssertEqual(ProtocolRung.allCases.map(\.rawValue), [1, 2, 3, 4, 5, 7, 8, 9])  // 6 retired (IKEv2)
         XCTAssertEqual(ProtocolRung.allCases.first, .wireGuardUDP)
         XCTAssertEqual(ProtocolRung.allCases.last, .openVPNTCP)
         // The ladder proper — what Automatic will walk — is the WireGuard rungs.
         // The two OpenVPN rungs sit below it and are opt-in only.
         XCTAssertEqual(ProtocolRung.allCases.filter(\.isOwnWireGuardTunnel).map(\.rawValue),
-                       Array(1...7))
+                       [1, 2, 3, 4, 5, 7])
     }
 
     func testEveryNetworkFailureModeHasAnAnswer() {
         let all = ProtocolRung.allCases
-        XCTAssertTrue(all.contains { $0.survivesUDPBlock && $0.usesPacketTunnel },
+        XCTAssertTrue(all.contains(where: \.survivesUDPBlock),
                       "must have a rung for UDP-blocked networks")
         XCTAssertTrue(all.contains(where: \.looksLikeWeb), "must have a rung that looks like HTTPS")
         XCTAssertTrue(all.contains { $0 == .shadowsocks2022 },
                       "must have a rung with no plaintext handshake to fingerprint")
-        XCTAssertTrue(all.contains { !$0.usesPacketTunnel }, "must have a kernel rung for low power")
-    }
-
-    func testStealthModeOnlyOffersWebShapedRungs() {
-        let rungs = ProtocolPreference.stealth.permittedRungs(enabledTiers: Set(ProtocolRung.allCases))
-        XCTAssertFalse(rungs.isEmpty)
-        XCTAssertTrue(rungs.allSatisfy(\.looksLikeWeb))
-    }
-
-    func testLowPowerModeIsKernelOnly() {
-        XCTAssertEqual(ProtocolPreference.lowPower.permittedRungs(
-            enabledTiers: Set(ProtocolRung.allCases)), [.ikev2])
     }
 
     func testRaceSetIsDiverseNotJustTopN() {

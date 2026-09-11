@@ -138,10 +138,6 @@ public struct AutoModeEngine: Sendable {
         var permitted = preference.permittedRungs(enabledTiers: enabledRungs)
         if permitted.isEmpty { return .failClosed(.allRungsFailed) }
 
-        // Low Power Mode explicitly prefers the kernel IKEv2 rung when it is permitted.
-        if signals.isLowPowerMode, permitted.contains(.ikev2) {
-            return .connect(.ikev2)
-        }
         // An unexpired "UDP blocked" flag removes the UDP rungs from this network.
         if memory.isUDPBlocked(now: now) || signals.udpBlockedHint {
             permitted.removeAll { $0.isUDP }

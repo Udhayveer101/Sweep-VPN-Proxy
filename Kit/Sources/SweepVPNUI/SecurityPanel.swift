@@ -56,10 +56,6 @@ public struct SecurityPanel: View {
             return ("Curve25519 (X25519), Noise IK",
                     "ChaCha20-Poly1305 (AEAD)",
                     "BLAKE2s, mutual static public keys")
-        case .ikev2:
-            return ("Diffie-Hellman group 20 (ECP-384)",
-                    "AES-256-GCM",
-                    "Certificate, mutual")
         case .openVPNUDP, .openVPNTCP:
             // The one rung with real cipher agility, and the weakest: the relay
             // picks, and a VPN Gate profile typically asks for AES-128-CBC with

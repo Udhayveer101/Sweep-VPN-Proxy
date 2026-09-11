@@ -39,14 +39,6 @@ final class AdapterFactoryTests: XCTestCase {
                         endpoints: [.init(host: "1.2.3.4", port: 443, rung: .wireGuardTLS)],
                         dnsServers: ["10.64.0.1"], ipv4Address: "10.64.0.2")
 
-    func testKernelRungIsNeverBuiltAsAnAdapter() {
-        XCTAssertThrowsError(try AdapterFactory.make(rung: .ikev2, server: server,
-                                                     privateKeyBase64: "k", presharedKeyBase64: nil,
-                                                     keepalive: 25)) {
-            XCTAssertEqual($0 as? AdapterFactoryError, .rungNotImplemented(.ikev2))
-        }
-    }
-
     func testMissingEndpointFails() {
         XCTAssertThrowsError(try AdapterFactory.make(rung: .wireGuardUDP, server: server,
                                                      privateKeyBase64: "k", presharedKeyBase64: nil,
@@ -55,7 +47,7 @@ final class AdapterFactoryTests: XCTestCase {
         }
     }
 
-    func testShippedRungsCoverEveryFailureModeAndExcludeTheKernelOne() {
+    func testShippedRungsCoverEveryFailureMode() {
         // The WireGuard ladder is the same on every platform.
         XCTAssertEqual(Set(AdapterFactory.implementedRungs.filter(\.isOwnWireGuardTunnel)),
                        Set([.wireGuardUDP, .wireGuardUDP443, .wireGuardQUIC,
@@ -70,14 +62,6 @@ final class AdapterFactoryTests: XCTestCase {
         #else
         XCTAssertTrue(AdapterFactory.implementedRungs.isDisjoint(with: [.openVPNUDP, .openVPNTCP]))
         #endif
-        XCTAssertFalse(AdapterFactory.implementedRungs.contains(.ikev2),
-                       "IKEv2 is a kernel profile, not a packet-tunnel adapter")
-        // IKEv2 is no longer offered at all. IKEv2Configurator exists but nothing
-        // calls it, so listing the rung promised a fallback that could never
-        // engage — and installing it would overwrite NEVPNManager.shared(), the
-        // one system-wide personal-VPN slot. Re-add only once it is truly wired.
-        XCTAssertFalse(AdapterFactory.availableRungs.contains(.ikev2),
-                       "an unreachable rung must not be offered in the picker")
         XCTAssertEqual(AdapterFactory.availableRungs, AdapterFactory.implementedRungs)
     }
 }
