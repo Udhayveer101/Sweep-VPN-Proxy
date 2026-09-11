@@ -50,6 +50,13 @@ public struct SecurityPolicyOptions: Sendable, Equatable, Codable {
     /// Bridge lines from https://bridges.torproject.org. Only needed when the
     /// network blocks Tor and the VPN is not carrying it; empty means direct.
     public var torBridges: [String] = []
+    /// Cloudflare WARP over MASQUE (usque) as the local proxy's upstream. App-
+    /// side only, like Tor, and mutually exclusive with it.
+    public var warpEnabled: Bool = false
+    /// SNI presented to Cloudflare. Any neutral name works; the gateway resets
+    /// the real consumer-masque.cloudflareclient.com.
+    public var warpSNI: String = "example.com"
+    public var warpSocksPort: Int = 1081
     /// Local SOCKS5 / HTTP-CONNECT listener for apps that should use the tunnel
     /// (or Tor) without the whole system being routed through it.
     public var localProxyEnabled: Bool = false

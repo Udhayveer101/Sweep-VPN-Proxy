@@ -134,7 +134,44 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
+    @Published public internal(set) var warpState: WarpController.State = .stopped
+    private var warp: WarpController?
+
+    public var warpStatusText: String? {
+        switch warpState {
+        case .stopped: return nil
+        case .starting: return "Starting WARP…"
+        case .running: return "WARP ready on 127.0.0.1:\(String(options.warpSocksPort)) (SNI \(options.warpSNI))"
+        case .failed(let why): return why
+        }
+    }
+
+    /// WARP and Tor both want to be the proxy's SOCKS upstream; only one can be.
+    public func setWarp(enabled: Bool) {
+        if enabled, options.torEnabled { setTor(enabled: false) }
+        var o = options
+        o.warpEnabled = enabled
+        apply(options: o)
+        warp?.stop()
+        warp = nil
+        warpState = .stopped
+        guard enabled else { syncProxyUpstream(); return }
+        guard let controller = WarpController(socksPort: options.warpSocksPort,
+                                              sni: options.warpSNI) else {
+            warpState = .failed("This build has no bundled usque. Build it and run `make bundle-tor`.")
+            return
+        }
+        warp = controller
+        controller.start { [weak self] st in
+            Task { @MainActor in
+                self?.warpState = st
+                self?.syncProxyUpstream()
+            }
+        }
+    }
+
     public func setTor(enabled: Bool) {
+        if enabled, options.warpEnabled { setWarp(enabled: false) }
         var o = options
         o.torEnabled = enabled
         apply(options: o)
@@ -187,7 +224,7 @@ public final class VPNViewModel: ObservableObject {
     public var proxyUpstreamLabel: String {
         switch currentUpstream() {
         case .direct: return "VPN"
-        case .socks5: return "Tor"
+        case .socks5: return options.warpEnabled ? "WARP" : "Tor"
         case .worker: return "Worker"
         }
     }
@@ -199,7 +236,10 @@ public final class VPNViewModel: ObservableObject {
         syncProxyUpstream()
     }
 
-    private func currentUpstream() -> LocalProxy.Upstream {
+    func currentUpstream() -> LocalProxy.Upstream {
+        if options.warpEnabled, warpState == .running {
+            return .socks5(host: "127.0.0.1", port: options.warpSocksPort)
+        }
         if options.torEnabled, torState == .running, let port = tor?.socksPort {
             return .socks5(host: "127.0.0.1", port: port)
         }

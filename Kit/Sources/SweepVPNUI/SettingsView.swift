@@ -77,6 +77,26 @@ public struct SettingsView: View {
                     Text("Runs Tor inside Sweep and sends its circuits through the VPN, so the exit relay sees the VPN server rather than your connection. Connect the VPN first — your ISP blocks Tor directly, and with the VPN up it only sees WireGuard traffic. Without the VPN, Sweep still tries bridges, Snowflake and meek in turn, but none of them completed on this network.")
                         .font(.footnote).foregroundStyle(.secondary)
 
+                    Toggle("WARP (Cloudflare, disguised)", isOn: Binding(
+                        get: { model.options.warpEnabled },
+                        set: { model.setWarp(enabled: $0) }))
+                    if let status = model.warpStatusText {
+                        Text(status).font(.footnote)
+                            .foregroundStyle(model.warpState.isFailed ? .red : .secondary)
+                            .textSelection(.enabled)
+                    }
+                    TextField("WARP SNI", text: Binding(
+                        get: { model.options.warpSNI },
+                        set: {
+                            var o = model.options
+                            o.warpSNI = $0.trimmingCharacters(in: .whitespaces)
+                            model.apply(options: o)
+                        }))
+                        .font(.system(.footnote, design: .monospaced))
+                        .disabled(model.options.warpEnabled)
+                    Text("Sends the local proxy's traffic to Cloudflare WARP inside HTTPS that names an ordinary site, which the network filter lets through. Turn on Local proxy and point a browser at it. Replaces Tor while on. Change the SNI with WARP off.")
+                        .font(.footnote).foregroundStyle(.secondary)
+
                     Toggle("Local proxy", isOn: Binding(
                         get: { model.options.localProxyEnabled },
                         set: { model.setLocalProxy(enabled: $0) }))

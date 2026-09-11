@@ -76,6 +76,20 @@ for F in "$DEST"/*.dylib; do
 done
 codesign --force --timestamp=none --options runtime --sign "$IDENTITY" "$DEST/tor"
 
+# usque (WARP over MASQUE) is a static Go binary built from source:
+#   git clone https://github.com/Diniboy1123/usque && CGO_ENABLED=0 go build
+# Optional — without it the WARP toggle says the binary is missing.
+USQUE="${USQUE:-$HOME/src/usque/usque}"
+if [ -x "$USQUE" ]; then
+  mkdir -p "$APP/Contents/Resources/warp"
+  cp -f "$USQUE" "$APP/Contents/Resources/warp/usque"
+  chmod u+w "$APP/Contents/Resources/warp/usque"
+  codesign --force --timestamp=none --options runtime --sign "$IDENTITY" \
+    "$APP/Contents/Resources/warp/usque"
+else
+  echo "warning: usque not found at $USQUE; WARP mode is unavailable" >&2
+fi
+
 # The app was signed before these files existed, so its seal no longer covers
 # Contents/Resources. Without re-sealing, `codesign --verify` reports "a sealed
 # resource is missing or invalid" and the OS refuses to launch it. Entitlements
