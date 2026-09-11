@@ -62,7 +62,8 @@ public enum ConfigVerifier {
         guard pinnedKey.isValidSignature(signed.signature, for: signed.payload) else {
             throw ConfigError.badSignature
         }
-        guard let bundle = try? decoder().decode(ConfigBundle.self, from: signed.payload) else {
+        guard let bundle = try? decoder().decode(ConfigBundle.self,
+                                                 from: droppingRetiredRungs(signed.payload)) else {
             throw ConfigError.malformed
         }
         if let current = currentVersion, bundle.version < current {
@@ -79,6 +80,28 @@ public enum ConfigVerifier {
         }
         guard !bundle.servers.isEmpty else { throw ConfigError.noServers }
         return bundle
+    }
+
+    /// A bundle signed before a rung was retired (IKEv2, raw value 6) still
+    /// lists it. Drop rungs this build does not know instead of rejecting the
+    /// whole bundle — runs after the signature check, so it cannot widen what
+    /// the signer allowed, only narrow it.
+    static func droppingRetiredRungs(_ payload: Data) -> Data {
+        guard var root = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
+            return payload
+        }
+        let known = { (v: Any) in (v as? Int).flatMap(ProtocolRung.init(rawValue:)) != nil }
+        if let rungs = root["enabledRungs"] as? [Any] { root["enabledRungs"] = rungs.filter(known) }
+        if let servers = root["servers"] as? [[String: Any]] {
+            root["servers"] = servers.map { s -> [String: Any] in
+                var s = s
+                if let eps = s["endpoints"] as? [[String: Any]] {
+                    s["endpoints"] = eps.filter { known($0["rung"] as Any) }
+                }
+                return s
+            }
+        }
+        return (try? JSONSerialization.data(withJSONObject: root)) ?? payload
     }
 
     /// Used by the offline signing tool and by tests.

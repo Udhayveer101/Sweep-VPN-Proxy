@@ -195,6 +195,22 @@ final class SignedConfigTests: XCTestCase {
         XCTAssertEqual(out.servers.count, 1)
     }
 
+    func testBundleListingRetiredRungStillVerifies() throws {
+        var json = try JSONSerialization.jsonObject(
+            with: ConfigVerifier.encoder().encode(bundle())) as! [String: Any]
+        json["enabledRungs"] = [1, 6, 7]
+        var servers = json["servers"] as! [[String: Any]]
+        servers[0]["endpoints"] = (servers[0]["endpoints"] as! [[String: Any]])
+            + [["host": "1.2.3.4", "port": 500, "rung": 6]]
+        json["servers"] = servers
+        let payload = try JSONSerialization.data(withJSONObject: json)
+        let signed = SignedBundle(payload: payload, signature: try key.signature(for: payload))
+        let out = try ConfigVerifier.verify(signed, pinnedKey: key.publicKey,
+                                            currentVersion: nil, appBuild: 5, now: now)
+        XCTAssertEqual(out.enabledRungs, [.wireGuardUDP, .wireGuardTCP])
+        XCTAssertEqual(out.servers[0].endpoints.map(\.rung), [.wireGuardUDP])
+    }
+
     func testTamperedPayloadRejected() throws {
         var signed = try ConfigVerifier.sign(bundle(), with: key)
         signed.payload[signed.payload.count - 2] ^= 0xFF
