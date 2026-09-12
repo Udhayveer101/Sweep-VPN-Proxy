@@ -76,9 +76,19 @@ public final class WarpController: @unchecked Sendable {
     /// after which every SOCKS dial fails until the idle reconnect. Pinning the
     /// IPv4 Cloudflare pair keeps lookups on a path that exists (measured
     /// 2026-09-12: 0/20 parallel fetches succeeded on the defaults, 20/20 here).
+    /// `--always-reconnect`: without it usque parks after every tunnel loss
+    /// ("Tunnel idle. Waiting for outbound activity"), and the packet that wakes
+    /// it is *read off the TUN device and dropped* before the ~1s redial. That
+    /// packet is normally the DNS query, and the resolver sends one datagram per
+    /// server with no retry, so the first request after any loss — link drop,
+    /// sleep/wake, a fresh start — dies as `lookup ...: i/o timeout`. Measured
+    /// 2026-09-13 on a cold proxy: 12s failure or a 5s stall without the flag,
+    /// 0.07-0.14s with it. `--dns-timeout` then covers a query that still lands
+    /// inside a redial window.
     var arguments: [String] {
         ["-c", configFile.path, "socks",
          "-s", sni, "--http2",
+         "--always-reconnect", "--dns-timeout", "5s",
          "-d", "1.1.1.1", "-d", "1.0.0.1",
          "-b", "127.0.0.1", "-p", String(socksPort)]
     }
