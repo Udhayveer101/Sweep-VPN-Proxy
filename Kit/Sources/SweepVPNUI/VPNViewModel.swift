@@ -146,6 +146,55 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
+    @Published public private(set) var systemProxyEnabled = false
+    @Published public private(set) var systemProxyError: String?
+    /// Set while WARP is still starting and the whole Mac is meant to follow it.
+    private var armSystemProxyWhenReady = false
+
+    /// One switch for "send this whole Mac through WARP": start WARP, start the
+    /// local proxy, and point the system SOCKS setting at it once WARP is
+    /// actually up. Pointing the system at a port nothing is listening on
+    /// breaks every app on the machine, so the order matters.
+    public func setEverythingThroughWarp(_ on: Bool) {
+        systemProxyError = nil
+        guard on else {
+            armSystemProxyWhenReady = false
+            applySystemProxy(false)
+            setLocalProxy(enabled: false)
+            setWarp(enabled: false)
+            return
+        }
+        armSystemProxyWhenReady = true
+        setWarp(enabled: true)
+        setLocalProxy(enabled: true)
+        if warpState == .running { applySystemProxyWhenReady() }
+    }
+
+    private func applySystemProxyWhenReady() {
+        guard armSystemProxyWhenReady, warpState == .running,
+              case .listening = proxyState else { return }
+        armSystemProxyWhenReady = false
+        applySystemProxy(true)
+    }
+
+    private func applySystemProxy(_ on: Bool) {
+        guard on || systemProxyEnabled else { return }   // nothing to undo
+        do {
+            try SystemProxy.set(enabled: on, port: options.localProxyPort)
+            systemProxyEnabled = on
+        } catch {
+            systemProxyEnabled = SystemProxy.isEnabled(port: options.localProxyPort)
+            systemProxyError = error.localizedDescription
+        }
+    }
+
+    /// Leaving the system pointed at a proxy that died with the app would take
+    /// the Mac offline, so the setting is undone on the way out.
+    public func restoreSystemProxyOnQuit() {
+        guard systemProxyEnabled else { return }
+        applySystemProxy(false)
+    }
+
     /// WARP and Tor both want to be the proxy's SOCKS upstream; only one can be.
     public func setWarp(enabled: Bool) {
         if enabled, options.torEnabled { setTor(enabled: false) }
@@ -166,6 +215,7 @@ public final class VPNViewModel: ObservableObject {
             Task { @MainActor in
                 self?.warpState = st
                 self?.syncProxyUpstream()
+                self?.applySystemProxyWhenReady()
             }
         }
     }
@@ -214,7 +264,10 @@ public final class VPNViewModel: ObservableObject {
         }
         proxy = listener
         listener.start(upstream: currentUpstream()) { [weak self] st in
-            Task { @MainActor in self?.proxyState = st }
+            Task { @MainActor in
+                self?.proxyState = st
+                self?.applySystemProxyWhenReady()
+            }
         }
     }
 

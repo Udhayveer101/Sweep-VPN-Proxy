@@ -18,7 +18,7 @@ struct SweepVPNMacApp: App {
         Window("Sweep VPN", id: "main") {
             HomeView(model: model)
                 .frame(minWidth: 420, idealWidth: 460, minHeight: 620, idealHeight: 680)
-                .onAppear { model.onAppear() }
+                .onAppear { model.onAppear(); AppDelegate.model = model }
                 .onDisappear { model.onDisappear() }
                 .task { await Self.refreshConfiguration(into: model) }
         }
@@ -114,6 +114,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// The system SOCKS proxy points at a listener that dies with this app, so
+    /// leaving it set would take the Mac offline after quitting.
+    @MainActor static weak var model: VPNViewModel?
+
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated { Self.model?.restoreSystemProxyOnQuit() }
     }
 
 }

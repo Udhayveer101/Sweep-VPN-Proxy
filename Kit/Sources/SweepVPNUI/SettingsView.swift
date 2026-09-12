@@ -77,6 +77,15 @@ public struct SettingsView: View {
                     Text("Runs Tor inside Sweep and sends its circuits through the VPN, so the exit relay sees the VPN server rather than your connection. Connect the VPN first — your ISP blocks Tor directly, and with the VPN up it only sees WireGuard traffic. Without the VPN, Sweep still tries bridges, Snowflake and meek in turn, but none of them completed on this network.")
                         .font(.footnote).foregroundStyle(.secondary)
 
+                    Toggle("Route this whole Mac through WARP", isOn: Binding(
+                        get: { model.systemProxyEnabled },
+                        set: { model.setEverythingThroughWarp($0) }))
+                    if let why = model.systemProxyError {
+                        Text(why).font(.footnote).foregroundStyle(.red).textSelection(.enabled)
+                    }
+                    Text("Starts WARP, starts the local proxy, and sets the Mac's system SOCKS proxy to it — macOS asks for your password each way. Turn it off before quitting Sweep; the app also undoes it on quit, because a system proxy with nothing behind it takes the Mac offline. Apps that ignore the system proxy setting are unaffected, and DNS lookups still go out normally.")
+                        .font(.footnote).foregroundStyle(.secondary)
+
                     Toggle("WARP (Cloudflare, disguised)", isOn: Binding(
                         get: { model.options.warpEnabled },
                         set: { model.setWarp(enabled: $0) }))
