@@ -290,7 +290,12 @@ public final class VPNViewModel: ObservableObject {
     }
 
     func currentUpstream() -> LocalProxy.Upstream {
-        if options.warpEnabled, warpState == .running {
+        // Deliberately not gated on `warpState == .running`: while WARP is
+        // starting, restarting after a wedged tunnel, or failed, the port is
+        // simply not listening and dials are refused. Falling back to .direct
+        // there would push traffic the user asked to route through WARP straight
+        // out to the ISP — a leak, and the harder kind to notice because it works.
+        if options.warpEnabled {
             return .socks5(host: "127.0.0.1", port: options.warpSocksPort)
         }
         if options.torEnabled, torState == .running, let port = tor?.socksPort {

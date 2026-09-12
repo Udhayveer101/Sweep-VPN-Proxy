@@ -30,6 +30,10 @@ public final class WarpController: @unchecked Sendable {
     private let lock = NSLock()
     private var onState: (@Sendable (State) -> Void)?
     private var stallTimer: DispatchSourceTimer?
+    private var failureTimes: [Date] = []
+    private var lastRestart: Date = .distantPast
+    private var restarting = false
+    private var stopped = false
     private(set) public var state: State = .stopped {
         didSet { if state != oldValue { onState?(state) } }
     }
@@ -97,6 +101,7 @@ public final class WarpController: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         self.onState = onState
+        stopped = false
         guard process == nil else { return }
 
         let dir = configFile.deletingLastPathComponent()
@@ -146,6 +151,7 @@ public final class WarpController: @unchecked Sendable {
         lock.lock()
         let p = process
         process = nil
+        stopped = true
         stallTimer?.cancel()
         stallTimer = nil
         lock.unlock()
@@ -184,9 +190,74 @@ public final class WarpController: @unchecked Sendable {
                 record(.info, "connected", line)
             case .error:
                 record(.warn, "log", line)
+                if noteFailure(line) { restartWedgedTunnel(line) }
             case nil:
                 break
             }
+        }
+    }
+
+    /// usque only tears the session down when a write fails with a connect-ip
+    /// CloseError (api/tunnel.go). A MASQUE session whose HTTP/2 pipe has been
+    /// closed underneath it fails with `io: read/write on closed pipe` instead,
+    /// which it logs as "continuing..." forever while the read pump stays parked
+    /// — so it reports Connected while nothing flows and never reconnects. Seen
+    /// 2026-09-13: a minute of traffic, then every lookup timing out for good.
+    /// We supervise the process, so we are the ones who can end that: a write
+    /// failure is acted on at once, and a burst of dial failures counts as the
+    /// same wedge in case the write pump stays quiet.
+    static let wedgeWindow: TimeInterval = 10
+    static let wedgeBurst = 4
+    static let restartFloor: TimeInterval = 20
+
+    /// `true` when this error line means the tunnel is wedged and the child
+    /// should be relaunched. Bookkeeping only — the process work is separate so
+    /// this stays testable. `now` is injectable for the same reason.
+    func noteFailure(_ line: String, now: Date = Date()) -> Bool {
+        let writeFailed = line.contains("closed pipe")
+            || line.contains("Error writing to IP connection")
+        lock.lock()
+        defer { lock.unlock() }
+        failureTimes.append(now)
+        failureTimes.removeAll { now.timeIntervalSince($0) > Self.wedgeWindow }
+        let wedged = writeFailed || failureTimes.count >= Self.wedgeBurst
+        guard wedged, !restarting, process != nil,
+              now.timeIntervalSince(lastRestart) >= Self.restartFloor else { return false }
+        lastRestart = now
+        failureTimes.removeAll()
+        restarting = true
+        return true
+    }
+
+    /// Tests need a controller that believes a child is running without one —
+    /// the state a real relaunch lands in.
+    func pretendRunningForTests() {
+        lock.lock(); defer { lock.unlock() }
+        process = Process()
+        restarting = false
+    }
+
+    private func restartWedgedTunnel(_ line: String) {
+        record(.warn, "restarting", "tunnel wedged: \(line)")
+        DispatchQueue.global().async { [self] in
+            lock.lock()
+            let doomed = process
+            process = nil
+            stallTimer?.cancel()
+            stallTimer = nil
+            let callback = onState
+            lock.unlock()
+
+            doomed?.terminationHandler = nil          // this exit is ours, not a failure
+            doomed?.terminate()
+            doomed?.waitUntilExit()
+
+            lock.lock()
+            restarting = false
+            let abandoned = stopped                   // stop() won the race
+            lock.unlock()
+            guard !abandoned, let callback else { return }
+            start(onState: callback)
         }
     }
 
