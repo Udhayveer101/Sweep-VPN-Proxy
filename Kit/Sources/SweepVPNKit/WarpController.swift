@@ -69,9 +69,17 @@ public final class WarpController: @unchecked Sendable {
         self.configFile = directory.appendingPathComponent("config.json")
     }
 
+    /// usque's default in-tunnel resolver list contains two IPv6 Quad9 servers,
+    /// and IPv6 does not route inside this MASQUE session: those lookups stall
+    /// for the 2s DNS deadline and the stuck in-tunnel UDP eventually takes the
+    /// whole session down ("Tunnel connection lost: read: operation timed out"),
+    /// after which every SOCKS dial fails until the idle reconnect. Pinning the
+    /// IPv4 Cloudflare pair keeps lookups on a path that exists (measured
+    /// 2026-09-12: 0/20 parallel fetches succeeded on the defaults, 20/20 here).
     var arguments: [String] {
         ["-c", configFile.path, "socks",
          "-s", sni, "--http2",
+         "-d", "1.1.1.1", "-d", "1.0.0.1",
          "-b", "127.0.0.1", "-p", String(socksPort)]
     }
 
