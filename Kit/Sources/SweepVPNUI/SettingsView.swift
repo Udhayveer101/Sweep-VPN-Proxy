@@ -12,6 +12,16 @@ public struct SettingsView: View {
     public var body: some View {
         NavigationStack {
             Form {
+                #if os(macOS)
+                Section("WARP setup") {
+                    LabeledContent("Status", value: model.warpRegistered ? "Registered on this Mac" : "Not set up")
+                    Button(model.warpRegistered ? "Open setup guide" : "Set up WARP") {
+                        model.activeSheet = .onboarding
+                    }
+                    Text("The proxy needs a free WARP registration. The guide walks through it and takes any optional keys.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                #endif
                 Section("Protection") {
                     Toggle("Kill switch", isOn: Binding(
                         get: { model.options.killSwitchEnabled },

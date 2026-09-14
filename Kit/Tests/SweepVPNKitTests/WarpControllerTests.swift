@@ -79,7 +79,7 @@ final class WarpControllerTests: XCTestCase {
                                socksPort: 1081, sni: "example.com", directory: dir)
         w.start { _ in }
         guard case .failed(let why) = w.state else { return XCTFail("state \(w.state)") }
-        XCTAssertTrue(why.contains("No WARP registration"))
+        XCTAssertTrue(why.contains("WARP setup"))
         let mode = try? FileManager.default.attributesOfItem(atPath: dir.path)[.posixPermissions] as? Int
         XCTAssertEqual(mode, 0o700)
     }

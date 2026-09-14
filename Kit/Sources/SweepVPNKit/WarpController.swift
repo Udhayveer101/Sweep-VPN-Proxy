@@ -115,7 +115,7 @@ public final class WarpController: @unchecked Sendable {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
                                                  attributes: [.posixPermissions: 0o700])
         guard FileManager.default.fileExists(atPath: configFile.path) else {
-            state = .failed("No WARP registration. Run `usque -c \"\(configFile.path)\" register -a` once, then turn WARP on again.")
+            state = .failed("WARP is not set up yet. Open Settings ▸ WARP setup and press Register.")
             record(.error, "noConfig", configFile.path)
             return
         }
@@ -280,6 +280,96 @@ public final class WarpController: @unchecked Sendable {
 
     private func record(_ level: LogEntry.Level, _ kind: String, _ detail: String) {
         EventLog.shared.record(phase: "warp", level: level, kind: kind, detail: detail)
+    }
+}
+
+/// The one-time WARP setup, done from the app instead of a terminal. WARP needs
+/// no Cloudflare account or API key: `usque register` creates a free, anonymous
+/// device and writes its keys to `config.json`. A WARP+ license key and a Zero
+/// Trust team token are both optional extras on top of that.
+public enum WarpRegistration {
+
+    public struct Failure: LocalizedError, Equatable {
+        public let message: String
+        public var errorDescription: String? { message }
+    }
+
+    public static func isRegistered(directory: URL = WarpController.defaultDirectory) -> Bool {
+        FileManager.default.fileExists(atPath: directory.appendingPathComponent("config.json").path)
+    }
+
+    /// `xxxxxxxx-xxxxxxxx-xxxxxxxx`, the format usque's `account set` documents.
+    public static func isValidLicenseKey(_ key: String) -> Bool {
+        key.range(of: #"^[A-Za-z0-9]{8}-[A-Za-z0-9]{8}-[A-Za-z0-9]{8}$"#, options: .regularExpression) != nil
+    }
+
+    static func registerArguments(configFile: URL, teamToken: String) -> [String] {
+        var args = ["-c", configFile.path, "register", "--accept-tos", "-n", "Sweep VPN"]
+        if !teamToken.isEmpty { args += ["--jwt", teamToken] }
+        return args
+    }
+
+    static func licenseArguments(configFile: URL, key: String) -> [String] {
+        ["-c", configFile.path, "account", "set", key]
+    }
+
+    /// Registers this Mac, then binds the license key if one was given. Only
+    /// call after the user has accepted Cloudflare's terms: `--accept-tos`
+    /// accepts them on their behalf. A failed license leaves the (working, free)
+    /// registration in place and reports the license error.
+    public static func register(licenseKey: String = "", teamToken: String = "",
+                                executable: URL? = WarpController.bundledExecutable(),
+                                directory: URL = WarpController.defaultDirectory) async throws {
+        guard let executable else {
+            throw Failure(message: "This build has no bundled usque, so WARP cannot be set up. Rebuild with `make install-macos`.")
+        }
+        let key = licenseKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = teamToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !key.isEmpty, !isValidLicenseKey(key) {
+            throw Failure(message: "That license key does not look right. It should be three groups of 8 letters or digits, like ab12cd34-ef56gh78-ij90kl12.")
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let configFile = directory.appendingPathComponent("config.json")
+        if !isRegistered(directory: directory) {
+            try await run(executable, registerArguments(configFile: configFile, teamToken: token),
+                          what: "Registration")
+            guard isRegistered(directory: directory) else {
+                throw Failure(message: "Registration finished but no WARP configuration was saved. Try again.")
+            }
+            // usque writes 0644; the file holds the device's private key.
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configFile.path)
+            EventLog.shared.record(phase: "warp", kind: "registered", detail: token.isEmpty ? "free" : "team")
+        }
+        if !key.isEmpty {
+            try await run(executable, licenseArguments(configFile: configFile, key: key), what: "Setting the license key")
+            EventLog.shared.record(phase: "warp", kind: "licenseSet", detail: "WARP+ key bound")
+        }
+    }
+
+    /// usque logs its reason on failure and exits non-zero (log.Fatalf).
+    private static func run(_ executable: URL, _ arguments: [String], what: String) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let p = Process()
+            p.executableURL = executable
+            p.arguments = arguments
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = pipe
+            p.standardInput = FileHandle.nullDevice   // never hang on a y/n prompt
+            p.terminationHandler = { proc in
+                let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                guard proc.terminationStatus != 0 else { return continuation.resume() }
+                let reason = output.split(whereSeparator: \.isNewline).last.map(String.init)
+                    ?? "exit status \(proc.terminationStatus)"
+                EventLog.shared.record(phase: "warp", level: .error, kind: "setupFailed", detail: reason)
+                continuation.resume(throwing: Failure(
+                    message: "\(what) failed: \(reason). Check your internet connection and any key you entered, then try again."))
+            }
+            do { try p.run() } catch {
+                continuation.resume(throwing: Failure(message: "Could not launch usque: \(error.localizedDescription)"))
+            }
+        }
     }
 }
 #endif

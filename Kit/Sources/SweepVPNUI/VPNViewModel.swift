@@ -137,6 +137,28 @@ public final class VPNViewModel: ObservableObject {
     @Published public internal(set) var warpState: WarpController.State = .stopped
     private var warp: WarpController?
 
+    /// Whether this Mac has a WARP registration. Onboarding is shown until it does.
+    @Published public internal(set) var warpRegistered = WarpRegistration.isRegistered()
+    @Published public private(set) var warpSetupBusy = false
+    @Published public var warpSetupError: String?
+
+    /// Runs the in-app registration. The caller must only offer this after the
+    /// user ticked the Cloudflare terms box.
+    public func registerWarp(licenseKey: String, teamToken: String) async {
+        warpSetupBusy = true
+        warpSetupError = nil
+        defer { warpSetupBusy = false }
+        do {
+            try await WarpRegistration.register(licenseKey: licenseKey, teamToken: teamToken)
+        } catch {
+            warpSetupError = error.localizedDescription
+        }
+        warpRegistered = WarpRegistration.isRegistered()
+        if warpRegistered, warpSetupError == nil {
+            completeOnboarding()
+        }
+    }
+
     public var warpStatusText: String? {
         switch warpState {
         case .stopped: return nil
@@ -384,7 +406,13 @@ public final class VPNViewModel: ObservableObject {
         self.appGroup = appGroup
         self.presentation = Presentation.make(state: .disconnected, serverName: nil,
                                               killSwitchArmed: true, onDemandArmed: true, quality: nil)
+        #if os(macOS)
+        // The proxy cannot work without a WARP registration, so the setup guide
+        // keeps coming back until one exists, whatever was dismissed before.
+        if !warpRegistered { activeSheet = .onboarding }
+        #else
         if !UserDefaults.standard.bool(forKey: "sweep.onboarded") { activeSheet = .onboarding }
+        #endif
     }
 
     /// Test/preview seam: force a state without a running extension.
