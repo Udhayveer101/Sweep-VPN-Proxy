@@ -89,10 +89,17 @@ public final class WarpController: @unchecked Sendable {
     /// 2026-09-13 on a cold proxy: 12s failure or a 5s stall without the flag,
     /// 0.07-0.14s with it. `--dns-timeout` then covers a query that still lands
     /// inside a redial window.
+    /// `-k 5s` (patched usque, api/masque.go): the path kills the MASQUE TCP
+    /// flow every 1-4 min whatever we send (measured 2026-09-14, also on the
+    /// original flags). Stock usque only wires keepalive into QUIC, so over
+    /// HTTP/2 a dead flow went unnoticed for the ~20-25s kernel retransmit
+    /// timeout and every lookup failed. HTTP/2 PINGs now catch it in <=8s, and
+    /// the patched resolver re-asks every 1.5s, so a 15s DNS budget spans
+    /// detection plus the ~3s redial instead of failing inside it.
     var arguments: [String] {
         ["-c", configFile.path, "socks",
          "-s", sni, "--http2",
-         "--always-reconnect", "--dns-timeout", "5s",
+         "--always-reconnect", "-k", "5s", "--dns-timeout", "15s",
          "-d", "1.1.1.1", "-d", "1.0.0.1",
          "-b", "127.0.0.1", "-p", String(socksPort)]
     }
