@@ -77,9 +77,15 @@ public final class LocalProxy: @unchecked Sendable {
         // Connections already spliced keep the upstream they were dialled with;
         // only new ones follow the change, which is what a user changing a
         // setting expects anyway.
-        if listener != nil, case .listening = state {
-            onState(state)
-            return
+        // A listener still binding counts too: the WARP switch calls this again
+        // from WARP's first state change, before the first bind reports ready,
+        // and cancelling it there rebound into its own cancel (log 2026-09-15).
+        if listener != nil {
+            switch state {
+            case .listening: onState(state); return
+            case .stopped: return            // still binding
+            case .failed: break              // rebind below
+            }
         }
         stop()
         do {

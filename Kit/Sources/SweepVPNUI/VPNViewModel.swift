@@ -283,18 +283,17 @@ public final class VPNViewModel: ObservableObject {
             proxyState = .stopped
             return
         }
-        guard let listener = LocalProxy(port: options.localProxyPort,
-                                        upstream: currentUpstream()) else {
-            proxyState = .failed("Port \(options.localProxyPort) is not usable.")
-            return
-        }
-        proxy = listener
-        listener.start(upstream: currentUpstream()) { [weak self] st in
-            Task { @MainActor in
-                self?.proxyState = st
-                self?.applySystemProxyWhenReady()
+        // Reuse the running proxy: a second LocalProxy on the same port could
+        // never bind while the first still held it ("Address already in use").
+        if proxy == nil {
+            guard let listener = LocalProxy(port: options.localProxyPort,
+                                            upstream: currentUpstream()) else {
+                proxyState = .failed("Port \(options.localProxyPort) is not usable.")
+                return
             }
+            proxy = listener
         }
+        syncProxyUpstream()
     }
 
     /// What the proxy is actually pointed at, for the line under the toggle.
@@ -339,7 +338,12 @@ public final class VPNViewModel: ObservableObject {
     private func syncProxyUpstream() {
         guard options.localProxyEnabled, let proxy else { return }
         proxy.start(upstream: currentUpstream()) { [weak self] st in
-            Task { @MainActor in self?.proxyState = st }
+            // Same handler as the first start: this one replaces it, and
+            // dropping applySystemProxyWhenReady left the system proxy unarmed.
+            Task { @MainActor in
+                self?.proxyState = st
+                self?.applySystemProxyWhenReady()
+            }
         }
     }
     #endif
