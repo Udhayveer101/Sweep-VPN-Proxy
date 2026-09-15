@@ -9,6 +9,11 @@ set -euo pipefail
 
 APP="${1:?usage: bundle-tor.sh <App.app> [identity]}"
 IDENTITY="${2:--}"
+# Notarization needs a secure timestamp on every binary; local builds skip the
+# network round trip. The release workflow sets SIGN_TIMESTAMP=--timestamp.
+TS="${SIGN_TIMESTAMP:---timestamp=none}"
+# Apple's timestamp service intermittently answers "not available"; retry.
+sign() { for i in 1 2 3 4 5; do codesign "$@" && return 0; sleep $((i * 3)); done; return 1; }
 SRC="$(command -v tor || echo /opt/homebrew/bin/tor)"
 DEST="$APP/Contents/Resources/tor"
 
@@ -63,7 +68,7 @@ for T in obfs4proxy snowflake-client meek-client; do
   if [ -x "$SRC_T" ]; then
     cp -f "$SRC_T" "$DEST/$T"
     chmod u+w "$DEST/$T"
-    codesign --force --timestamp=none --options runtime --sign "$IDENTITY" "$DEST/$T"
+    sign --force "$TS" --options runtime --sign "$IDENTITY" "$DEST/$T"
   else
     echo "warning: $T not found; that transport is unavailable (brew install $T)" >&2
   fi
@@ -72,9 +77,9 @@ done
 # Sign inside-out: dylibs first, then the executable that loads them.
 for F in "$DEST"/*.dylib; do
   [ -e "$F" ] || continue
-  codesign --force --timestamp=none --sign "$IDENTITY" "$F"
+  sign --force "$TS" --sign "$IDENTITY" "$F"
 done
-codesign --force --timestamp=none --options runtime --sign "$IDENTITY" "$DEST/tor"
+sign --force "$TS" --options runtime --sign "$IDENTITY" "$DEST/tor"
 
 # usque (WARP over MASQUE) is a static Go binary built from source:
 #   git clone https://github.com/Diniboy1123/usque && CGO_ENABLED=0 go build
@@ -84,7 +89,7 @@ if [ -x "$USQUE" ]; then
   mkdir -p "$APP/Contents/Resources/warp"
   cp -f "$USQUE" "$APP/Contents/Resources/warp/usque"
   chmod u+w "$APP/Contents/Resources/warp/usque"
-  codesign --force --timestamp=none --options runtime --sign "$IDENTITY" \
+  sign --force "$TS" --options runtime --sign "$IDENTITY" \
     "$APP/Contents/Resources/warp/usque"
 else
   echo "warning: usque not found at $USQUE; WARP mode is unavailable" >&2
@@ -95,7 +100,7 @@ fi
 # resource is missing or invalid" and the OS refuses to launch it. Entitlements
 # are preserved from the existing signature — re-signing without them would
 # strip the NetworkExtension capability and put us back at "permission denied".
-codesign --force --sign "$IDENTITY" \
+sign --force "$TS" --sign "$IDENTITY" \
   --preserve-metadata=entitlements,requirements,flags,runtime "$APP"
 codesign --verify --deep --strict "$APP" || {
   echo "re-signing failed; the app will not launch" >&2

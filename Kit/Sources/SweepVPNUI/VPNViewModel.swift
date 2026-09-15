@@ -168,6 +168,10 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
+    /// The Developer ID release ships without the VPN extensions (SweepProxyOnly
+    /// in Info.plist), so its screens offer the proxy instead of Connect.
+    public let proxyOnly = Bundle.main.object(forInfoDictionaryKey: "SweepProxyOnly") as? String == "YES"
+
     @Published public private(set) var systemProxyEnabled = false
     @Published public private(set) var systemProxyError: String?
     /// Set while WARP is still starting and the whole Mac is meant to follow it.

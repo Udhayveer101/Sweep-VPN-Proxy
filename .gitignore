@@ -19,3 +19,5 @@ DataPlane/sweepovpn/build-mac/
 # Wrangler caches the Cloudflare account id and the account holder's email.
 Tools/**/.wrangler/
 /tmp/tunnel_token
+build/
+build-release.log

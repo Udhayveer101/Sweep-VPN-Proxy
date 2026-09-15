@@ -15,12 +15,16 @@ public struct HomeView: View {
             VStack(spacing: 20) {
                 header
                 Spacer(minLength: 0)
-                statusPanel
-                serverPill
-                Spacer(minLength: 0)
-                if let note = model.protocolSwitchNote { protocolSwitchRow(note) }
-                if let error = model.lastError { errorRow(error) }
-                primaryButton
+                #if os(macOS)
+                if model.proxyOnly {
+                    ProxyHomePanel(model: model)
+                    Spacer(minLength: 0)
+                } else {
+                    vpnBody
+                }
+                #else
+                vpnBody
+                #endif
             }
             .padding(24)
         }
@@ -34,6 +38,15 @@ public struct HomeView: View {
             case .connectionLog: ConnectionLogView(model: model)
             }
         }
+    }
+
+    @ViewBuilder private var vpnBody: some View {
+        statusPanel
+        serverPill
+        Spacer(minLength: 0)
+        if let note = model.protocolSwitchNote { protocolSwitchRow(note) }
+        if let error = model.lastError { errorRow(error) }
+        primaryButton
     }
 
     /// The gear lives in the layout, not in `.toolbar`: a toolbar item is
@@ -183,6 +196,57 @@ public struct HomeView: View {
         .disabled(model.isBusy && model.presentation.primaryAction != .cancel)
     }
 }
+
+#if os(macOS)
+/// Home screen of the proxy-only release: WARP state and the one switch that
+/// matters, instead of a Connect button whose extension this build lacks.
+struct ProxyHomePanel: View {
+    @ObservedObject var model: VPNViewModel
+
+    private var headline: String {
+        if !model.warpRegistered { return "WARP is not set up" }
+        if model.systemProxyEnabled { return "This Mac is using WARP" }
+        if model.options.warpEnabled { return model.warpState == .running ? "WARP is ready" : "Starting WARP…" }
+        return "Proxy is off"
+    }
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: model.systemProxyEnabled ? "lock.shield.fill" : "shield")
+                .font(.system(size: 44, weight: .medium))
+                .foregroundStyle(model.systemProxyEnabled ? .green : .secondary)
+            Text(headline).font(.title2.weight(.semibold))
+            if let status = model.warpStatusText {
+                Text(status).font(.caption)
+                    .foregroundStyle(model.warpState.isFailed ? .red : .secondary)
+                    .multilineTextAlignment(.center).textSelection(.enabled)
+            }
+            if let why = model.systemProxyError {
+                Text(why).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center)
+            }
+            if model.warpRegistered {
+                Button {
+                    model.setEverythingThroughWarp(!model.systemProxyEnabled)
+                } label: {
+                    Text(model.systemProxyEnabled ? "Stop routing this Mac through WARP"
+                                                  : "Route this Mac through WARP")
+                        .font(.headline).frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(model.systemProxyEnabled ? .red : .accentColor)
+                Text("macOS asks for your password each way. For a single app, use Settings ▸ Tor and proxy.")
+                    .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            } else {
+                Button("Set up WARP") { model.activeSheet = .onboarding }
+                    .buttonStyle(.borderedProminent).controlSize(.large)
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: 420)
+        .background(.ultraThinMaterial, in: .rect(cornerRadius: 24, style: .continuous))
+    }
+}
+#endif
 
 /// One slow gradient keyed to state. Motion is gated by Reduce Motion and by
 /// power state — an always-animating blurred backdrop is a real battery cost.

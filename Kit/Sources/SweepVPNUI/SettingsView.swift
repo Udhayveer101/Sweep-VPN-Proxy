@@ -9,6 +9,15 @@ public struct SettingsView: View {
 
     public init(model: VPNViewModel) { self.model = model }
 
+    /// The proxy-only release has no tunnel or filter, so their switches would do nothing.
+    private var showsVPNSettings: Bool {
+        #if os(macOS)
+        return !model.proxyOnly
+        #else
+        return true
+        #endif
+    }
+
     public var body: some View {
         NavigationStack {
             Form {
@@ -22,6 +31,7 @@ public struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 #endif
+                if showsVPNSettings {
                 Section("Protection") {
                     Toggle("Kill switch", isOn: Binding(
                         get: { model.options.killSwitchEnabled },
@@ -58,7 +68,9 @@ public struct SettingsView: View {
                     Text("Forcing a route disables racing and automatic fallback. Leave it off unless you are debugging a specific network.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
+                }
                 #if os(macOS)
+                if showsVPNSettings {
                 Section("Blocked sites") {
                     TextField("One domain per line", text: Binding(
                         get: { model.options.blockedDomains.joined(separator: "\n") },
@@ -73,6 +85,7 @@ public struct SettingsView: View {
                         .font(.system(.footnote, design: .monospaced))
                     Text("Blocked at the connection, not just in DNS, so it holds even when the VPN is off. Subdomains are included. Needs the second kill-switch layer below to be on.")
                         .font(.footnote).foregroundStyle(.secondary)
+                }
                 }
                 #endif
                 #if os(macOS)
@@ -155,15 +168,19 @@ public struct SettingsView: View {
                     Text("Only needed if Tor is blocked and the VPN is not carrying it. Get bridges from bridges.torproject.org — the bridges shipped with Tor Browser are public and widely blocked.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
+                if showsVPNSettings {
                 MacSettingsSection(model: model,
                                    tunnelExtensionID: model.tunnelExtensionID,
                                    filterExtensionID: model.filterExtensionID)
+                }
                 #endif
+                if showsVPNSettings {
                 SecurityPanel(model: model, signingKeyFingerprint: model.signingKeyFingerprint)
                 Section("Configuration") {
                     Text(model.configStatus ?? "No configuration loaded yet.")
                         .font(.footnote).foregroundStyle(.secondary)
                         .textSelection(.enabled)
+                }
                 }
                 Section("Diagnostics") {
                     Button("Export diagnostics") {

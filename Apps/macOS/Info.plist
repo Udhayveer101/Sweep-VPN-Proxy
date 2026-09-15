@@ -34,6 +34,8 @@
 	<string>$(SWEEP_RELAY_MIRROR_URL)</string>
 	<key>SweepTunnelToken</key>
 	<string>$(SWEEP_TUNNEL_TOKEN)</string>
+	<key>SweepProxyOnly</key>
+	<string>$(SWEEP_PROXY_ONLY)</string>
 	<key>SweepAppGroup</key>
 	<string>$(DEVELOPMENT_TEAM).group.com.sweep.vpn</string>
 </dict>

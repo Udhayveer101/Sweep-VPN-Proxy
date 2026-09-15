@@ -116,6 +116,36 @@ targets:
         product: SweepVPNKit
       - package: SweepVPNKit
         product: SweepVPNUI
+  # Developer ID release. Apple only accepts NetworkExtension providers under
+  # Developer ID as system extensions, which this project does not build yet,
+  # so the release leaves both extensions out: the WARP/Tor/local proxy works,
+  # the Connect (VPN) button is replaced by a pointer to the proxy. No
+  # restricted entitlements means no provisioning profile is needed.
+  SweepVPN-macOS-Direct:
+    type: application
+    platform: macOS
+    sources:
+      - Apps/macOS
+      - Apps/Shared
+    settings:
+      base:
+        PRODUCT_NAME: Sweep VPN
+        PRODUCT_BUNDLE_IDENTIFIER: com.sweep.vpn.mac
+        CODE_SIGN_ENTITLEMENTS: Apps/macOS/Direct.entitlements
+        INFOPLIST_FILE: Apps/macOS/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_HARDENED_RUNTIME: YES
+        SWEEP_PROXY_ONLY: YES
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+    dependencies:
+      - package: SweepVPNCore
+        product: SweepVPNCore
+      - package: SweepVPNKit
+        product: SweepVPNKit
+      - package: SweepVPNKit
+        product: SweepVPNUI
+
   SweepVPN-macOS-Filter:
     type: app-extension
     platform: macOS
@@ -156,3 +186,5 @@ schemes:
     build: { targets: { SweepVPN-iOS: all } }
   SweepVPN-macOS:
     build: { targets: { SweepVPN-macOS: all } }
+  SweepVPN-macOS-Direct:
+    build: { targets: { SweepVPN-macOS-Direct: all } }

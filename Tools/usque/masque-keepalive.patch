@@ -1,0 +1,188 @@
+From 5148471910dd17c164e9f5a75851cd204a9bccca Mon Sep 17 00:00:00 2001
+From: Udhayveer Singh <udhayveersingh@Udhayveer.local>
+Date: Mon, 14 Sep 2026 23:35:57 +0530
+Subject: [PATCH] Detect dead HTTP/2 MASQUE flows with PINGs and retry dropped
+ in-tunnel DNS
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ api/masque.go              | 16 +++++++++--
+ internal/dns.go            | 27 +++++++++++++++++-
+ internal/dns_retry_test.go | 56 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 96 insertions(+), 3 deletions(-)
+ create mode 100644 internal/dns_retry_test.go
+
+diff --git a/api/masque.go b/api/masque.go
+index 6b2c5d9..f7e4fe9 100644
+--- a/api/masque.go
++++ b/api/masque.go
+@@ -11,6 +11,7 @@ import (
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
++	"time"
+ 
+ 	connectip "github.com/Diniboy1123/connect-ip-go"
+ 	"github.com/quic-go/quic-go"
+@@ -123,7 +124,7 @@ func ConnectTunnel(ctx context.Context, tlsConfig *tls.Config, quicConfig *quic.
+ 		// TODO: support PQC
+ 		h2Headers.Set("pq-enabled", "false")
+ 
+-		h2Client, err := newHTTP2Client(tlsConfig, h2Endpoint, connectUri)
++		h2Client, err := newHTTP2Client(tlsConfig, h2Endpoint, connectUri, quicConfig.KeepAlivePeriod)
+ 		if err != nil {
+ 			return nil, nil, nil, nil, fmt.Errorf("failed to create HTTP/2 client: %w", err)
+ 		}
+@@ -220,9 +221,17 @@ func isRetryableHTTP3ConnectFailure(err error) bool {
+ 		strings.Contains(msg, "PROTOCOL_VIOLATION")
+ }
+ 
++const h2PingTimeout = 3 * time.Second
++
+ // newHTTP2Client builds an HTTP client for CONNECT-IP over HTTP/2.
+ // It honors proxy environment variables and pins dialing to the selected endpoint.
+-func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI string) (*http.Client, error) {
++//
++// keepalive drives HTTP/2 PINGs: after that much silence a PING goes out, and
++// a PING unanswered for h2PingTimeout closes the connection so the tunnel loop
++// reconnects. Without it a black-holed TCP flow is only noticed when a write
++// hits the kernel retransmit timeout (~20-25s), and every DNS lookup in that
++// window times out. The --keepalive-period flag previously reached QUIC only.
++func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI string, keepalive time.Duration) (*http.Client, error) {
+ 	if endpoint == nil {
+ 		return nil, errors.New("missing HTTP/2 endpoint")
+ 	}
+@@ -239,6 +248,8 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
+ 
+ 	if proxyURL == nil {
+ 		transport := &http2.Transport{
++			ReadIdleTimeout: keepalive,
++			PingTimeout:     h2PingTimeout,
+ 			DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
+ 				dialer := &net.Dialer{}
+ 				conn, err := dialer.DialContext(ctx, network, endpoint.String())
+@@ -265,6 +276,7 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
+ 		Proxy:              http.ProxyFromEnvironment,
+ 		ForceAttemptHTTP2:  true,
+ 		DisableCompression: true,
++		HTTP2:              &http.HTTP2Config{SendPingTimeout: keepalive, PingTimeout: h2PingTimeout},
+ 		TLSClientConfig:    tlsConfig,
+ 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+ 			if addr == originAuthority {
+diff --git a/internal/dns.go b/internal/dns.go
+index 252b357..1fc0000 100644
+--- a/internal/dns.go
++++ b/internal/dns.go
+@@ -2,6 +2,7 @@ package internal
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/netip"
+@@ -85,7 +86,7 @@ func (r TunnelDNSResolver) Resolve(ctx context.Context, name string) (net.IP, er
+ 				PreferGo: true,
+ 				Dial:     dialFunc,
+ 			}
+-			ips, err := resolver.LookupIP(queryCtx, "ip", name)
++			ips, err := lookupWithRetry(queryCtx, resolver, name, r.TunNet != nil)
+ 			if err == nil && len(ips) > 0 {
+ 				results <- result{ip: ips[0], err: nil}
+ 			} else {
+@@ -109,6 +110,30 @@ func (r TunnelDNSResolver) Resolve(ctx context.Context, name string) (net.IP, er
+ 	return nil, fmt.Errorf("all DNS servers failed: %v", lastErr)
+ }
+ 
++// dnsAttempt bounds one in-tunnel query. The MASQUE session is torn down and
++// redialled whenever the path kills its TCP flow (seen every 54-90s), and a
++// query sent in that gap is dropped with no retransmit; Go's resolver would
++// then sit out the whole budget on a datagram that is gone. Re-asking every
++// attempt window lets the lookup land as soon as the session is back.
++const dnsAttempt = 1500 * time.Millisecond
++
++func lookupWithRetry(ctx context.Context, resolver *net.Resolver, name string, inTunnel bool) ([]net.IP, error) {
++	if !inTunnel {
++		return resolver.LookupIP(ctx, "ip", name)
++	}
++	for {
++		attemptCtx, cancel := context.WithTimeout(ctx, dnsAttempt)
++		ips, err := resolver.LookupIP(attemptCtx, "ip", name)
++		cancel()
++		var dnsErr *net.DNSError
++		retryable := err != nil && ctx.Err() == nil &&
++			(!errors.As(err, &dnsErr) || dnsErr.IsTimeout || dnsErr.IsTemporary)
++		if !retryable {
++			return ips, err
++		}
++	}
++}
++
+ // NewNetstackResolver returns a *net.Resolver that uses the tunnel network stack
+ // and provided DNS servers for DNS queries.
+ //
+diff --git a/internal/dns_retry_test.go b/internal/dns_retry_test.go
+new file mode 100644
+index 0000000..d3646d5
+--- /dev/null
++++ b/internal/dns_retry_test.go
+@@ -0,0 +1,56 @@
++package internal
++
++import (
++	"context"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// A query sent while the MASQUE session is being redialled is dropped. The
++// lookup must re-ask and succeed once the path is back, inside its budget.
++func TestLookupRetriesDroppedQueries(t *testing.T) {
++	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer pc.Close()
++	var seen atomic.Int32
++	go func() {
++		buf := make([]byte, 512)
++		for {
++			_, from, err := pc.ReadFrom(buf)
++			if err != nil {
++				return
++			}
++			if seen.Add(1) <= 4 { // first A+AAAA pair twice: tunnel down
++				continue
++			}
++			// Reply with header + question only (drop Go's EDNS record), one A answer.
++			end := 12
++			for buf[end] != 0 {
++				end += int(buf[end]) + 1
++			}
++			qtype := buf[end+2]
++			resp := append([]byte{}, buf[:end+5]...)
++			resp[2], resp[3] = 0x81, 0x80
++			resp[6], resp[7], resp[8], resp[9], resp[10], resp[11] = 0, 0, 0, 0, 0, 0
++			if qtype == 1 {
++				resp[7] = 1
++				resp = append(resp, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 0, 0, 1)
++			}
++			pc.WriteTo(resp, from)
++		}
++	}()
++
++	resolver := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
++		return (&net.Dialer{}).DialContext(ctx, "udp", pc.LocalAddr().String())
++	}}
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	ips, err := lookupWithRetry(ctx, resolver, "example.com", true)
++	if err != nil || len(ips) == 0 || !ips[0].Equal(net.IPv4(10, 0, 0, 1)) {
++		t.Fatalf("got %v, %v after %d queries", ips, err, seen.Load())
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,106 @@
+name: macOS release
+
+# Push a tag like v1.2.0 to publish a GitHub Release, or run it by hand to get
+# the DMG as a workflow artifact only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Marketing version (e.g. 1.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      TEAM_ID: P66SB4MX92
+      # Public half of the config-signing key; safe to ship, pinned in the app.
+      SWEEP_CONFIG_SIGNING_KEY: wVOJIuoa32ZZ5lSd8RmCaUOEFQIUYmidxFcK8bhYNYA=
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then V="${GITHUB_REF_NAME#v}"; else V="${{ inputs.version }}"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=${{ github.run_number }}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+
+      - name: Tools
+        run: |
+          brew install xcodegen tor
+          # Tor's pluggable transports are optional; the bundler warns if absent.
+          brew install obfs4proxy snowflake || true
+
+      - name: Import Developer ID certificate
+        env:
+          P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          test -n "$P12_BASE64" || { echo "::error::DEVELOPER_ID_P12_BASE64 secret is missing"; exit 1; }
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          KC_PASS="$(uuidgen)"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$KC"
+
+      - name: Notarization key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          test -n "$ASC_KEY_P8" || { echo "::error::ASC_KEY_P8 secret is missing"; exit 1; }
+          printf '%s' "$ASC_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+          echo "ASC_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: cd Kit && swift test
+
+      - name: Build, sign, notarize
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: Tools/release-macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SweepVPN-${{ env.VERSION }}
+          path: |
+            build/release/SweepVPN-*.dmg
+            build/release/SweepVPN-*.dmg.sha256
+
+      - name: GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" build/release/SweepVPN-*.dmg build/release/SweepVPN-*.dmg.sha256 \
+            --title "Sweep VPN $VERSION" --notes "Signed with Developer ID and notarized by Apple. Apple Silicon Macs, macOS 14 or later.
+
+          This release is the proxy build: Cloudflare WARP (whole-Mac or per-app), Tor and the local proxy. The VPN Connect button is not included yet.
+
+          Install: open the DMG, drag Sweep VPN to Applications, open it and follow the setup guide."
+
+      - name: Clean up
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/AuthKey.p8"
