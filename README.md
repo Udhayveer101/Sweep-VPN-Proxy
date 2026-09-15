@@ -13,8 +13,14 @@ belonging to whoever published it.
 
 ## Getting it
 
-**Download a build** — see [Releases](../../releases). macOS 14+, Apple silicon
-and Intel. Signed and notarized, so it opens normally.
+**Download a build** — see [Releases](../../releases). Open the DMG, drag
+Sweep VPN to Applications, open it and follow the setup guide. Apple silicon,
+macOS 14+. Signed with Developer ID and notarized, so it opens normally. The
+download is the proxy build (Cloudflare WARP for the whole Mac or one app, Tor,
+local proxy); the VPN Connect button needs a source build for now.
+
+Maintainers publish with `make release VERSION=x.y.z` (uses the `sweep-notary`
+notarytool profile), then `gh release create vx.y.z build/release/SweepVPN-x.y.z.dmg*`.
 
 **Or build it** — `make config`, fill in `Config/Local.xcconfig`, then
 `make install-macos`. Details under [Setup](#setup).

@@ -7,7 +7,7 @@ TEAM   ?= $(shell sed -n 's/^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=[[:space:]
 CRATE  := DataPlane/sweepwg
 TARGETS := aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
 
-.PHONY: config dataplane test project ios macos install-macos bundle-tor
+.PHONY: config dataplane test project ios macos install-macos bundle-tor release
 
 # First thing to run after cloning. Creates the gitignored file that holds your
 # team, your pinned key and your own Worker.
@@ -73,3 +73,11 @@ install-macos: macos bundle-tor
 	  rm -rf "/Applications/$$(basename $$APP)"; \
 	  cp -R "$$APP" /Applications/; \
 	  codesign -dv "/Applications/$$(basename $$APP)" 2>&1 | head -3
+
+# Signed + notarized DMG, built on this Mac like Sweep's releases. Uses the
+# Developer ID identity in the login keychain and the `sweep-notary` notarytool
+# profile; publish with `gh release create vX build/release/SweepVPN-X.dmg*`.
+release:
+	VERSION=$(VERSION) TEAM_ID=$(TEAM) NOTARY_PROFILE=$${NOTARY_PROFILE:-sweep-notary} \
+	  SWEEP_CONFIG_SIGNING_KEY=$$(sed -n 's/^[[:space:]]*SWEEP_CONFIG_SIGNING_KEY[[:space:]]*=[[:space:]]*//p' $(LOCAL)) \
+	  Tools/release-macos.sh

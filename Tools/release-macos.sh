@@ -8,7 +8,8 @@
 #   BUILD_NUMBER       CFBundleVersion                           (default 1)
 #   TEAM_ID            Apple team id                             (required)
 #   SWEEP_CONFIG_SIGNING_KEY  pinned public key                  (optional)
-#   ASC_KEY_PATH ASC_KEY_ID ASC_ISSUER_ID  notarytool API key    (optional; skip = unsigned-by-Apple DMG)
+#   NOTARY_PROFILE     notarytool keychain profile, e.g. sweep-notary (local releases)
+#   ASC_KEY_PATH ASC_KEY_ID ASC_ISSUER_ID  notarytool API key    (CI; neither set = not notarized)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -53,23 +54,43 @@ if codesign -d --entitlements - "$APP" 2>/dev/null | grep -q get-task-allow; the
   echo "release carries get-task-allow; notarization would reject it" >&2; exit 1
 fi
 
+if [ -n "${NOTARY_PROFILE:-}" ]; then
+  AUTH=(--keychain-profile "$NOTARY_PROFILE")
+else
+  AUTH=(--key "${ASC_KEY_PATH:-}" --key-id "${ASC_KEY_ID:-}" --issuer "${ASC_ISSUER_ID:-}")
+fi
 notarize() {
-  xcrun notarytool submit "$1" --key "$ASC_KEY_PATH" --key-id "$ASC_KEY_ID" \
-    --issuer "$ASC_ISSUER_ID" --wait --timeout 30m --output-format json > "$OUT/notary.json" || true
-  cat "$OUT/notary.json"
-  grep -q '"status" *: *"Accepted"' "$OUT/notary.json" || {
-    ID=$(sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' "$OUT/notary.json" | head -1)
-    [ -n "$ID" ] && xcrun notarytool log "$ID" --key "$ASC_KEY_PATH" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID"
-    echo "notarization failed" >&2; exit 1; }
+  # Submit, then poll by id ourselves: `--wait` aborts on a single network
+  # timeout while Apple is still processing (seen on the first 1.0.0 run).
+  local sid="" status=""
+  for i in 1 2 3; do
+    sid=$(xcrun notarytool submit "$1" "${AUTH[@]}" --output-format json 2>/dev/null \
+      | sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$sid" ] && break; sleep 15
+  done
+  [ -n "$sid" ] || { echo "notarization upload failed" >&2; exit 1; }
+  echo "notary submission $sid"
+  for _ in $(seq 1 60); do
+    status=$(xcrun notarytool info "$sid" "${AUTH[@]}" --output-format json 2>/dev/null \
+      | sed -n 's/.*"status" *: *"\([^"]*\)".*/\1/p' | head -1)
+    case "$status" in Accepted|Invalid|Rejected) break;; esac
+    sleep 30
+  done
+  echo "notary status: ${status:-unknown}"
+  if [ "$status" != Accepted ]; then
+    xcrun notarytool log "$sid" "${AUTH[@]}" || true
+    echo "notarization failed" >&2; exit 1
+  fi
 }
 
 NOTARIZE=0
+[ -n "${NOTARY_PROFILE:-}" ] && NOTARIZE=1
 [ -n "${ASC_KEY_PATH:-}" ] && [ -n "${ASC_KEY_ID:-}" ] && [ -n "${ASC_ISSUER_ID:-}" ] && NOTARIZE=1
 
 if [ $NOTARIZE = 1 ]; then
   ditto -c -k --keepParent "$APP" "$OUT/app.zip"
   notarize "$OUT/app.zip"
-  xcrun stapler staple "$APP"
+  for i in 1 2 3; do xcrun stapler staple "$APP" && break; sleep 10; done
 fi
 
 DMG="$OUT/SweepVPN-$VERSION.dmg"
@@ -82,11 +103,11 @@ codesign --verify --strict "$DMG"
 
 if [ $NOTARIZE = 1 ]; then
   notarize "$DMG"
-  xcrun stapler staple "$DMG"
+  for i in 1 2 3; do xcrun stapler staple "$DMG" && break; sleep 10; done
   spctl --assess --type open --context context:primary-signature -v "$DMG"
   spctl --assess --type execute -v "$APP"
 else
-  echo "warning: ASC key not set; DMG is signed but NOT notarized" >&2
+  echo "warning: no notary credentials; DMG is signed but NOT notarized" >&2
 fi
 shasum -a 256 "$DMG" | tee "$DMG.sha256"
 echo "release: $DMG"

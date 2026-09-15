@@ -1,10 +1,9 @@
 name: macOS release
 
-# Push a tag like v1.2.0 to publish a GitHub Release, or run it by hand to get
-# the DMG as a workflow artifact only.
+# Releases are normally built on the maintainer's Mac (see docs: `make release`),
+# like Sweep. This manual workflow is the CI alternative; it needs the
+# DEVELOPER_ID_P12_BASE64 / DEVELOPER_ID_P12_PASSWORD / ASC_* secrets.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
