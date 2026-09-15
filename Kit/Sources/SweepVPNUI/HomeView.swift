@@ -1,4 +1,7 @@
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
 import SweepVPNCore
 
 /// The five-fact home screen: protected state, server, quality, security glyph,
@@ -15,16 +18,12 @@ public struct HomeView: View {
             VStack(spacing: 20) {
                 header
                 Spacer(minLength: 0)
-                #if os(macOS)
                 if model.proxyOnly {
                     ProxyHomePanel(model: model)
                     Spacer(minLength: 0)
                 } else {
                     vpnBody
                 }
-                #else
-                vpnBody
-                #endif
             }
             .padding(24)
         }
@@ -92,7 +91,11 @@ public struct HomeView: View {
                     // connect it happened. One line of summary is not enough to
                     // tell a dead relay from an unreachable Worker.
                     Button("See connection log") { model.activeSheet = .connectionLog }
+                        #if os(macOS)
                         .buttonStyle(.link).font(.caption2)
+                        #else
+                        .buttonStyle(.borderless).font(.caption2)
+                        #endif
                 }
             }
             Spacer(minLength: 0)
@@ -197,7 +200,6 @@ public struct HomeView: View {
     }
 }
 
-#if os(macOS)
 /// Home screen of the proxy-only release: WARP state and the one switch that
 /// matters, instead of a Connect button whose extension this build lacks.
 struct ProxyHomePanel: View {
@@ -205,7 +207,12 @@ struct ProxyHomePanel: View {
 
     private var headline: String {
         if !model.warpRegistered { return "WARP is not set up" }
+        #if os(macOS)
         if model.systemProxyEnabled { return "This Mac is using WARP" }
+        #else
+        if model.warpState == .running { return "This \(DeviceNoun.current) is using WARP" }
+        if model.warpState == .starting { return "Connecting to WARP…" }
+        #endif
         if model.options.warpEnabled { return model.warpState == .running ? "WARP is ready" : "Starting WARP…" }
         return "Proxy is off"
     }
@@ -228,14 +235,19 @@ struct ProxyHomePanel: View {
                 Button {
                     model.setEverythingThroughWarp(!model.systemProxyEnabled)
                 } label: {
-                    Text(model.systemProxyEnabled ? "Stop routing this Mac through WARP"
-                                                  : "Route this Mac through WARP")
+                    Text(model.systemProxyEnabled ? "Stop routing this \(DeviceNoun.current) through WARP"
+                                                  : "Route this \(DeviceNoun.current) through WARP")
                         .font(.headline).frame(maxWidth: .infinity, minHeight: 44)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(model.systemProxyEnabled ? .red : .accentColor)
+                #if os(macOS)
                 Text("macOS asks for your password each way. For a single app, use Settings ▸ Tor and proxy.")
                     .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                #else
+                Text("iOS asks once to add a VPN configuration. It stays on after you close Sweep; turn it off here or in Settings ▸ VPN.")
+                    .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                #endif
             } else {
                 Button("Set up WARP") { model.activeSheet = .onboarding }
                     .buttonStyle(.borderedProminent).controlSize(.large)
@@ -246,7 +258,17 @@ struct ProxyHomePanel: View {
         .background(.ultraThinMaterial, in: .rect(cornerRadius: 24, style: .continuous))
     }
 }
-#endif
+
+/// "Mac", "iPhone" or "iPad", for copy that names the device being routed.
+enum DeviceNoun {
+    @MainActor static var current: String {
+        #if os(macOS)
+        return "Mac"
+        #else
+        return UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
+        #endif
+    }
+}
 
 /// One slow gradient keyed to state. Motion is gated by Reduce Motion and by
 /// power state — an always-animating blurred backdrop is a real battery cost.

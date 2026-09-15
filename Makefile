@@ -7,7 +7,7 @@ TEAM   ?= $(shell sed -n 's/^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=[[:space:]
 CRATE  := DataPlane/sweepwg
 TARGETS := aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
 
-.PHONY: config dataplane test project ios macos install-macos bundle-tor release
+.PHONY: config dataplane warp-ios test project ios ios-ipa macos install-macos bundle-tor release
 
 # First thing to run after cloning. Creates the gitignored file that holds your
 # team, your pinned key and your own Worker.
@@ -38,8 +38,14 @@ project: $(LOCAL)
 $(LOCAL):
 	@$(MAKE) config
 
+warp-ios:
+	DataPlane/warpmobile/build.sh
+
+ios-ipa:
+	Tools/release-ios.sh
+
 ios: project
-	xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-iOS -sdk iphonesimulator \
+	xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-iOS -sdk iphonesimulator ARCHS=arm64 \
 	  -destination 'generic/platform=iOS Simulator' CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO build
 
 # NetworkExtension entitlements cannot be ad-hoc signed: xcodebuild rejects the

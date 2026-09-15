@@ -10,24 +10,42 @@ public struct SettingsView: View {
     public init(model: VPNViewModel) { self.model = model }
 
     /// The proxy-only release has no tunnel or filter, so their switches would do nothing.
-    private var showsVPNSettings: Bool {
-        #if os(macOS)
-        return !model.proxyOnly
-        #else
-        return true
-        #endif
-    }
+    private var showsVPNSettings: Bool { !model.proxyOnly }
 
     public var body: some View {
         NavigationStack {
             Form {
-                #if os(macOS)
                 Section("WARP setup") {
-                    LabeledContent("Status", value: model.warpRegistered ? "Registered on this Mac" : "Not set up")
+                    LabeledContent("Status", value: model.warpRegistered ? "Registered on this \(DeviceNoun.current)" : "Not set up")
                     Button(model.warpRegistered ? "Open setup guide" : "Set up WARP") {
                         model.activeSheet = .onboarding
                     }
                     Text("The proxy needs a free WARP registration. The guide walks through it and takes any optional keys.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                #if os(iOS)
+                Section("WARP") {
+                    Toggle("Route this \(DeviceNoun.current) through WARP", isOn: Binding(
+                        get: { model.systemProxyEnabled },
+                        set: { model.setEverythingThroughWarp($0) }))
+                        .disabled(!model.warpRegistered)
+                    if let status = model.warpStatusText {
+                        Text(status).font(.footnote)
+                            .foregroundStyle(model.warpState.isFailed ? .red : .secondary)
+                            .textSelection(.enabled)
+                    }
+                    TextField("WARP SNI", text: Binding(
+                        get: { model.options.warpSNI },
+                        set: {
+                            var o = model.options
+                            o.warpSNI = $0.trimmingCharacters(in: .whitespaces)
+                            model.options = o
+                        }))
+                        .font(.system(.footnote, design: .monospaced))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .disabled(model.systemProxyEnabled)
+                    Text("Sends every app's traffic to Cloudflare WARP inside HTTPS that names an ordinary site, which the network filter lets through. Change the SNI with WARP off.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 #endif

@@ -13,12 +13,12 @@ struct SweepVPNApp: App {
     var body: some Scene {
         WindowGroup {
             NavigationStack {
+                // HomeView draws its own header; a navigation title repeated it.
                 HomeView(model: model)
-                    .navigationTitle("Sweep VPN")
-                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar(.hidden, for: .navigationBar)
             }
             .task { await refreshConfiguration() }
-            .onAppear { model.onAppear() }
+            .onAppear { model.onAppear(); model.attachWarp() }
             .onDisappear { model.onDisappear() }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active { Task { await refreshConfiguration() } }

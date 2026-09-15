@@ -100,8 +100,12 @@ open class SweepPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendabl
         // 1. Fail closed first, always.
         // The Worker has to stay reachable through the blackhole, or the tunnel
         // blocks the very connection it needs to come up.
+        #if os(macOS)
         let relayTunnel = RelayTunnelSettings.load(appGroup: appGroup)
         let reachable = relayTunnel.enabled ? relayTunnel.workerAddresses(appGroup: appGroup) : []
+        #else
+        let reachable: Set<String> = []   // the Worker leg is macOS-only
+        #endif
         diagnostics.record("blackhole", "excluding \(reachable.count) worker address(es)")
         applyPlan(policy.blackholePlan(reachableHosts: reachable)) { [weak self] error in
             queue.async {

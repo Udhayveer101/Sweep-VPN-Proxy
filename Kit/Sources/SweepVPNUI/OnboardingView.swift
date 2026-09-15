@@ -15,7 +15,11 @@ public struct OnboardingView: View {
         #if os(macOS)
         WarpSetupGuide(model: model, close: { dismiss() })
         #else
-        primer
+        if model.proxyOnly {
+            WarpSetupGuide(model: model, close: { dismiss() })
+        } else {
+            primer
+        }
         #endif
     }
 
@@ -72,7 +76,6 @@ public struct OnboardingView: View {
     #endif
 }
 
-#if os(macOS)
 /// Step-by-step WARP setup for someone who has never opened a terminal. Every
 /// value the proxy needs is entered here; nothing has to be edited in code.
 struct WarpSetupGuide: View {
@@ -93,9 +96,18 @@ struct WarpSetupGuide: View {
                     step(1, "What you need", done: true) {
                         Text("Nothing to buy and no account to create. Sweep's proxy runs on Cloudflare WARP, which is free. You only need an internet connection for the next step.")
                     }
-                    step(2, "Register this Mac with WARP", done: model.warpRegistered) {
+                    step(2, "Register this \(DeviceNoun.current) with WARP", done: model.warpRegistered) {
                         registration
                     }
+                    #if os(iOS)
+                    step(3, "Turn WARP on", done: false) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Tap **Route this \(DeviceNoun.current) through WARP** on the main screen. The first time, iOS asks to add a VPN configuration: choose **Allow**.")
+                            Text("Every app then goes through Cloudflare WARP inside HTTPS that names an ordinary site. It keeps running after you close Sweep.")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    #else
                     step(3, "Turn the proxy on", done: false) {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("**Whole Mac:** click the gear ⚙︎ on the main screen ▸ **Tor and proxy** ▸ turn on **Route this whole Mac through WARP**. macOS asks for your password once to change the proxy setting.")
@@ -107,12 +119,13 @@ struct WarpSetupGuide: View {
                     step(4, "Optional: your own relay Worker", done: false) {
                         worker
                     }
+                    #endif
                 }
                 .padding(24)
             }
             Divider()
             HStack {
-                Text(model.warpRegistered ? "WARP is set up on this Mac."
+                Text(model.warpRegistered ? "WARP is set up on this \(DeviceNoun.current)."
                                           : "This guide comes back until WARP is registered.")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
@@ -124,7 +137,9 @@ struct WarpSetupGuide: View {
             }
             .padding(16)
         }
+        #if os(macOS)
         .frame(minWidth: 440, idealWidth: 480, minHeight: 560, idealHeight: 680)
+        #endif
     }
 
     private var header: some View {
@@ -157,7 +172,7 @@ struct WarpSetupGuide: View {
                     .padding(.top, 6)
                 }
             } else {
-                Text("This creates a free, anonymous WARP device for this Mac. Its keys are saved only on this Mac.")
+                Text("This creates a free, anonymous WARP device for this \(DeviceNoun.current). Its keys are saved only on this \(DeviceNoun.current).")
 
                 DisclosureGroup("I have a WARP+ key or a company team token (optional)", isExpanded: $showExtras) {
                     VStack(alignment: .leading, spacing: 8) {
@@ -175,14 +190,12 @@ struct WarpSetupGuide: View {
                 }
 
                 Toggle(isOn: $acceptedTerms) {
-                    HStack(spacing: 4) {
-                        Text("I accept Cloudflare's")
-                        Link("Terms", destination: URL(string: "https://www.cloudflare.com/application/terms/")!)
-                        Text("and")
-                        Link("Privacy Policy", destination: URL(string: "https://www.cloudflare.com/application/privacypolicy/")!)
-                    }
+                    // One Text with inline links, so it wraps as a sentence on an iPhone.
+                    Text("I accept Cloudflare's [Terms](https://www.cloudflare.com/application/terms/) and [Privacy Policy](https://www.cloudflare.com/application/privacypolicy/)")
                 }
+                #if os(macOS)
                 .toggleStyle(.checkbox)
+                #endif
 
                 HStack(spacing: 10) {
                     Button {
@@ -206,6 +219,7 @@ struct WarpSetupGuide: View {
         }
     }
 
+    #if os(macOS)
     private var worker: some View {
         DisclosureGroup("Only needed for the Connect (VPN) button, not the proxy", isExpanded: $showWorker) {
             VStack(alignment: .leading, spacing: 8) {
@@ -221,6 +235,7 @@ struct WarpSetupGuide: View {
         }
         .onAppear { model.loadWorkerSettings() }
     }
+    #endif
 
     private func step<Content: View>(_ number: Int, _ title: String, done: Bool,
                                      @ViewBuilder content: () -> Content) -> some View {
@@ -245,4 +260,3 @@ struct WarpSetupGuide: View {
         .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 12, style: .continuous))
     }
 }
-#endif

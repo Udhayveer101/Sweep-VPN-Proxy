@@ -347,6 +347,68 @@ public final class VPNViewModel: ObservableObject {
         }
     }
     #endif
+    #if os(iOS)
+    // MARK: - WARP (iOS)
+    //
+    // The same WARP as macOS, but as its own packet tunnel: iOS has neither child
+    // processes nor a system SOCKS proxy. `systemProxyEnabled` keeps the macOS
+    // name so the home panel and setup guide are shared; here it means "this
+    // device is routed through WARP".
+
+    @Published public internal(set) var warpState: WarpController.State = .stopped
+    private lazy var warp = WarpController(sni: options.warpSNI)
+
+    @Published public internal(set) var warpRegistered = WarpRegistration.isRegistered()
+    @Published public private(set) var warpSetupBusy = false
+    @Published public var warpSetupError: String?
+
+    public func registerWarp(licenseKey: String, teamToken: String) async {
+        warpSetupBusy = true
+        warpSetupError = nil
+        defer { warpSetupBusy = false }
+        do {
+            try await WarpRegistration.register(licenseKey: licenseKey, teamToken: teamToken)
+        } catch {
+            warpSetupError = error.localizedDescription
+        }
+        warpRegistered = WarpRegistration.isRegistered()
+        if warpRegistered, warpSetupError == nil {
+            completeOnboarding()
+        }
+    }
+
+    public var warpStatusText: String? {
+        switch warpState {
+        case .stopped: return nil
+        case .starting: return "Connecting to WARP… (SNI \(options.warpSNI))"
+        case .running: return "All traffic goes through Cloudflare WARP (SNI \(options.warpSNI))"
+        case .failed(let why): return why
+        }
+    }
+
+    /// The iOS app ships as the WARP build (SweepProxyOnly in Info.plist).
+    public let proxyOnly = Bundle.main.object(forInfoDictionaryKey: "SweepProxyOnly") as? String == "YES"
+
+    public var systemProxyEnabled: Bool { warpState == .running || warpState == .starting }
+    @Published public private(set) var systemProxyError: String?
+
+    public func setEverythingThroughWarp(_ on: Bool) { setWarp(enabled: on) }
+
+    public func setWarp(enabled: Bool) {
+        systemProxyError = nil
+        var o = options
+        o.warpEnabled = enabled
+        options = o
+        guard enabled else { warp.stop(); return }
+        if warp.sni != options.warpSNI { warp = WarpController(sni: options.warpSNI) }
+        warp.start { [weak self] st in Task { @MainActor in self?.warpState = st } }
+    }
+
+    /// The tunnel outlives the app; pick its state back up on launch.
+    public func attachWarp() {
+        warp.attach { [weak self] st in Task { @MainActor in self?.warpState = st } }
+    }
+    #endif
     /// No verified, unexpired signed bundle => the app has nothing it is allowed
     /// to connect to, and says so instead of implying it is standing guard.
     @Published public private(set) var hasVerifiedConfig = false
@@ -419,7 +481,9 @@ public final class VPNViewModel: ObservableObject {
         // keeps coming back until one exists, whatever was dismissed before.
         if !warpRegistered { activeSheet = .onboarding }
         #else
-        if !UserDefaults.standard.bool(forKey: "sweep.onboarded") { activeSheet = .onboarding }
+        if proxyOnly ? !warpRegistered : !UserDefaults.standard.bool(forKey: "sweep.onboarded") {
+            activeSheet = .onboarding
+        }
         #endif
     }
 

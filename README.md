@@ -25,6 +25,23 @@ notarytool profile), then `gh release create vx.y.z build/release/SweepVPN-x.y.z
 **Or build it** — `make config`, fill in `Config/Local.xcconfig`, then
 `make install-macos`. Details under [Setup](#setup).
 
+### iPhone and iPad
+
+`make ios-ipa` builds `build/ios/SweepVPN-<version>.ipa`: Cloudflare WARP for
+the whole device, the same tunnel, SNI disguise and setup guide as the Mac
+build, running as a packet-tunnel extension (iOS 17+).
+
+The IPA is unsigned. iOS only grants the packet-tunnel entitlement to paid
+Apple Developer Program teams, so a free Apple ID (AltStore, SideStore,
+Sideloadly) installs the app but WARP cannot start. To use it, sign it with a
+paid team — re-sign the IPA, or open the project in Xcode, set your team in
+`Config/Local.xcconfig` and run `SweepVPN-iOS` on your device. Change the
+`com.sweep.vpn.*` bundle ids and the `group.com.sweep.vpn` app group in
+`project.yml` and the entitlements to ones your team owns.
+
+On the device: open Sweep, accept Cloudflare's terms and tap **Register**, then
+**Route this iPhone through WARP** and allow the VPN configuration.
+
 Either way, read [First run](#first-run): out of the box the app has nowhere to
 connect to, and getting it somewhere is three or four steps.
 
@@ -33,6 +50,7 @@ connect to, and getting it somewhere is three or four steps.
 |---|---|
 | `Core/` | `SweepVPNCore` — state machine, Auto-mode engine, server scoring, signed-config verifier, security policy, keychain store, diagnostics, IPC. Pure Swift, host-testable. |
 | `DataPlane/sweepwg/` | Rust C-ABI shim over **boringtun** (audited userspace WireGuard). No cryptography is written here. |
+| `DataPlane/warpmobile/` | iOS WARP data plane: patched usque (`Tools/usque/*.patch`) as a C archive on the tunnel fd. `build.sh` → `SweepWarp.xcframework`. |
 | `DataPlane/SweepWireGuard.xcframework` | Built static lib for ios-arm64, ios-sim (arm64+x86_64), macos (arm64+x86_64). |
 | `Kit/` | `SweepVPNKit` (adapters, packet-tunnel provider, NE configurators) and `SweepVPNUI` (SwiftUI). |
 | `Apps/` | iOS app + `.appex`, macOS menu-bar app + `.appex`, shared config, entitlements. |
