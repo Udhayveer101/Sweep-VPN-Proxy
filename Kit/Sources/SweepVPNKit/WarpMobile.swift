@@ -225,7 +225,11 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
 
         setTunnelNetworkSettings(Self.settings(for: iface)) { [weak self] error in
             guard let self else { return }
-            if let error { return completionHandler(error) }
+            if let error {
+                EventLog.shared.record(phase: "warp", level: .error, kind: "settingsRejected",
+                                       detail: "\(error.localizedDescription) remote=\(Self.remoteAddress(iface.endpointH2V4)) v4=\(iface.ipv4) v6=\(iface.ipv6.isEmpty ? "none" : "set")")
+                return completionHandler(error)
+            }
             let fd = SweepWarpFindTunnelFd()
             guard fd >= 0 else { return completionHandler(Self.error("Could not find the tunnel interface.")) }
 
@@ -257,7 +261,9 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
     /// tunnel; the data plane drops it (it does not route inside the session).
     /// DNS goes to Cloudflare through the tunnel, the same resolvers macOS pins.
     static func settings(for iface: WarpInterface) -> NEPacketTunnelNetworkSettings {
-        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: iface.endpointH2V4)
+        // iOS rejects anything but a bare IP here ("Invalid NETunnelNetworkSettings
+        // tunnelRemoteAddress"); the value is only a label, the fd carries traffic.
+        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: remoteAddress(iface.endpointH2V4))
         let v4 = NEIPv4Settings(addresses: [iface.ipv4], subnetMasks: ["255.255.255.255"])
         v4.includedRoutes = [NEIPv4Route.default()]
         settings.ipv4Settings = v4
@@ -271,6 +277,20 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
         settings.dnsSettings = dns
         settings.mtu = 1280
         return settings
+    }
+
+    /// Bare IPv4/IPv6 from the config value (tolerating "ip:port" and "[v6]:port"),
+    /// else Cloudflare's default HTTP/2 MASQUE endpoint.
+    static func remoteAddress(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("["), let end = s.firstIndex(of: "]") {
+            s = String(s[s.index(after: s.startIndex)..<end])
+        } else if s.filter({ $0 == ":" }).count == 1, let colon = s.firstIndex(of: ":") {
+            s = String(s[..<colon])
+        }
+        var v4 = in_addr(), v6 = in6_addr()
+        if inet_pton(AF_INET, s, &v4) == 1 || inet_pton(AF_INET6, s, &v6) == 1 { return s }
+        return "162.159.198.2"
     }
 
     func ingest(_ line: String) {
