@@ -25,6 +25,15 @@ notarytool profile), then `gh release create vx.y.z build/release/SweepVPN-x.y.z
 **Or build it** — `make config`, fill in `Config/Local.xcconfig`, then
 `make install-macos`. Details under [Setup](#setup).
 
+### Windows
+
+Download `SweepVPN-<version>-windows-x64.exe` from [Releases](../../releases)
+(tags `windows-v*`) and run it — see `Windows/RELEASE_NOTES.md`. A tray app
+running the same patched usque WARP tunnel, routing Windows through it via the
+per-user system proxy. Build: `Windows/build.sh <version>` (Go, cross-compiles
+from macOS). CI (`.github/workflows/windows-release.yml`) tests it end to end on
+Windows and publishes on a `windows-v*` tag.
+
 ### iPhone and iPad
 
 `make ios-ipa` builds `build/ios/SweepVPN-<version>.ipa`: Cloudflare WARP for
