@@ -47,6 +47,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.sweep.vpn.ios
         CODE_SIGN_ENTITLEMENTS: Apps/iOS/App.entitlements
         INFOPLIST_FILE: Apps/iOS/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: NO
         MARKETING_VERSION: "1.3.0"
         CURRENT_PROJECT_VERSION: "3"
