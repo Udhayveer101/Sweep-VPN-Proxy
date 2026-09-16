@@ -100,7 +100,7 @@ public final class VPNConfigurator: @unchecked Sendable {
         }.count
         EventLog.shared.record(phase: "profile", level: mine > 1 ? .error : .info,
                                kind: "profileInventory",
-                               detail: "\(existing.count) VPN profile(s) on this Mac, \(mine) ours"
+                               detail: "\(existing.count) VPN profile(s) on this device, \(mine) ours"
                                    + (ours == nil ? " — creating a new one" : " — adopting the existing one"))
         let m = ours ?? NETunnelProviderManager()
         withState {

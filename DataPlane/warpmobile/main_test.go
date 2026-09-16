@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/Diniboy1123/usque/config"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -128,4 +130,26 @@ func TestLiveFetchThroughWarp(t *testing.T) {
 		t.Fatalf("trace did not report warp=on:\n%s", body)
 	}
 	t.Logf("trace:\n%s", body)
+}
+
+// usque's SaveConfig ignores its receiver and encodes the global AppConfig, so
+// a registration that saved a local Config wrote every field blank (iOS then
+// failed with "failed to parse private key ... sequence truncated").
+func TestSaveConfigWritesTheGivenConfig(t *testing.T) {
+	path := t.TempDir() + "/config.json"
+	want := config.Config{PrivateKey: "cHJpdg==", EndpointH2V4: "162.159.198.2", IPv4: "172.16.0.2"}
+	if err := saveConfig(path, want); err != nil {
+		t.Fatal(err)
+	}
+	config.AppConfig = config.Config{}
+	got, err := load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PrivateKey != want.PrivateKey || got.EndpointH2V4 != want.EndpointH2V4 || got.IPv4 != want.IPv4 {
+		t.Fatalf("saved config lost fields: %+v", got)
+	}
+	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+		t.Fatalf("config holds the private key; mode %v", info.Mode().Perm())
+	}
 }

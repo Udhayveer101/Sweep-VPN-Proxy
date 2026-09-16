@@ -29,6 +29,9 @@ struct SweepVPNApp: App {
     /// Servers only ever come from the verified bundle — never straight off the
     /// network, never from UserDefaults.
     private func refreshConfiguration() async {
+        // The WARP build has no signed server list to fetch; trying reported
+        // configurationInvalid ("traffic blocked") on every launch.
+        guard !model.proxyOnly else { return }
         guard let store = try? AppConfig.makeConfigStore() else {
             model.noteConfigurationFailure("No signing key is pinned in this build.")
             return

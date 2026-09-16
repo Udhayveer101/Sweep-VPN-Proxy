@@ -146,7 +146,17 @@ func register(path, name, jwt string) error {
 		IPv4:           updated.Config.Interface.Addresses.V4,
 		IPv6:           updated.Config.Interface.Addresses.V6,
 	}
-	if err := cfg.SaveConfig(path); err != nil {
+	return saveConfig(path, cfg)
+}
+
+// saveConfig writes cfg to path. usque's SaveConfig ignores its receiver and
+// encodes the global AppConfig, so cfg has to become AppConfig first; saving a
+// local Config wrote every field blank.
+func saveConfig(path string, cfg config.Config) error {
+	mu.Lock()
+	defer mu.Unlock()
+	config.AppConfig = cfg
+	if err := config.AppConfig.SaveConfig(path); err != nil {
 		return err
 	}
 	// The file holds the device's private key.

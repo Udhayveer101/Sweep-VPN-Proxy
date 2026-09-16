@@ -304,8 +304,13 @@ public enum WarpRegistration {
         public var errorDescription: String? { message }
     }
 
+    /// A config.json with a device private key. The file alone is not enough:
+    /// iOS builds before 1.3.0 (4) saved one with every field blank.
     public static func isRegistered(directory: URL = WarpController.defaultDirectory) -> Bool {
-        FileManager.default.fileExists(atPath: directory.appendingPathComponent("config.json").path)
+        struct Keys: Decodable { let private_key: String? }
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent("config.json")),
+              let keys = try? JSONDecoder().decode(Keys.self, from: data) else { return false }
+        return !(keys.private_key ?? "").isEmpty
     }
 
     /// `xxxxxxxx-xxxxxxxx-xxxxxxxx`, the format usque's `account set` documents.
