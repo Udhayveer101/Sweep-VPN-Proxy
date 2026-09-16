@@ -15,6 +15,15 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 BREW="${BREW_PREFIX:-/opt/homebrew}"
+# build/deps (Tools/build-deps-mac.sh) holds openssl/lz4/fmt built for the app's
+# deployment target; Homebrew's static libs only target the host OS.
+DEPS="$(cd ../.. && pwd)/build/deps"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+if [ -d "$DEPS/lib" ]; then
+  SSL="$DEPS" LZ4="$DEPS" FMT="$DEPS" PREFIXES="$DEPS"
+else
+  SSL="$BREW/opt/openssl@3" LZ4="$BREW/opt/lz4" FMT="$BREW/opt/fmt" PREFIXES="$BREW"
+fi
 BUILD="build-mac"
 OUT="../SweepOpenVPN.xcframework"
 STAGE="build-stage"
@@ -27,8 +36,9 @@ fi
 echo "==> configuring"
 cmake -S . -B "$BUILD" -GNinja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_PREFIX_PATH="$BREW" \
-  -DOPENSSL_ROOT_DIR="$BREW/opt/openssl@3" >/dev/null
+  -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+  -DCMAKE_PREFIX_PATH="$PREFIXES" \
+  -DOPENSSL_ROOT_DIR="$SSL" >/dev/null
 
 echo "==> building"
 cmake --build "$BUILD" --target sweepovpn >/dev/null
@@ -38,10 +48,10 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/mac"
 libtool -static -o "$STAGE/mac/libsweepovpn.a" \
   "$BUILD/libsweepovpn.a" \
-  "$BREW/opt/openssl@3/lib/libssl.a" \
-  "$BREW/opt/openssl@3/lib/libcrypto.a" \
-  "$BREW/opt/lz4/lib/liblz4.a" \
-  "$BREW/opt/fmt/lib/libfmt.a" 2>/dev/null
+  "$SSL/lib/libssl.a" \
+  "$SSL/lib/libcrypto.a" \
+  "$LZ4/lib/liblz4.a" \
+  "$FMT/lib/libfmt.a" 2>/dev/null
 
 # The headers directory name ends up in the framework's search paths, and
 # SweepWireGuard.xcframework already ships one called "include". Two of those

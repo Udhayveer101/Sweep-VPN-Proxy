@@ -14,12 +14,19 @@ IDENTITY="${2:--}"
 TS="${SIGN_TIMESTAMP:---timestamp=none}"
 # Apple's timestamp service intermittently answers "not available"; retry.
 sign() { for i in 1 2 3 4 5; do codesign "$@" && return 0; sleep $((i * 3)); done; return 1; }
-SRC="$(command -v tor || echo /opt/homebrew/bin/tor)"
+# Prefer the tor from Tools/build-deps-mac.sh: Homebrew's is stamped for the
+# host OS and dyld refuses it on older macOS (e.g. Sequoia).
+DEPS_TOR="$(cd "$(dirname "$0")/.." && pwd)/build/deps/bin/tor"
+if [ -x "$DEPS_TOR" ]; then SRC="$DEPS_TOR"
+else SRC="$(command -v tor || echo /opt/homebrew/bin/tor)"
+  echo "warning: using Homebrew tor; run Tools/build-deps-mac.sh for older-macOS support" >&2; fi
 DEST="$APP/Contents/Resources/tor"
 
 [ -x "$SRC" ] || { echo "tor not found; run: brew install tor" >&2; exit 1; }
 
 mkdir -p "$DEST"
+# Drop dylibs from an earlier Homebrew-tor bundle; the static build needs none.
+rm -f "$DEST"/*.dylib
 cp -f "$SRC" "$DEST/tor"
 chmod u+w "$DEST/tor"
 
