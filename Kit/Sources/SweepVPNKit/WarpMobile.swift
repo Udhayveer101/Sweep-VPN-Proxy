@@ -40,6 +40,11 @@ public final class WarpController: @unchecked Sendable {
 
     /// Saves (or refreshes) the WARP profile, then starts it. iOS shows its
     /// "Add VPN Configurations" prompt the first time.
+    /// Retire each MASQUE flow at this age so the ISP's sweep of long-lived
+    /// TCP flows never reaches it. 0 keeps the warm standby only, which is the
+    /// default: rotation can briefly stall new connections.
+    public var flowTTLSeconds: Int = 0
+
     public func start(onState: @escaping @Sendable (State) -> Void) {
         self.onState = onState
         guard WarpRegistration.isRegistered() else {
@@ -53,7 +58,8 @@ public final class WarpController: @unchecked Sendable {
                 let proto = NETunnelProviderProtocol()
                 proto.providerBundleIdentifier = Self.providerBundleIdentifier
                 proto.serverAddress = "Cloudflare WARP (SNI \(sni))"
-                proto.providerConfiguration = ["sni": sni]
+                proto.providerConfiguration = ["sni": sni,
+                                               "flowTTL": NSNumber(value: flowTTLSeconds)]
                 manager.protocolConfiguration = proto
                 manager.localizedDescription = "Sweep WARP"
                 manager.isEnabled = true
@@ -210,6 +216,7 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
                                    completionHandler: @escaping (Error?) -> Void) {
         let proto = protocolConfiguration as? NETunnelProviderProtocol
         let sni = (proto?.providerConfiguration?["sni"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "example.com"
+        let flowTTL = (proto?.providerConfiguration?["flowTTL"] as? NSNumber)?.int32Value ?? 0
         let configFile = WarpController.defaultDirectory.appendingPathComponent("config.json")
 
         guard let data = try? Data(contentsOf: configFile),
@@ -240,8 +247,11 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
             self.lock.unlock()
             DispatchQueue.global().asyncAfter(deadline: .now() + Self.startTimeout, execute: deadline)
 
-            EventLog.shared.record(phase: "warp", kind: "starting", detail: "sni=\(sni)")
-            if let failure = SweepWarpStart(strdup(configFile.path), strdup(sni), fd) {
+            EventLog.shared.record(phase: "warp", kind: "starting", detail: "sni=\(sni) flowTTL=\(flowTTL)")
+            // The warm standby is on for every start (SweepWarpStartGaming
+            // with ttl 0): the phone sits behind the same ISP, and turning a
+            // killed flow into a promotion has no downside.
+            if let failure = SweepWarpStartGaming(strdup(configFile.path), strdup(sni), fd, flowTTL) {
                 let message = String(cString: failure)
                 SweepWarpFree(failure)
                 self.finishStart(Self.error("Could not start WARP: \(message)"))

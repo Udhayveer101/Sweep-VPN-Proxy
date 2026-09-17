@@ -128,7 +128,8 @@ func TestLiveFetchThroughWarp(t *testing.T) {
 	testLog = func(s string) { linesMu.Lock(); lines = append(lines, s); linesMu.Unlock() }
 	defer func() { testLog = nil }()
 
-	if err := start(path, "example.com", fds[0]); err != nil {
+	// ttl 0: the warm standby is on, flow rotation is not.
+	if err := start(path, "example.com", fds[0], 0); err != nil {
 		t.Fatal(err)
 	}
 	defer SweepWarpStop()

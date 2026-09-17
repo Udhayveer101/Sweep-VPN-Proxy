@@ -119,3 +119,60 @@ func mustBeWarp(t *testing.T, port int) {
 		}
 	}
 }
+
+// Gaming mode swaps the loopback proxy for a real TUN device: a proxy only
+// catches apps that read the Windows proxy setting, and games do not.
+func TestGameArgsUseNativeTun(t *testing.T) {
+	w := &Warp{Exe: "usque.exe", Config: "c.json", SNI: "example.com", Port: 1080, Game: true}
+	args := strings.Join(w.Args(), " ")
+
+	if !strings.Contains(args, "nativetun") {
+		t.Fatalf("gaming mode must use nativetun, got: %s", args)
+	}
+	if strings.Contains(args, "http-proxy") || strings.Contains(args, "-p 1080") {
+		t.Fatalf("gaming mode must not bind a proxy port, got: %s", args)
+	}
+	// IPv6 inside the tunnel re-IPs the player on every reconnect, which the
+	// game server sees as a different client.
+	if !strings.Contains(args, "-S") {
+		t.Fatalf("gaming mode must keep IPv6 out of the tunnel, got: %s", args)
+	}
+	if !strings.Contains(args, "--hot-standby") {
+		t.Fatalf("gaming mode must keep a warm session, got: %s", args)
+	}
+	// Rotation is opt-in: it stalls roughly one new connection in twenty.
+	if strings.Contains(args, "--flow-ttl") {
+		t.Fatalf("rotation must be off unless asked for, got: %s", args)
+	}
+}
+
+func TestFlowTTLIsOptIn(t *testing.T) {
+	w := &Warp{Config: "c.json", SNI: "example.com", Game: true, FlowTTL: "45s"}
+	if !strings.Contains(strings.Join(w.Args(), " "), "--flow-ttl 45s") {
+		t.Fatalf("flow-ttl was not passed through: %v", w.Args())
+	}
+	w.FlowTTL = "0"
+	if strings.Contains(strings.Join(w.Args(), " "), "--flow-ttl") {
+		t.Fatal(`"0" must disable rotation`)
+	}
+}
+
+// Proxy mode must be untouched by any of this.
+func TestProxyArgsUnchanged(t *testing.T) {
+	w := &Warp{Config: "c.json", SNI: "example.com", Port: 1080}
+	args := strings.Join(w.Args(), " ")
+	if !strings.Contains(args, "http-proxy") || !strings.Contains(args, "-p 1080") {
+		t.Fatalf("proxy mode changed: %s", args)
+	}
+	if strings.Contains(args, "nativetun") || strings.Contains(args, "--hot-standby") {
+		t.Fatalf("proxy mode picked up gaming flags: %s", args)
+	}
+}
+
+// usque announces a TUN device instead of a listener in gaming mode; without
+// this the supervisor would call a healthy tunnel stalled and restart it.
+func TestTunDeviceCountsAsListening(t *testing.T) {
+	if classify("2026/09/18 00:40:02 Created TUN device: usque") != evListening {
+		t.Fatal("TUN creation must count as the tunnel being up")
+	}
+}

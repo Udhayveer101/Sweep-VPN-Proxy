@@ -22,6 +22,13 @@ import (
 // usque does not serve), so this runs `http-proxy` where the Mac runs `socks`.
 type Warp struct {
 	Exe, Config, SNI string
+	// Game swaps the loopback proxy for a real TUN device, so traffic that
+	// ignores a proxy - games, and the UDP they carry - is tunneled too.
+	Game bool
+	// FlowTTL retires a healthy MASQUE flow at this age so the ISP's sweep of
+	// long-lived TCP flows never reaches it. Empty or "0" disables rotation;
+	// it is opt-in because the swap can briefly stall new connections.
+	FlowTTL string
 	Port             int
 	OnState          func(State, string)
 	Log              io.Writer
@@ -67,11 +74,27 @@ var (
 // Args mirrors WarpController.arguments; the comments there record why each
 // flag exists (measured on this ISP, 2026-09-12..14).
 func (w *Warp) Args() []string {
-	return []string{"-c", w.Config, "http-proxy",
-		"-s", w.SNI, "--http2",
+	common := []string{"-s", w.SNI, "--http2",
 		"--always-reconnect", "-k", "5s", "--dns-timeout", "15s",
-		"-d", "1.1.1.1", "-d", "1.0.0.1",
-		"-b", "127.0.0.1", "-p", strconv.Itoa(w.Port)}
+		"-d", "1.1.1.1", "-d", "1.0.0.1"}
+
+	if !w.Game {
+		args := append([]string{"-c", w.Config, "http-proxy"}, common...)
+		return append(args, "-b", "127.0.0.1", "-p", strconv.Itoa(w.Port))
+	}
+
+	// -S keeps IPv6 out of the tunnel deliberately: with it on, every new
+	// MASQUE session hands out a different public address, so a reconnect
+	// changes the player's IP mid-game and the game server drops them
+	// (measured 2026-09-18 - v4 held one address across every rotation).
+	// --hot-standby keeps a warm session so a killed flow is replaced by a
+	// promotion rather than a rebuild.
+	args := append([]string{"-c", w.Config, "nativetun"}, common...)
+	args = append(args, "-S", "--hot-standby")
+	if w.FlowTTL != "" && w.FlowTTL != "0" {
+		args = append(args, "--flow-ttl", w.FlowTTL)
+	}
+	return args
 }
 
 type logEvent int
@@ -86,7 +109,8 @@ const (
 
 func classify(line string) logEvent {
 	switch {
-	case strings.Contains(line, "proxy listening on"):
+	case strings.Contains(line, "proxy listening on"),
+		strings.Contains(line, "Created TUN device"):
 		return evListening
 	case strings.Contains(line, "Connected to MASQUE server"):
 		return evConnected

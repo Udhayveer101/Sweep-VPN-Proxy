@@ -190,10 +190,23 @@ func load(path string) (config.Config, error) {
 //
 //export SweepWarpStart
 func SweepWarpStart(configPath, sni *C.char, tunFd C.int) *C.char {
-	return cError(start(C.GoString(configPath), C.GoString(sni), int(tunFd)))
+	return cError(start(C.GoString(configPath), C.GoString(sni), int(tunFd), 0))
 }
 
-func start(path, sni string, fd int) error {
+// SweepWarpStartGaming is SweepWarpStart with the flow-kill mitigations on.
+//
+// The packet tunnel already carries every packet, so games work on iOS in the
+// ordinary mode; what they cannot ride out is this network's habit of killing
+// long-lived TCP flows, which stalls the tunnel for seconds. flowTTLSeconds
+// additionally retires each flow before the sweep can reach it - opt-in,
+// because the swap can briefly stall new connections. 0 keeps standby only.
+//
+//export SweepWarpStartGaming
+func SweepWarpStartGaming(configPath, sni *C.char, tunFd C.int, flowTTLSeconds C.int) *C.char {
+	return cError(start(C.GoString(configPath), C.GoString(sni), int(tunFd), int(flowTTLSeconds)))
+}
+
+func start(path, sni string, fd int, flowTTLSeconds int) error {
 	if fd < 0 {
 		return errors.New("no tunnel file descriptor")
 	}
@@ -229,6 +242,9 @@ func start(path, sni string, fd int) error {
 	}
 	ctx, c := context.WithCancel(context.Background())
 	cancel = c
+	// A warm standby costs one idle session and turns a killed flow into a
+	// promotion instead of a rebuild. It is on for every mode: the phone has
+	// the same ISP, and there is no downside to the user.
 	go api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
 		TLSConfig:       tlsConfig,
 		KeepalivePeriod: keepalive,
@@ -238,8 +254,10 @@ func start(path, sni string, fd int) error {
 		ReconnectDelay:  reconnectDelay,
 		AlwaysReconnect: true,
 		UseHTTP2:        true,
+		HotStandby:      true,
+		FlowTTL:         time.Duration(flowTTLSeconds) * time.Second,
 	})
-	log.Printf("WARP tunnel starting: endpoint %s, SNI %s", endpoint, sni)
+	log.Printf("WARP tunnel starting: endpoint %s, SNI %s, flow ttl %ds", endpoint, sni, flowTTLSeconds)
 	return nil
 }
 

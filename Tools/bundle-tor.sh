@@ -98,6 +98,11 @@ if [ -x "$USQUE" ]; then
   chmod u+w "$APP/Contents/Resources/warp/usque"
   sign --force "$TS" --options runtime --sign "$IDENTITY" \
     "$APP/Contents/Resources/warp/usque"
+  # Gaming mode's privileged half. It runs under osascript with administrator
+  # privileges, so it is a script rather than a signed helper: a Developer ID
+  # app cannot install a privileged helper without the paid NE entitlement.
+  cp -f "$(dirname "$0")/gamemode.sh" "$APP/Contents/Resources/warp/gamemode.sh"
+  chmod 755 "$APP/Contents/Resources/warp/gamemode.sh"
 else
   echo "warning: usque not found at $USQUE; WARP mode is unavailable" >&2
 fi

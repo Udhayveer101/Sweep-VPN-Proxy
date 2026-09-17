@@ -190,6 +190,7 @@ public final class VPNViewModel: ObservableObject {
             setWarp(enabled: false)
             return
         }
+        if game != nil { setGameMode(enabled: false) }
         armSystemProxyWhenReady = true
         setWarp(enabled: true)
         setLocalProxy(enabled: true)
@@ -221,8 +222,60 @@ public final class VPNViewModel: ObservableObject {
         applySystemProxy(false)
     }
 
+    // MARK: Gaming mode
+
+    @Published public internal(set) var gameState: GameModeController.State = .stopped
+    @Published public var gameDisguise: GameModeController.Disguise = .standby
+    private var game: GameModeController?
+
+    public var gameStatusText: String? {
+        switch gameState {
+        case .stopped:  return nil
+        case .starting: return "Gaming mode starting - this needs your admin password"
+        case .running:  return "Gaming mode on: the whole Mac, games included, goes through WARP"
+        case .failed(let why): return why
+        }
+    }
+
+    /// Gaming mode routes the entire Mac at the IP layer, so it cannot coexist
+    /// with the proxy modes that claim the same traffic: turning it on takes
+    /// the system proxy, WARP and Tor down first, and turning it off leaves
+    /// them off rather than silently restoring a state the user did not pick.
+    public func setGameMode(enabled: Bool) {
+        guard enabled else {
+            game?.stop()
+            game = nil
+            gameState = .stopped
+            return
+        }
+
+        armSystemProxyWhenReady = false
+        applySystemProxy(false)
+        setLocalProxy(enabled: false)
+        if options.warpEnabled { setWarp(enabled: false) }
+        if options.torEnabled { setTor(enabled: false) }
+
+        guard let controller = GameModeController.bundled() else {
+            gameState = .failed("This build has no bundled usque. Build it and run `make bundle-tor`.")
+            return
+        }
+        game = controller
+        let disguise = gameDisguise
+        controller.start(disguise: disguise) { [weak self] st in
+            Task { @MainActor in self?.gameState = st }
+        }
+    }
+
+    /// Gaming mode owns the routing table; leaving it set after the app quits
+    /// would point the Mac at a tunnel that no longer exists.
+    public func stopGameModeOnQuit() {
+        guard game != nil else { return }
+        setGameMode(enabled: false)
+    }
+
     /// WARP and Tor both want to be the proxy's SOCKS upstream; only one can be.
     public func setWarp(enabled: Bool) {
+        if enabled, game != nil { setGameMode(enabled: false) }
         if enabled, options.torEnabled { setTor(enabled: false) }
         var o = options
         o.warpEnabled = enabled
@@ -394,6 +447,25 @@ public final class VPNViewModel: ObservableObject {
 
     public func setEverythingThroughWarp(_ on: Bool) { setWarp(enabled: on) }
 
+    /// Gaming mode on iOS is only about flow rotation.
+    ///
+    /// The packet tunnel already carries every packet, UDP included, so games
+    /// work in the ordinary mode; the warm standby is always on. Rotation is
+    /// the one extra step, and it stays opt-in because the swap can briefly
+    /// stall new connections.
+    @Published public var gameModeEnabled = false {
+        didSet {
+            guard gameModeEnabled != oldValue else { return }
+            if options.warpEnabled { setWarp(enabled: true) }   // restart with the new setting
+        }
+    }
+
+    public var gameStatusText: String? {
+        gameModeEnabled
+            ? "Flows are retired before the network can drop them. New connections may pause briefly."
+            : nil
+    }
+
     public func setWarp(enabled: Bool) {
         systemProxyError = nil
         var o = options
@@ -401,6 +473,7 @@ public final class VPNViewModel: ObservableObject {
         options = o
         guard enabled else { warp.stop(); return }
         if warp.sni != options.warpSNI { warp = WarpController(sni: options.warpSNI) }
+        warp.flowTTLSeconds = gameModeEnabled ? 45 : 0
         warp.start { [weak self] st in Task { @MainActor in self?.warpState = st } }
     }
 

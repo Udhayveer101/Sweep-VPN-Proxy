@@ -94,6 +94,7 @@ extern void SweepWarpFree(char* p);
 extern char* SweepWarpRegister(char* configPath, char* deviceName, char* teamToken);
 extern char* SweepWarpSetLicense(char* configPath, char* key);
 extern char* SweepWarpStart(char* configPath, char* sni, int tunFd);
+extern char* SweepWarpStartGaming(char* configPath, char* sni, int tunFd, int flowTTLSeconds);
 extern void SweepWarpStop(void);
 extern int SweepWarpFindTunnelFd(void);
 

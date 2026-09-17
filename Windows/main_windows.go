@@ -34,12 +34,17 @@ type app struct {
 	enabled bool
 	proxyOn bool
 
-	mStatus, mRoute, mSetup, mStartup *systray.MenuItem
+	gameOn   bool
+	gameRoutes GameRoutes
+
+	mStatus, mRoute, mGame, mSetup, mStartup *systray.MenuItem
 }
 
 func main() {
 	restore := flag.Bool("restore-proxy", false, "put back the proxy settings Sweep changed, then exit")
+	game := flag.Bool("game", false, "start with gaming mode on (set by the elevated relaunch)")
 	flag.Parse()
+	startInGameMode = *game
 
 	name, _ := windows.UTF16PtrFromString(`Local\SweepVPN`)
 	_, err := windows.CreateMutex(nil, false, name)
@@ -118,6 +123,7 @@ func (a *app) onReady() {
 	a.mStatus.Disable()
 	systray.AddSeparator()
 	a.mRoute = systray.AddMenuItemCheckbox("Route this PC through WARP", "Send all traffic that uses the Windows proxy through Cloudflare WARP", false)
+	a.mGame = systray.AddMenuItemCheckbox("Gaming mode", "Send everything, games and their UDP included, through WARP. Needs administrator rights.", false)
 	a.mSetup = systray.AddMenuItem("Set up WARP…", "Register this PC with Cloudflare WARP (free, no account)")
 	info := systray.AddMenuItem(fmt.Sprintf("Proxy for single apps: 127.0.0.1:%d (HTTP)", proxyPort), "")
 	info.Disable()
@@ -128,7 +134,9 @@ func (a *app) onReady() {
 	mQuit := systray.AddMenuItem("Quit Sweep VPN", "")
 	a.refreshSetup()
 
-	if getBool("Enabled") && a.registered() {
+	if startInGameMode && a.registered() {
+		go a.setGameMode(true)
+	} else if getBool("Enabled") && a.registered() {
 		a.setEnabled(true)
 	} else if !a.registered() {
 		a.mStatus.SetTitle("WARP is not set up — choose Set up WARP…")
@@ -139,6 +147,8 @@ func (a *app) onReady() {
 			select {
 			case <-a.mRoute.ClickedCh:
 				a.setEnabled(!a.mRoute.Checked())
+			case <-a.mGame.ClickedCh:
+				go a.setGameMode(!a.mGame.Checked())
 			case <-a.mSetup.ClickedCh:
 				go a.setup()
 			case <-a.mStartup.ClickedCh:
@@ -168,9 +178,94 @@ func (a *app) onExit() {
 		_ = RestoreSystemProxy()
 	}
 	armRestoreAtSignIn(false, a.exe)
+	wasGame := a.gameOn
+	a.gameOn = false
 	a.mu.Unlock()
+	// Routes outlive the process unless we take them down, which would leave
+	// the PC pointed at a tunnel that no longer exists.
+	if wasGame {
+		_ = a.gameRoutes.Remove()
+	}
 	a.warp.Stop()
 }
+
+// startInGameMode is set by the elevated relaunch, which passes -game.
+var startInGameMode bool
+
+// setGameMode routes the whole PC through WARP at the packet level.
+//
+// Gaming mode and the proxy mode both claim the same traffic, so turning one
+// on takes the other down first. It needs administrator rights for wintun and
+// the routing table; without them the app relaunches itself through UAC.
+func (a *app) setGameMode(on bool) {
+	if on && !a.registered() {
+		a.mGame.Uncheck()
+		go a.setup()
+		return
+	}
+
+	if on && !IsElevated() {
+		if err := RelaunchElevated(); err != nil {
+			a.mGame.Uncheck()
+			msgBox("Gaming mode needs administrator rights: "+err.Error(), windows.MB_ICONERROR)
+			return
+		}
+		systray.Quit() // the elevated instance takes over
+		return
+	}
+
+	if !on {
+		a.mu.Lock()
+		a.gameOn = false
+		a.mu.Unlock()
+		a.warp.Stop()
+		if err := a.gameRoutes.Remove(); err != nil {
+			msgBox("Could not put the routing back: "+err.Error(), windows.MB_ICONERROR)
+		}
+		a.mGame.Uncheck()
+		a.mStatus.SetTitle("Off")
+		return
+	}
+
+	// The proxy mode must go first: two things claiming the same traffic is
+	// how a machine ends up routing in a circle.
+	a.setEnabled(false)
+
+	gateway, err := DefaultGateway()
+	if err != nil {
+		msgBox("Gaming mode needs a network connection: "+err.Error(), windows.MB_ICONERROR)
+		a.mGame.Uncheck()
+		return
+	}
+
+	a.mu.Lock()
+	a.gameOn = true
+	a.mu.Unlock()
+	a.mGame.Check()
+	a.mStatus.SetTitle("Gaming mode starting…")
+
+	a.warp.Game = true
+	a.warp.Start()
+
+	if err := WaitForInterface(gameInterface, 30*time.Second); err != nil {
+		a.warp.Stop()
+		a.mGame.Uncheck()
+		a.mu.Lock(); a.gameOn = false; a.mu.Unlock()
+		msgBox("The tunnel interface never came up: "+err.Error(), windows.MB_ICONERROR)
+		return
+	}
+	if err := a.gameRoutes.Apply(gameInterface, gateway); err != nil {
+		a.warp.Stop()
+		a.mGame.Uncheck()
+		a.mu.Lock(); a.gameOn = false; a.mu.Unlock()
+		msgBox("Could not route through the tunnel: "+err.Error(), windows.MB_ICONERROR)
+		return
+	}
+	a.mStatus.SetTitle("Gaming mode on")
+}
+
+// gameInterface is the wintun device name usque creates for nativetun.
+const gameInterface = "usque"
 
 func (a *app) refreshSetup() {
 	if a.registered() {

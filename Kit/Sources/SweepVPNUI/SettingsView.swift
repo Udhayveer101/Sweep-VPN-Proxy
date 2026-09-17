@@ -1,5 +1,6 @@
 import SwiftUI
 import SweepVPNCore
+import SweepVPNKit
 
 /// Advanced options live here, deliberately off the home screen.
 public struct SettingsView: View {
@@ -46,6 +47,13 @@ public struct SettingsView: View {
                         .autocorrectionDisabled()
                         .disabled(model.systemProxyEnabled)
                     Text("Sends every app's traffic to Cloudflare WARP inside HTTPS that names an ordinary site, which the network filter lets through. Change the SNI with WARP off.")
+                        .font(.footnote).foregroundStyle(.secondary)
+
+                    Toggle("Gaming mode", isOn: $model.gameModeEnabled)
+                    if let status = model.gameStatusText {
+                        Text(status).font(.footnote).foregroundStyle(.secondary)
+                    }
+                    Text("Games already go through the tunnel. This additionally retires each connection to Cloudflare before the network can drop it, which removes the pauses mid-game.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 #endif
@@ -107,6 +115,28 @@ public struct SettingsView: View {
                 }
                 #endif
                 #if os(macOS)
+                Section("Gaming") {
+                    Toggle("Gaming mode", isOn: Binding(
+                        get: { model.gameState != .stopped },
+                        set: { model.setGameMode(enabled: $0) }))
+                        .disabled(!model.warpRegistered)
+                    if let status = model.gameStatusText {
+                        Text(status).font(.footnote)
+                            .foregroundStyle(model.gameState.isFailed ? .red : .secondary)
+                            .textSelection(.enabled)
+                    }
+                    Picker("Disguise", selection: Binding(
+                        get: { model.gameDisguise },
+                        set: { model.gameDisguise = $0 })) {
+                            ForEach(GameModeController.Disguise.allCases, id: \.self) {
+                                Text($0.title).tag($0)
+                            }
+                        }
+                        .disabled(model.gameState != .stopped)
+                    Text("Routes the whole Mac, games included, through WARP at the packet level, so traffic games send over UDP is carried too — the proxy modes above cannot do that. Needs your admin password, and turns the proxy modes off while it runs. Standby keeps a spare tunnel warm so the network's connection drops are invisible; rotating flows also avoids the drops but can briefly slow new connections. Change the disguise with gaming mode off.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+
                 Section("Tor and proxy") {
                     Toggle("Tor over VPN", isOn: Binding(
                         get: { model.options.torEnabled },
