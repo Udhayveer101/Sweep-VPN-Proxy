@@ -52,6 +52,28 @@ func TestUtunFraming(t *testing.T) {
 	}
 }
 
+// NetworkExtension's utun fd is non-blocking: an idle read returns EAGAIN,
+// which usque treated as a dead device and reconnected every second
+// (iOS log, 2026-09-17). ReadPacket must wait for the packet instead.
+func TestUtunReadWaitsOnNonBlockingFd(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.SetNonblock(fds[0], true); err != nil {
+		t.Fatal(err)
+	}
+	dev := &utun{fd: fds[0]}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		unix.Write(fds[1], []byte{0, 0, 0, unix.AF_INET, 0x45, 7})
+	}()
+	n, err := dev.ReadPacket(make([]byte, mtu))
+	if err != nil || n != 2 {
+		t.Fatalf("ReadPacket = %d, %v; want the packet once it arrives", n, err)
+	}
+}
+
 // Live end-to-end check against Cloudflare, skipped unless WARP_LIVE_CONFIG
 // points at a registered config.json. A userspace netstack plays the iOS
 // kernel on the other end of the socketpair, so the HTTP fetch below goes

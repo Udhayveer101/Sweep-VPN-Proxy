@@ -274,6 +274,15 @@ func (t *utun) ReadPacket(buf []byte) (int, error) {
 			if err == unix.EINTR {
 				continue
 			}
+			// NetworkExtension leaves the utun fd non-blocking (it owns the
+			// flag, so don't clear it): wait for a packet instead of
+			// reporting an idle device as dead.
+			if err == unix.EAGAIN {
+				if _, err := unix.Poll([]unix.PollFd{{Fd: int32(t.fd), Events: unix.POLLIN}}, -1); err != nil && err != unix.EINTR {
+					return 0, err
+				}
+				continue
+			}
 			return 0, err
 		}
 		if n <= 4 {
@@ -317,7 +326,7 @@ func (t *utun) WritePacket(pkt []byte) error {
 	_, err := unix.Write(t.fd, b)
 	*bp = b
 	t.wpool.Put(bp)
-	if err == unix.EINTR || err == unix.ENOBUFS {
+	if err == unix.EINTR || err == unix.ENOBUFS || err == unix.EAGAIN {
 		return nil // a dropped packet, not a dead device
 	}
 	return err
