@@ -144,6 +144,14 @@ func TestGameArgsUseNativeTun(t *testing.T) {
 	if strings.Contains(args, "--flow-ttl") {
 		t.Fatalf("rotation must be off unless asked for, got: %s", args)
 	}
+	// nativetun has no in-process resolver and exits on an unknown flag, so
+	// passing these killed usque the moment it launched and the tunnel never
+	// appeared - with the failure swallowed by the background launch.
+	for _, proxyOnly := range []string{"--dns-timeout", "-d 1.1.1.1"} {
+		if strings.Contains(args, proxyOnly) {
+			t.Fatalf("nativetun rejects %q outright, got: %s", proxyOnly, args)
+		}
+	}
 }
 
 func TestFlowTTLIsOptIn(t *testing.T) {

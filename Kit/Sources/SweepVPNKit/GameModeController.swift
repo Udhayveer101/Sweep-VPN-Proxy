@@ -48,9 +48,14 @@ public final class GameModeController: @unchecked Sendable {
 
     private let script: URL
     private let usque: URL
-    private let configFile: URL
-    private let controlFile: URL
-    private let logFile: URL
+    /// Where the app's WARP registration lives - possibly inside the app's
+    /// sandbox container, which root cannot read.
+    private let sourceConfig: URL
+    /// Our own copy, outside any container, plus the control and log files.
+    private let workDir: URL
+    private var configFile: URL { workDir.appendingPathComponent("config.json") }
+    private var controlFile: URL { workDir.appendingPathComponent("gamemode.control") }
+    private var logFile: URL { workDir.appendingPathComponent("gamemode.log") }
     public let sni: String
 
     private let lock = NSLock()
@@ -72,18 +77,42 @@ public final class GameModeController: @unchecked Sendable {
                                   directory: WarpController.defaultDirectory)
     }
 
-    init(script: URL, usque: URL, directory: URL, sni: String = "example.com") {
+    init(script: URL, usque: URL, directory: URL, sni: String = "example.com",
+         workDir: URL = GameModeController.defaultWorkDir) {
         self.script = script
         self.usque = usque
         self.sni = sni
-        self.configFile = directory.appendingPathComponent("config.json")
-        self.controlFile = directory.appendingPathComponent("gamemode.control")
-        self.logFile = directory.appendingPathComponent("gamemode.log")
+        self.sourceConfig = directory.appendingPathComponent("config.json")
+        self.workDir = workDir
+    }
+
+    /// Deliberately not the app's container.
+    ///
+    /// The privileged half runs as root, and macOS denies even root access to
+    /// another app's sandbox container. With the work files in there, usque
+    /// could not read the registration and the script could not write its own
+    /// log - so a failed run left an empty log and no way to see why.
+    public static var defaultWorkDir: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("SweepVPN/gamemode", isDirectory: true)
     }
 
     /// Gaming mode needs the same WARP registration the proxy mode uses.
     public var isRegistered: Bool {
-        FileManager.default.fileExists(atPath: configFile.path)
+        FileManager.default.fileExists(atPath: sourceConfig.path)
+    }
+
+    /// Place the registration where the root process can read it. The app can
+    /// read its own container; root cannot, so the app is the one that must
+    /// carry it across.
+    private func stageConfig() throws {
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: configFile.path) {
+            try FileManager.default.removeItem(at: configFile)
+        }
+        try FileManager.default.copyItem(at: sourceConfig, to: configFile)
+        // usque rewrites the config when it refreshes its token.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configFile.path)
     }
 
     public func start(disguise: Disguise = .standby,
@@ -95,6 +124,13 @@ public final class GameModeController: @unchecked Sendable {
 
         guard isRegistered else {
             state = .failed("WARP is not set up yet. Open Settings ▸ WARP setup and press Register.")
+            return
+        }
+
+        do {
+            try stageConfig()
+        } catch {
+            state = .failed("Could not prepare the WARP config: \(error.localizedDescription)")
             return
         }
 

@@ -19,7 +19,7 @@ git -C "$WORK" fetch -q --depth 1 origin "$(cat "$PATCHES/BASE_COMMIT")"
 git -C "$WORK" checkout -q FETCH_HEAD
 git -C "$WORK" -c user.name=ci -c user.email=ci@localhost am -q \
   "$PATCHES/masque-keepalive.patch" "$PATCHES/masque-handshake-timeout.patch" "$PATCHES/masque-closed-pipe.patch" \
-    "$PATCHES/flow-standby-rotation.patch"
+    "$PATCHES/flow-standby-rotation.patch" "$PATCHES/darwin-tun-framing.patch"
 mkdir -p "$WORK/sweepwarp" && cp "$HERE/main.go" "$HERE/main_test.go" "$WORK/sweepwarp/"
 (cd "$WORK" && go vet ./sweepwarp && go test ./sweepwarp)
 

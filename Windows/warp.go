@@ -74,14 +74,17 @@ var (
 // Args mirrors WarpController.arguments; the comments there record why each
 // flag exists (measured on this ISP, 2026-09-12..14).
 func (w *Warp) Args() []string {
-	common := []string{"-s", w.SNI, "--http2",
-		"--always-reconnect", "-k", "5s", "--dns-timeout", "15s",
-		"-d", "1.1.1.1", "-d", "1.0.0.1"}
+	common := []string{"-s", w.SNI, "--http2", "--always-reconnect", "-k", "5s"}
 
 	if !w.Game {
+		// socks/http-proxy resolve in-process, so they take the resolver flags.
 		args := append([]string{"-c", w.Config, "http-proxy"}, common...)
+		args = append(args, "--dns-timeout", "15s", "-d", "1.1.1.1", "-d", "1.0.0.1")
 		return append(args, "-b", "127.0.0.1", "-p", strconv.Itoa(w.Port))
 	}
+
+	// nativetun has no in-process resolver and rejects those flags outright,
+	// which silently killed usque at launch. DNS is set on the interface.
 
 	// -S keeps IPv6 out of the tunnel deliberately: with it on, every new
 	// MASQUE session hands out a different public address, so a reconnect

@@ -71,9 +71,11 @@ log "pinned $ENDPOINT_IP via $ORIG_GW"
 # hands out a different public address, so a rotation or reconnect changes the
 # player's IP mid-game and the game server drops them (measured 2026-09-18:
 # v6 egress changed every rotation, v4 held 104.28.217.150 across all of them).
+# No --dns-timeout or -d here: nativetun moves packets and has no in-process
+# resolver, unlike socks/http-proxy, and usque exits on an unknown flag. DNS is
+# the system's job, which is why we point it at 1.1.1.1 below.
 ARGS=(-c "$CONFIG" nativetun -s "$SNI" --http2 --always-reconnect
-      --hot-standby -k 5s --dns-timeout 15s -S
-      -d 1.1.1.1 -d 1.0.0.1)
+      --hot-standby -k 5s -S)
 if [ "$ROTATE" != "0" ]; then
     ARGS+=(--flow-ttl "$ROTATE")
     log "flow rotation every $ROTATE"
