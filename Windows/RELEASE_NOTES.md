@@ -10,8 +10,10 @@ Sweep VPN for Windows 10/11 (64-bit). One file, no installer, no account.
 - Reconnects on its own: dead-tunnel detection, restart on crash, retries while you want to be connected.
 - Fail-closed: while WARP reconnects, traffic waits instead of leaking outside it.
 - Quitting, a crash, or a shutdown puts your own proxy settings back.
+- **Gaming mode**: routes the whole PC at the packet level through the same tunnel, so games and the UDP they send go through WARP instead of straight out to your ISP. Needs administrator rights (Windows will ask). Turning it on takes the proxy mode down, and quitting puts your routes back.
+- **Updates itself**: it checks for a newer release once a day and offers **Update now** or **Later**. The download is checked against the published checksum before it replaces the app.
 - Optional **Start with Windows**.
 
-Not included: Tor mode and the VPN Connect button (Mac-only). Like the Mac's system-wide switch, it only covers traffic that uses the Windows proxy — UDP (most online games, QUIC) goes direct. Log: tray → **Open log**.
+Not included: Tor mode and the VPN Connect button (Mac-only). The proxy mode only covers traffic that uses the Windows proxy — UDP (most online games, QUIC) goes direct, which is what gaming mode is for. Log: tray → **Open log**.
 
 Verify the download: compare with the `.sha256` file (`certutil -hashfile SweepVPN-…exe SHA256`).

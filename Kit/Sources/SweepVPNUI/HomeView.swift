@@ -17,6 +17,9 @@ public struct HomeView: View {
             Backdrop(tint: model.presentation.tint, animate: !reduceMotion && model.animateBackdrop)
             VStack(spacing: 20) {
                 header
+                #if os(macOS)
+                if model.availableUpdate != nil { UpdateBanner(model: model) }
+                #endif
                 Spacer(minLength: 0)
                 if model.proxyOnly {
                     ProxyHomePanel(model: model)
@@ -347,3 +350,33 @@ struct SecurityGlyphRow: View {
             .accessibilityLabel("\(title): \(on ? "on" : "off")")
     }
 }
+
+#if os(macOS)
+/// The reminder half of the updater: quiet until a newer release exists, then
+/// one line with the only two answers there are.
+struct UpdateBanner: View {
+    @ObservedObject var model: VPNViewModel
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.down.circle.fill").foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Version \(model.availableUpdate?.version ?? "") is available")
+                    .font(.callout.weight(.medium))
+                if case .downloading = model.updateState {
+                    Text("Downloading and verifying…").font(.caption).foregroundStyle(.secondary)
+                } else if case .failed(let why) = model.updateState {
+                    Text(why).font(.caption).foregroundStyle(.red)
+                }
+            }
+            Spacer(minLength: 0)
+            Button("Update") { model.installUpdate() }
+                .disabled(model.updateState == .downloading)
+            Button("Later") { model.snoozeUpdate() }
+                .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+#endif

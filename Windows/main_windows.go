@@ -37,7 +37,9 @@ type app struct {
 	gameOn   bool
 	gameRoutes GameRoutes
 
-	mStatus, mRoute, mGame, mSetup, mStartup *systray.MenuItem
+	update *Update
+
+	mStatus, mRoute, mGame, mSetup, mStartup, mUpdate *systray.MenuItem
 }
 
 func main() {
@@ -93,6 +95,9 @@ func newApp() (*app, error) {
 	}
 	a.log = f
 
+	// The previous version renamed itself aside so we could take its place.
+	clearOldExe(a.exe)
+
 	sum := sha256.Sum256(usqueBinary)
 	a.usque = filepath.Join(a.dataDir, "usque-"+hex.EncodeToString(sum[:4])+".exe")
 	if fi, err := os.Stat(a.usque); err != nil || fi.Size() != int64(len(usqueBinary)) {
@@ -129,6 +134,8 @@ func (a *app) onReady() {
 	info.Disable()
 	systray.AddSeparator()
 	a.mStartup = systray.AddMenuItemCheckbox("Start with Windows", "", startsWithWindows())
+	a.mUpdate = systray.AddMenuItem("Update available…", "Download and install a newer version of Sweep VPN")
+	a.mUpdate.Hide()
 	mLog := systray.AddMenuItem("Open log", "")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit Sweep VPN", "")
@@ -142,6 +149,15 @@ func (a *app) onReady() {
 		a.mStatus.SetTitle("WARP is not set up — choose Set up WARP…")
 	}
 
+	// Quiet unless there is something to offer; the ticker is for the PCs
+	// that stay signed in for weeks.
+	go func() {
+		a.checkForUpdate(false)
+		for range time.Tick(snoozeInterval) {
+			a.checkForUpdate(false)
+		}
+	}()
+
 	go func() {
 		for {
 			select {
@@ -149,6 +165,8 @@ func (a *app) onReady() {
 				a.setEnabled(!a.mRoute.Checked())
 			case <-a.mGame.ClickedCh:
 				go a.setGameMode(!a.mGame.Checked())
+			case <-a.mUpdate.ClickedCh:
+				go a.installUpdate()
 			case <-a.mSetup.ClickedCh:
 				go a.setup()
 			case <-a.mStartup.ClickedCh:

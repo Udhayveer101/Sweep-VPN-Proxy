@@ -222,6 +222,56 @@ public final class VPNViewModel: ObservableObject {
         applySystemProxy(false)
     }
 
+    // MARK: Updates
+
+    public enum UpdateState: Equatable, Sendable {
+        case idle, checking, downloading, failed(String)
+    }
+
+    @Published public private(set) var availableUpdate: UpdateChecker.Update?
+    @Published public private(set) var updateState: UpdateState = .idle
+    private var updateTimer: Timer?
+    public var appVersion: String { Bundle.main.shortVersion }
+
+    /// Look for a newer build. Silent unless there is something to offer:
+    /// being offline, up to date or snoozed all look the same to the user.
+    /// `force` is the Settings button, which ignores an outstanding "Later".
+    public func checkForUpdates(force: Bool = false) {
+        guard updateState != .checking, updateState != .downloading else { return }
+        updateState = .checking
+        let checker = UpdateChecker()
+        Task { @MainActor in
+            let found = await checker.check(force: force)
+            self.availableUpdate = found
+            self.updateState = .idle
+        }
+    }
+
+    /// Download, verify against the published SHA-256, and open the DMG. The
+    /// app does not replace itself: swapping a signed bundle out from under a
+    /// live tunnel is the one thing here that could leave the Mac unroutable.
+    public func installUpdate() {
+        guard let update = availableUpdate, updateState != .downloading else { return }
+        updateState = .downloading
+        let checker = UpdateChecker()
+        Task { @MainActor in
+            do {
+                let dmg = try await checker.download(update)
+                try checker.reveal(dmg)
+                self.updateState = .idle
+            } catch UpdateChecker.UpdateError.digestMismatch {
+                self.updateState = .failed("The downloaded update did not match its published checksum, so it was discarded.")
+            } catch {
+                self.updateState = .failed("Could not download the update: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    public func snoozeUpdate() {
+        UpdateChecker().snooze()
+        availableUpdate = nil
+    }
+
     // MARK: Gaming mode
 
     @Published public internal(set) var gameState: GameModeController.State = .stopped
@@ -570,6 +620,17 @@ public final class VPNViewModel: ObservableObject {
     }
 
     public func onAppear() {
+        #if os(macOS)
+        // Quiet unless there is something to offer, and snoozed for a day by
+        // "Later". The repeat is for the Macs that stay logged in for weeks.
+        checkForUpdates()
+        if updateTimer == nil {
+            updateTimer = Timer.scheduledTimer(withTimeInterval: UpdateChecker.snoozeInterval,
+                                               repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.checkForUpdates() }
+            }
+        }
+        #endif
         // Status is event-driven off NEVPNStatusDidChange; the timer is only a
         // slow safety net so we never poll hard in the background.
         // Scope the observation to *our* connection. With `object: nil` every VPN

@@ -14,7 +14,8 @@ git -C "$WORK" remote add origin https://github.com/Diniboy1123/usque
 git -C "$WORK" fetch -q --depth 1 origin "$(cat "$PATCHES/BASE_COMMIT")"
 git -C "$WORK" checkout -q FETCH_HEAD
 git -C "$WORK" -c user.name=ci -c user.email=ci@localhost am -q \
-  "$PATCHES/masque-keepalive.patch" "$PATCHES/masque-handshake-timeout.patch" "$PATCHES/masque-closed-pipe.patch"
+  "$PATCHES/masque-keepalive.patch" "$PATCHES/masque-handshake-timeout.patch" "$PATCHES/masque-closed-pipe.patch" \
+  "$PATCHES/flow-standby-rotation.patch" "$PATCHES/darwin-tun-framing.patch"
 (cd "$WORK" && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o "$HERE/usque.exe" .)
 
 mkdir -p "$HERE/dist"

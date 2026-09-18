@@ -230,6 +230,34 @@ public struct SettingsView: View {
                         .textSelection(.enabled)
                 }
                 }
+                #if os(macOS)
+                Section("Updates") {
+                    LabeledContent("Version", value: model.appVersion)
+                    if let update = model.availableUpdate {
+                        Text("Version \(update.version) is available.")
+                        HStack {
+                            Button("Update now") { model.installUpdate() }
+                                .disabled(model.updateState == .downloading)
+                            Button("Later") { model.snoozeUpdate() }
+                        }
+                    } else {
+                        Button("Check for updates") { model.checkForUpdates(force: true) }
+                            .disabled(model.updateState == .checking)
+                    }
+                    switch model.updateState {
+                    case .checking:
+                        Text("Checking…").font(.footnote).foregroundStyle(.secondary)
+                    case .downloading:
+                        // The download is verified against the checksum the
+                        // release publishes before the disk image is opened.
+                        Text("Downloading and verifying…").font(.footnote).foregroundStyle(.secondary)
+                    case .failed(let why):
+                        Text(why).font(.footnote).foregroundStyle(.red)
+                    case .idle:
+                        EmptyView()
+                    }
+                }
+                #endif
                 Section("Diagnostics") {
                     Button("Export diagnostics") {
                         Task { diagnostics = await model.exportDiagnostics() }
