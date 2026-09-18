@@ -1,5 +1,7 @@
 export PATH := /opt/homebrew/opt/rustup/bin:$(PATH)
 RUSTUP :=
+# Stamp native libs for the app floor, not the host OS, so they load on Sequoia.
+export MACOSX_DEPLOYMENT_TARGET := 14.0
 LOCAL  := Config/Local.xcconfig
 # Signing identity and team come from your own Config/Local.xcconfig, not from
 # the repo. Override on the command line if you keep them somewhere else.
@@ -7,13 +9,16 @@ TEAM   ?= $(shell sed -n 's/^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=[[:space:]
 CRATE  := DataPlane/sweepwg
 TARGETS := aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
 
-.PHONY: config dataplane test project ios macos install-macos bundle-tor release
+.PHONY: deps-mac config dataplane warp-ios test project ios ios-ipa macos install-macos bundle-tor release
 
 # First thing to run after cloning. Creates the gitignored file that holds your
 # team, your pinned key and your own Worker.
 config:
 	@if [ -f $(LOCAL) ]; then echo "$(LOCAL) already exists, leaving it alone"; \
 	else cp $(LOCAL).example $(LOCAL); echo "created $(LOCAL) - fill it in"; fi
+
+deps-mac:
+	Tools/build-deps-mac.sh
 
 dataplane:
 	cd $(CRATE) && $(RUSTUP) $(foreach t,$(TARGETS),cargo build --release --target $(t) &&) true
@@ -38,8 +43,14 @@ project: $(LOCAL)
 $(LOCAL):
 	@$(MAKE) config
 
+warp-ios:
+	DataPlane/warpmobile/build.sh
+
+ios-ipa:
+	Tools/release-ios.sh
+
 ios: project
-	xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-iOS -sdk iphonesimulator \
+	xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-iOS -sdk iphonesimulator ARCHS=arm64 \
 	  -destination 'generic/platform=iOS Simulator' CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO build
 
 # NetworkExtension entitlements cannot be ad-hoc signed: xcodebuild rejects the

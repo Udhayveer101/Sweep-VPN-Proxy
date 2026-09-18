@@ -1,0 +1,102 @@
+From 48805e26719619105079f151c93bfdac81270077 Mon Sep 17 00:00:00 2001
+From: Udhayveer Singh <udhayveersingh@Udhayveer.local>
+Date: Tue, 15 Sep 2026 16:37:01 +0530
+Subject: [PATCH 1/2] Bound the HTTP/2 MASQUE dial so a reconnect into a killed
+ flow cannot hang
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ api/masque.go                |  9 +++++++-
+ api/masque_handshake_test.go | 43 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 51 insertions(+), 1 deletion(-)
+ create mode 100644 api/masque_handshake_test.go
+
+diff --git a/api/masque.go b/api/masque.go
+index f7e4fe9..6005fcc 100644
+--- a/api/masque.go
++++ b/api/masque.go
+@@ -223,6 +223,8 @@ func isRetryableHTTP3ConnectFailure(err error) bool {
+ 
+ const h2PingTimeout = 3 * time.Second
+ 
++const h2HandshakeTimeout = 10 * time.Second
++
+ // newHTTP2Client builds an HTTP client for CONNECT-IP over HTTP/2.
+ // It honors proxy environment variables and pins dialing to the selected endpoint.
+ //
+@@ -251,17 +253,22 @@ func newHTTP2Client(baseTLSConfig *tls.Config, endpoint *net.TCPAddr, connectURI
+ 			ReadIdleTimeout: keepalive,
+ 			PingTimeout:     h2PingTimeout,
+ 			DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
+-				dialer := &net.Dialer{}
++				// The tunnel loop passes its own long-lived context, so without a
++				// bound a flow killed mid-handshake hung "Establishing MASQUE
++				// connection" for minutes. Once connected, PINGs take over.
++				dialer := &net.Dialer{Timeout: h2HandshakeTimeout}
+ 				conn, err := dialer.DialContext(ctx, network, endpoint.String())
+ 				if err != nil {
+ 					return nil, err
+ 				}
+ 
++				_ = conn.SetDeadline(time.Now().Add(h2HandshakeTimeout))
+ 				tlsConn := tls.Client(conn, tlsConfig)
+ 				if err := tlsConn.HandshakeContext(ctx); err != nil {
+ 					_ = conn.Close()
+ 					return nil, err
+ 				}
++				_ = conn.SetDeadline(time.Time{})
+ 				return tlsConn, nil
+ 			},
+ 		}
+diff --git a/api/masque_handshake_test.go b/api/masque_handshake_test.go
+new file mode 100644
+index 0000000..4eb3a9a
+--- /dev/null
++++ b/api/masque_handshake_test.go
+@@ -0,0 +1,43 @@
++package api
++
++import (
++	"crypto/tls"
++	"net"
++	"net/http"
++	"testing"
++	"time"
++)
++
++// A peer that accepts TCP and then says nothing is what a flow killed
++// mid-reconnect looks like. The dial must give up instead of hanging the
++// tunnel loop on "Establishing MASQUE connection" (seen 2026-09-15).
++func TestHTTP2DialGivesUpOnSilentPeer(t *testing.T) {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ln.Close()
++	go func() {
++		for {
++			c, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			defer c.Close()
++		}
++	}()
++
++	client, err := newHTTP2Client(&tls.Config{InsecureSkipVerify: true},
++		ln.Addr().(*net.TCPAddr), "https://example.com/", 5*time.Second)
++	if err != nil {
++		t.Fatal(err)
++	}
++	start := time.Now()
++	req, _ := http.NewRequest(http.MethodGet, "https://example.com/", nil)
++	if _, err := client.Do(req); err == nil {
++		t.Fatal("expected the dial to fail")
++	}
++	if d := time.Since(start); d > 13*time.Second {
++		t.Fatalf("dial took %v", d)
++	}
++}
+-- 
+2.50.1 (Apple Git-155)
+

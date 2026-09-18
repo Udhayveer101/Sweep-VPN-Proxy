@@ -1,0 +1,77 @@
+From d56ce061ae568d5a22655339dde3d199bdb5a71f Mon Sep 17 00:00:00 2001
+From: Udhayveer Singh <udhayveersingh@Udhayveer.local>
+Date: Wed, 16 Sep 2026 00:16:03 +0530
+Subject: [PATCH 2/2] End the MASQUE session when its HTTP/2 stream closes
+ under a write
+
+---
+ api/closed_pipe_test.go | 20 ++++++++++++++++++++
+ api/tunnel.go           | 12 +++++++++++-
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+ create mode 100644 api/closed_pipe_test.go
+
+diff --git a/api/closed_pipe_test.go b/api/closed_pipe_test.go
+new file mode 100644
+index 0000000..7c925d1
+--- /dev/null
++++ b/api/closed_pipe_test.go
+@@ -0,0 +1,20 @@
++package api
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"testing"
++)
++
++func TestIsClosedPipe(t *testing.T) {
++	if !isClosedPipe(fmt.Errorf("write: %w", io.ErrClosedPipe)) {
++		t.Fatal("wrapped io.ErrClosedPipe not detected")
++	}
++	if !isClosedPipe(errors.New("io: read/write on closed pipe")) {
++		t.Fatal("unwrapped closed-pipe text not detected")
++	}
++	if isClosedPipe(errors.New("datagram too large")) {
++		t.Fatal("unrelated error treated as closed pipe")
++	}
++}
+diff --git a/api/tunnel.go b/api/tunnel.go
+index 5f06187..6da78e3 100644
+--- a/api/tunnel.go
++++ b/api/tunnel.go
+@@ -5,8 +5,10 @@ import (
+ 	"crypto/tls"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"log"
+ 	"net"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -331,7 +333,7 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 				icmp, err := ipConn.WritePacketBuffer(buf, datagramContextIDHeadroom, n)
+ 				if err != nil {
+ 					packetBufferPool.Put(buf)
+-					if errors.As(err, new(*connectip.CloseError)) {
++					if errors.As(err, new(*connectip.CloseError)) || isClosedPipe(err) {
+ 						errChan <- fmt.Errorf("connection closed while writing to IP connection: %w", err)
+ 						return
+ 					}
+@@ -410,3 +412,11 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 		}
+ 	}
+ }
++
++// isClosedPipe reports a MASQUE session whose HTTP/2 stream was closed
++// underneath it. connect-ip-go surfaces that as io.ErrClosedPipe rather than a
++// CloseError, so without this the write pump logs "continuing..." forever while
++// the read pump stays parked: the tunnel reports Connected and carries nothing.
++func isClosedPipe(err error) bool {
++	return errors.Is(err, io.ErrClosedPipe) || strings.Contains(err.Error(), "closed pipe")
++}
+-- 
+2.50.1 (Apple Git-155)
+

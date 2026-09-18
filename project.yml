@@ -47,12 +47,18 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.sweep.vpn.ios
         CODE_SIGN_ENTITLEMENTS: Apps/iOS/App.entitlements
         INFOPLIST_FILE: Apps/iOS/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: NO
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.4.0"
+        CURRENT_PROJECT_VERSION: "7"
         TARGETED_DEVICE_FAMILY: "1,2"
+        # The iOS app ships as the WARP build, like the macOS release: the
+        # WireGuard Connect path needs a signed server bundle no build carries.
+        SWEEP_PROXY_ONLY: YES
     dependencies:
       - target: SweepVPN-iOS-Tunnel
+        embed: true
+      - target: SweepVPN-iOS-Warp
         embed: true
       - package: SweepVPNCore
         product: SweepVPNCore
@@ -70,8 +76,28 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Apps/iOSTunnel/Tunnel.entitlements
         INFOPLIST_FILE: Apps/iOSTunnel/Info.plist
         GENERATE_INFOPLIST_FILE: NO
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.4.0"
+        CURRENT_PROJECT_VERSION: "7"
+    dependencies:
+      - package: SweepVPNCore
+        product: SweepVPNCore
+      - package: SweepVPNKit
+        product: SweepVPNKit
+  # WARP packet tunnel: patched usque (SweepWarp.xcframework) on the utun fd.
+  # PRODUCT_NAME carries "Tunnel" so EventLog attributes its lines correctly.
+  SweepVPN-iOS-Warp:
+    type: app-extension
+    platform: iOS
+    sources: [Apps/iOSWarp]
+    settings:
+      base:
+        PRODUCT_NAME: SweepWarpTunnel
+        PRODUCT_BUNDLE_IDENTIFIER: com.sweep.vpn.ios.warp
+        CODE_SIGN_ENTITLEMENTS: Apps/iOSWarp/Tunnel.entitlements
+        INFOPLIST_FILE: Apps/iOSWarp/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        MARKETING_VERSION: "1.4.0"
+        CURRENT_PROJECT_VERSION: "7"
     dependencies:
       - package: SweepVPNCore
         product: SweepVPNCore
@@ -103,8 +129,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Apps/macOS/App.entitlements
         INFOPLIST_FILE: Apps/macOS/Info.plist
         GENERATE_INFOPLIST_FILE: NO
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.4.0"
+        CURRENT_PROJECT_VERSION: "7"
     dependencies:
       - target: SweepVPN-macOS-Tunnel
         embed: true
@@ -136,8 +162,8 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         ENABLE_HARDENED_RUNTIME: YES
         SWEEP_PROXY_ONLY: YES
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.4.0"
+        CURRENT_PROJECT_VERSION: "7"
     dependencies:
       - package: SweepVPNCore
         product: SweepVPNCore
@@ -156,8 +182,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Apps/macOSFilter/Filter.entitlements
         INFOPLIST_FILE: Apps/macOSFilter/Info.plist
         GENERATE_INFOPLIST_FILE: NO
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.4.0"
+        CURRENT_PROJECT_VERSION: "7"
     dependencies:
       - package: SweepVPNCore
         product: SweepVPNCore
@@ -174,8 +200,8 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Apps/macOSTunnel/Tunnel.entitlements
         INFOPLIST_FILE: Apps/macOSTunnel/Info.plist
         GENERATE_INFOPLIST_FILE: NO
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.4.0"
+        CURRENT_PROJECT_VERSION: "7"
     dependencies:
       - package: SweepVPNCore
         product: SweepVPNCore

@@ -16,7 +16,7 @@ final class WarpRegistrationTests: XCTestCase {
         #!/bin/sh
         echo "$@" >> "\(argLog.path)"
         if [ \(exitCode) -ne 0 ]; then echo "2026/09/15 Failed to register: 403 Forbidden" >&2; exit \(exitCode); fi
-        if [ "$3" = "register" ] && [ \(writesConfig ? 1 : 0) -eq 1 ]; then echo '{}' > "$2"; fi
+        if [ "$3" = "register" ] && [ \(writesConfig ? 1 : 0) -eq 1 ]; then echo '{"private_key": "cHJpdg=="}' > "$2"; fi
         echo "2026/09/15 Config saved"
         """
         try script.write(to: exe, atomically: true, encoding: .utf8)
@@ -37,6 +37,19 @@ final class WarpRegistrationTests: XCTestCase {
         XCTAssertEqual(lines(f.argLog), ["-c \(config) register --accept-tos -n Sweep VPN"])
         let mode = try FileManager.default.attributesOfItem(atPath: config)[.posixPermissions] as? Int
         XCTAssertEqual(mode, 0o600, "the config holds the device private key")
+    }
+
+    /// iOS builds before 1.3.0 (4) saved config.json with every field blank. A
+    /// file without a private key is not a registration: setup must run again.
+    func testBlankConfigIsNotARegistrationAndGetsReplaced() async throws {
+        let f = try makeFake()
+        try FileManager.default.createDirectory(at: f.dir, withIntermediateDirectories: true)
+        let config = f.dir.appendingPathComponent("config.json")
+        try #"{"private_key": "", "endpoint_h2_v4": ""}"#.write(to: config, atomically: true, encoding: .utf8)
+        XCTAssertFalse(WarpRegistration.isRegistered(directory: f.dir))
+        try await WarpRegistration.register(executable: f.exe, directory: f.dir)
+        XCTAssertTrue(WarpRegistration.isRegistered(directory: f.dir))
+        XCTAssertEqual(lines(f.argLog).count, 1, "blank config must trigger a fresh register")
     }
 
     func testTeamTokenAndLicenseAreBothPassedToUsque() async throws {

@@ -121,7 +121,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor static weak var model: VPNViewModel?
 
     func applicationWillTerminate(_ notification: Notification) {
-        MainActor.assumeIsolated { Self.model?.restoreSystemProxyOnQuit() }
+        MainActor.assumeIsolated {
+            Self.model?.restoreSystemProxyOnQuit()
+            // Gaming mode owns the routing table; leaving it set would point
+            // the Mac at a tunnel that dies with the app.
+            Self.model?.stopGameModeOnQuit()
+        }
     }
 
 }

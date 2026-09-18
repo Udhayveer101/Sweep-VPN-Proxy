@@ -195,10 +195,11 @@ public final class WarpController: @unchecked Sendable {
                 record(.info, "listening", line)
             case .connected:
                 record(.info, "connected", line)
-            case .error:
+            // A loss line only counted when it named a failure, as before .lost existed.
+            case .error, .lost where line.lowercased().contains("failed") || line.lowercased().contains("error"):
                 record(.warn, "log", line)
                 if noteFailure(line) { restartWedgedTunnel(line) }
-            case nil:
+            case .lost, nil:
                 break
             }
         }
@@ -268,23 +269,32 @@ public final class WarpController: @unchecked Sendable {
         }
     }
 
-    enum LogEvent: Equatable { case listening, connected, error }
-
-    static func classify(_ line: String) -> LogEvent? {
-        if line.contains("SOCKS proxy listening on") { return .listening }
-        if line.contains("Connected to MASQUE server") { return .connected }
-        let l = line.lowercased()
-        if l.contains("failed") || l.contains("error") { return .error }
-        return nil
-    }
-
     private func record(_ level: LogEntry.Level, _ kind: String, _ detail: String) {
         EventLog.shared.record(phase: "warp", level: level, kind: kind, detail: detail)
     }
 }
 
+#endif
+
+import Foundation
+
+extension WarpController {
+    enum LogEvent: Equatable { case listening, connected, lost, error }
+
+    /// Lines from usque 2026-09 (see WarpControllerTests for real samples).
+    /// Shared by the macOS child-process supervisor and the iOS extension.
+    static func classify(_ line: String) -> LogEvent? {
+        if line.contains("SOCKS proxy listening on") { return .listening }
+        if line.contains("Connected to MASQUE server") { return .connected }
+        if line.contains("Tunnel connection lost") { return .lost }
+        let l = line.lowercased()
+        if l.contains("failed") || l.contains("error") { return .error }
+        return nil
+    }
+}
+
 /// The one-time WARP setup, done from the app instead of a terminal. WARP needs
-/// no Cloudflare account or API key: `usque register` creates a free, anonymous
+/// no Cloudflare account or API key: registering creates a free, anonymous
 /// device and writes its keys to `config.json`. A WARP+ license key and a Zero
 /// Trust team token are both optional extras on top of that.
 public enum WarpRegistration {
@@ -294,8 +304,13 @@ public enum WarpRegistration {
         public var errorDescription: String? { message }
     }
 
+    /// A config.json with a device private key. The file alone is not enough:
+    /// iOS builds before 1.3.0 (4) saved one with every field blank.
     public static func isRegistered(directory: URL = WarpController.defaultDirectory) -> Bool {
-        FileManager.default.fileExists(atPath: directory.appendingPathComponent("config.json").path)
+        struct Keys: Decodable { let private_key: String? }
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent("config.json")),
+              let keys = try? JSONDecoder().decode(Keys.self, from: data) else { return false }
+        return !(keys.private_key ?? "").isEmpty
     }
 
     /// `xxxxxxxx-xxxxxxxx-xxxxxxxx`, the format usque's `account set` documents.
@@ -303,6 +318,17 @@ public enum WarpRegistration {
         key.range(of: #"^[A-Za-z0-9]{8}-[A-Za-z0-9]{8}-[A-Za-z0-9]{8}$"#, options: .regularExpression) != nil
     }
 
+    static func validated(licenseKey: String) throws -> String {
+        let key = licenseKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !key.isEmpty, !isValidLicenseKey(key) {
+            throw Failure(message: "That license key does not look right. It should be three groups of 8 letters or digits, like ab12cd34-ef56gh78-ij90kl12.")
+        }
+        return key
+    }
+}
+
+#if os(macOS)
+extension WarpRegistration {
     static func registerArguments(configFile: URL, teamToken: String) -> [String] {
         var args = ["-c", configFile.path, "register", "--accept-tos", "-n", "Sweep VPN"]
         if !teamToken.isEmpty { args += ["--jwt", teamToken] }
@@ -323,11 +349,8 @@ public enum WarpRegistration {
         guard let executable else {
             throw Failure(message: "This build has no bundled usque, so WARP cannot be set up. Rebuild with `make install-macos`.")
         }
-        let key = licenseKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = try validated(licenseKey: licenseKey)
         let token = teamToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !key.isEmpty, !isValidLicenseKey(key) {
-            throw Failure(message: "That license key does not look right. It should be three groups of 8 letters or digits, like ab12cd34-ef56gh78-ij90kl12.")
-        }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         let configFile = directory.appendingPathComponent("config.json")

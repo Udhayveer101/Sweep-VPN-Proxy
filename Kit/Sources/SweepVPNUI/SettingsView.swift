@@ -1,5 +1,6 @@
 import SwiftUI
 import SweepVPNCore
+import SweepVPNKit
 
 /// Advanced options live here, deliberately off the home screen.
 public struct SettingsView: View {
@@ -10,24 +11,49 @@ public struct SettingsView: View {
     public init(model: VPNViewModel) { self.model = model }
 
     /// The proxy-only release has no tunnel or filter, so their switches would do nothing.
-    private var showsVPNSettings: Bool {
-        #if os(macOS)
-        return !model.proxyOnly
-        #else
-        return true
-        #endif
-    }
+    private var showsVPNSettings: Bool { !model.proxyOnly }
 
     public var body: some View {
         NavigationStack {
             Form {
-                #if os(macOS)
                 Section("WARP setup") {
-                    LabeledContent("Status", value: model.warpRegistered ? "Registered on this Mac" : "Not set up")
+                    LabeledContent("Status", value: model.warpRegistered ? "Registered on this \(DeviceNoun.current)" : "Not set up")
                     Button(model.warpRegistered ? "Open setup guide" : "Set up WARP") {
                         model.activeSheet = .onboarding
                     }
                     Text("The proxy needs a free WARP registration. The guide walks through it and takes any optional keys.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                #if os(iOS)
+                Section("WARP") {
+                    Toggle("Route this \(DeviceNoun.current) through WARP", isOn: Binding(
+                        get: { model.systemProxyEnabled },
+                        set: { model.setEverythingThroughWarp($0) }))
+                        .disabled(!model.warpRegistered)
+                    if let status = model.warpStatusText {
+                        Text(status).font(.footnote)
+                            .foregroundStyle(model.warpState.isFailed ? .red : .secondary)
+                            .textSelection(.enabled)
+                    }
+                    TextField("WARP SNI", text: Binding(
+                        get: { model.options.warpSNI },
+                        set: {
+                            var o = model.options
+                            o.warpSNI = $0.trimmingCharacters(in: .whitespaces)
+                            model.options = o
+                        }))
+                        .font(.system(.footnote, design: .monospaced))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .disabled(model.systemProxyEnabled)
+                    Text("Sends every app's traffic to Cloudflare WARP inside HTTPS that names an ordinary site, which the network filter lets through. Change the SNI with WARP off.")
+                        .font(.footnote).foregroundStyle(.secondary)
+
+                    Toggle("Gaming mode", isOn: $model.gameModeEnabled)
+                    if let status = model.gameStatusText {
+                        Text(status).font(.footnote).foregroundStyle(.secondary)
+                    }
+                    Text("Games already go through the tunnel. This additionally retires each connection to Cloudflare before the network can drop it, which removes the pauses mid-game.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 #endif
@@ -89,6 +115,28 @@ public struct SettingsView: View {
                 }
                 #endif
                 #if os(macOS)
+                Section("Gaming") {
+                    Toggle("Gaming mode", isOn: Binding(
+                        get: { model.gameState != .stopped },
+                        set: { model.setGameMode(enabled: $0) }))
+                        .disabled(!model.warpRegistered)
+                    if let status = model.gameStatusText {
+                        Text(status).font(.footnote)
+                            .foregroundStyle(model.gameState.isFailed ? .red : .secondary)
+                            .textSelection(.enabled)
+                    }
+                    Picker("Disguise", selection: Binding(
+                        get: { model.gameDisguise },
+                        set: { model.gameDisguise = $0 })) {
+                            ForEach(GameModeController.Disguise.allCases, id: \.self) {
+                                Text($0.title).tag($0)
+                            }
+                        }
+                        .disabled(model.gameState != .stopped)
+                    Text("Routes the whole Mac, games included, through WARP at the packet level, so traffic games send over UDP is carried too — the proxy modes above cannot do that. Needs your admin password, and turns the proxy modes off while it runs. Standby keeps a spare tunnel warm so the network's connection drops are invisible; rotating flows also avoids the drops but can briefly slow new connections. Change the disguise with gaming mode off.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+
                 Section("Tor and proxy") {
                     Toggle("Tor over VPN", isOn: Binding(
                         get: { model.options.torEnabled },
@@ -182,6 +230,34 @@ public struct SettingsView: View {
                         .textSelection(.enabled)
                 }
                 }
+                #if os(macOS)
+                Section("Updates") {
+                    LabeledContent("Version", value: model.appVersion)
+                    if let update = model.availableUpdate {
+                        Text("Version \(update.version) is available.")
+                        HStack {
+                            Button("Update now") { model.installUpdate() }
+                                .disabled(model.updateState == .downloading)
+                            Button("Later") { model.snoozeUpdate() }
+                        }
+                    } else {
+                        Button("Check for updates") { model.checkForUpdates(force: true) }
+                            .disabled(model.updateState == .checking)
+                    }
+                    switch model.updateState {
+                    case .checking:
+                        Text("Checking…").font(.footnote).foregroundStyle(.secondary)
+                    case .downloading:
+                        // The download is verified against the checksum the
+                        // release publishes before the disk image is opened.
+                        Text("Downloading and verifying…").font(.footnote).foregroundStyle(.secondary)
+                    case .failed(let why):
+                        Text(why).font(.footnote).foregroundStyle(.red)
+                    case .idle:
+                        EmptyView()
+                    }
+                }
+                #endif
                 Section("Diagnostics") {
                     Button("Export diagnostics") {
                         Task { diagnostics = await model.exportDiagnostics() }

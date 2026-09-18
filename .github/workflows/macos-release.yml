@@ -4,11 +4,16 @@ name: macOS release
 # like Sweep. This manual workflow is the CI alternative; it needs the
 # DEVELOPER_ID_P12_BASE64 / DEVELOPER_ID_P12_PASSWORD / ASC_* secrets.
 on:
+  # A tag is what actually publishes: the release step below only runs on a
+  # push, so dispatch alone builds and uploads an artifact but never makes a
+  # GitHub Release.
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
         description: "Marketing version (e.g. 1.2.0)"
-        required: true
+        required: false
 
 permissions:
   contents: write
