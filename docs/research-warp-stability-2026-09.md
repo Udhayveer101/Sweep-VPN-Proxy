@@ -462,12 +462,28 @@ here is our own limits, which are known.)
 
 ### Next, on HTTP/2, ranked
 
-**R5. Re-tune detection now that a false positive is cheap. VERIFIED.**
-The current `-k 5s` + 3s `PingTimeout` leaves ~8s of blindness (§1). The
-fork's own record says `-k 2s` lost to `-k 5s` only because every false positive
-cost a rebuild; with `--hot-standby` a false positive costs a promotion, and
-with R1 it no longer costs a process restart. Re-run that experiment — it is now
-a different experiment.
+**R5. Re-tune detection now that a false positive is cheap. VERIFIED as
+reasoning, UNTESTED as a change.** The current `-k 5s` + 3s `PingTimeout` leaves
+~8s of blindness (§1). The fork's own record says `-k 2s` lost to `-k 5s` only
+because every false positive cost a rebuild; with R1 it no longer costs a
+process restart. Re-run that experiment — it is now a different experiment.
+
+Note the caveat added by measurement, and it is a large one: see
+`docs/measurements-2026-09-20.md`. When a transfer stalled for 60s on the
+shipping build, `usque` logged **nothing at all** — no lost session, no
+reconnect. The MASQUE session stayed up while traffic through it stopped dead.
+Faster *detection* cannot help with a fault the client never detects, so R5 is
+not the fix for the stalls users are reporting, and should not be sold as one.
+
+**R5a. `--hot-standby` in normal mode: tried, measured, rejected.**
+The obvious companion to R5, and it did not survive a head-to-head run (both
+tunnels up at once, same network, 14 minutes each): median 19.77 vs
+19.34 Mbit/s, 1 failed transfer vs 0, longest unbroken 332s vs 535s. A wash on
+throughput and behind on the numbers that matter. A standby is a second
+long-lived TCP flow to the same endpoint on a network that sweeps long-lived TCP
+flows, so an unmeasurable benefit does not pay for it. Normal mode does not pass
+it; gaming mode still does, because rotation needs a warm session to rotate
+into.
 
 **R6. Raise the tunnel MTU above 1280 where the path allows. VERIFIED that 1280
 is the default; the correct value is UNVERIFIED.** usque defaults to 1280 and
