@@ -101,17 +101,25 @@ public final class WarpController: @unchecked Sendable {
     /// timeout and every lookup failed. HTTP/2 PINGs now catch it in <=8s, and
     /// the patched resolver re-asks every 1.5s, so a 15s DNS budget spans
     /// detection plus the ~3s redial instead of failing inside it.
-    /// `--hot-standby`: normal mode never had it — only gaming mode passed it —
-    /// so every flow the ISP swept cost a full rebuild here, and a transfer in
-    /// flight when the kill landed simply hung. Measured 2026-09-19 on the old
-    /// build: ~28 Mbit/s with a 60s stall roughly every three minutes. A warm
-    /// second session turns that kill into a promotion. It costs one idle
-    /// session, and since standby dialling now backs off (standby-backoff.patch)
-    /// a down path no longer turns it into a 1Hz redial loop.
+    /// Deliberately *not* `--hot-standby`, which gaming mode does pass.
+    ///
+    /// The theory was good — a warm second session turns a swept flow into a
+    /// promotion instead of a rebuild — but it did not survive measurement.
+    /// Run head to head on 2026-09-20, both tunnels up at once so they saw the
+    /// same network, 14 minutes each through Tools/soak.sh: with standby,
+    /// median 19.77 Mbit/s and 1 failed transfer, longest unbroken 332s;
+    /// without, median 19.34 Mbit/s and 0 failed, longest unbroken 535s. A wash
+    /// on throughput, and if anything worse on the two numbers that matter.
+    ///
+    /// So it stays off here. A standby is a second long-lived TCP flow to the
+    /// same endpoint, on the network that sweeps long-lived TCP flows, and that
+    /// is not a cost worth paying for an effect nobody can measure. Gaming mode
+    /// keeps it because rotation needs a warm session to rotate *into*.
+    /// Re-measure before changing this, don't reason about it.
     var arguments: [String] {
         ["-c", configFile.path, "socks",
          "-s", sni, "--http2",
-         "--always-reconnect", "--hot-standby", "-k", "5s", "--dns-timeout", "15s",
+         "--always-reconnect", "-k", "5s", "--dns-timeout", "15s",
          "-d", "1.1.1.1", "-d", "1.0.0.1",
          "-b", "127.0.0.1", "-p", String(socksPort)]
     }

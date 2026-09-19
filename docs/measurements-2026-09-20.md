@@ -1,0 +1,83 @@
+# Tunnel measurements, 20 September 2026
+
+Recorded with `Tools/soak.sh` against the real WARP tunnel on the filtered
+network, so the numbers below can be argued with instead of remembered wrongly.
+Re-run it before changing any of the flags these justify.
+
+## Method
+
+`Tools/soak.sh <minutes> <socks host:port>` pulls a 10MB file from
+`proof.ovh.net` through the SOCKS port every 5s and records curl's own
+`speed_download` and `time_total`. It is deliberately not a Cloudflare host:
+measuring WARP through Cloudflare measures the thing inside itself.
+
+Two harness faults were found and fixed while doing this, both of which had
+already produced a wrong answer:
+
+- Timing came from `date +%s`, so a 10MB transfer could only be 3s or 4s and
+  nothing between. Two runs differing by well under a second read as
+  "27.96 Mbit/s vs 20.97 Mbit/s" — an artefact that looks exactly like a
+  regression. Now taken from curl.
+- The first target (`speed.hetzner.de`) is unreachable through this tunnel, so
+  the first run measured nothing but failures.
+
+## Baseline: the shipping build
+
+15 minutes, `usque` from `/Applications/Sweep VPN.app`, the flags v1.4.0 ships:
+
+```
+transfers:        82 ok, 4 failed (each a 60s stall mid-transfer)
+median:           see note below — this run predates the timing fix
+longest unbroken: 145s
+```
+
+The **145s** is the number that matters and does not depend on the timing bug:
+the longest the tunnel went without a failed transfer was about two and a half
+minutes, which matches the ISP sweeping long-lived TCP flows every 1-4 minutes.
+
+Note on the stalls: when one happened, `usque` logged **nothing**. No lost
+session, no reconnect, no standby promotion. The MASQUE session stayed up while
+a transfer through it stalled to a halt and timed out at 60s. So these are not
+session kills the client can see and recover from — which is exactly why the
+client-side recovery changes below cannot be credited with fixing them.
+
+## Head to head: `--hot-standby` in normal mode
+
+Both tunnels running **at the same time** on different ports, so they saw the
+same network and the same drift. 14 minutes each.
+
+| | A: `--hot-standby` | B: shipping flags |
+|---|---|---|
+| transfers | 67 ok, 1 failed | 62 ok, 0 failed |
+| median | 19.77 Mbit/s | 19.34 Mbit/s |
+| mean | 18.10 Mbit/s | 16.93 Mbit/s |
+| p10 | 7.60 Mbit/s | 6.06 Mbit/s |
+| longest unbroken | 332s | 535s |
+
+(Absolute figures are roughly halved by the two tunnels contending for one
+uplink. The comparison is what this run is for.)
+
+**Verdict: a wash.** Slightly ahead on throughput percentiles, behind on the two
+numbers that actually matter — failed transfers and longest unbroken stretch.
+One run each is not enough to call it either way, and "not enough to call" is
+not a reason to ship it: a standby is a second long-lived TCP flow to the same
+endpoint, on the network that sweeps long-lived TCP flows. So normal mode does
+**not** pass `--hot-standby`. Gaming mode still does, because rotation needs a
+warm session to rotate into.
+
+## Rejected: `l4-socks`
+
+`usque` prints a startup hint recommending `l4-socks` for TCP-only SOCKS use,
+which is exactly what normal mode is. Its help text: *"TCP-only SOCKS5 proxy
+using direct HTTP/3 CONNECT streams."* HTTP/3 is QUIC is UDP, and this network
+blocks UDP. Not available here.
+
+## What is still unmeasured
+
+- Whether raising the MTU off 1280 helps. `--mtu` exists on `socks` mode; no
+  run has compared values.
+- Whether gaming mode's flow rotation actually removes the stalls above. It is
+  the one mechanism that would, since it retires a flow *before* it reaches the
+  stalled state, and the stalls are invisible to every reactive mechanism.
+  Worth testing with `--hot-standby --flow-ttl 90s` on a normal-mode port.
+- Anything on iOS/iPadOS. Every number here is macOS.
