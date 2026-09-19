@@ -101,10 +101,17 @@ public final class WarpController: @unchecked Sendable {
     /// timeout and every lookup failed. HTTP/2 PINGs now catch it in <=8s, and
     /// the patched resolver re-asks every 1.5s, so a 15s DNS budget spans
     /// detection plus the ~3s redial instead of failing inside it.
+    /// `--hot-standby`: normal mode never had it — only gaming mode passed it —
+    /// so every flow the ISP swept cost a full rebuild here, and a transfer in
+    /// flight when the kill landed simply hung. Measured 2026-09-19 on the old
+    /// build: ~28 Mbit/s with a 60s stall roughly every three minutes. A warm
+    /// second session turns that kill into a promotion. It costs one idle
+    /// session, and since standby dialling now backs off (standby-backoff.patch)
+    /// a down path no longer turns it into a 1Hz redial loop.
     var arguments: [String] {
         ["-c", configFile.path, "socks",
          "-s", sni, "--http2",
-         "--always-reconnect", "-k", "5s", "--dns-timeout", "15s",
+         "--always-reconnect", "--hot-standby", "-k", "5s", "--dns-timeout", "15s",
          "-d", "1.1.1.1", "-d", "1.0.0.1",
          "-b", "127.0.0.1", "-p", String(socksPort)]
     }

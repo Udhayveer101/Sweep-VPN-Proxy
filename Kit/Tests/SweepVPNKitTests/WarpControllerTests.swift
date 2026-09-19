@@ -33,7 +33,7 @@ final class WarpControllerTests: XCTestCase {
                                socksPort: 1081, sni: "example.com", directory: dir)
         XCTAssertEqual(w.arguments, ["-c", dir.appendingPathComponent("config.json").path, "socks",
                                      "-s", "example.com", "--http2",
-                                     "--always-reconnect", "-k", "5s", "--dns-timeout", "15s",
+                                     "--always-reconnect", "--hot-standby", "-k", "5s", "--dns-timeout", "15s",
                                      "-d", "1.1.1.1", "-d", "1.0.0.1",
                                      "-b", "127.0.0.1", "-p", "1081"])
     }

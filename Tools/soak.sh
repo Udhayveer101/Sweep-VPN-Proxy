@@ -72,7 +72,8 @@ if [ -f "$JOURNAL" ]; then
   echo
   echo "journal over the same window:"
   for k in restarting lost connected stalled disconnected exited watching; do
-    n=$(grep -c "\"kind\":\"$k\"" "$OUT/journal.slice" 2>/dev/null || echo 0)
+    n=$(grep -c "\"kind\":\"$k\"" "$OUT/journal.slice" 2>/dev/null | head -1)
+    n=${n:-0}
     [ "$n" -gt 0 ] && printf '  %-14s %s\n' "$k" "$n"
   done
   echo "  (full slice: $OUT/journal.slice)"
