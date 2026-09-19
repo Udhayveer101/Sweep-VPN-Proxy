@@ -523,7 +523,7 @@ public final class VPNViewModel: ObservableObject {
         options = o
         guard enabled else { warp.stop(); return }
         if warp.sni != options.warpSNI { warp = WarpController(sni: options.warpSNI) }
-        warp.flowTTLSeconds = gameModeEnabled ? 45 : 0
+        warp.flowTTLSeconds = gameModeEnabled ? 90 : 0   // see GameModeController.Disguise.flowTTL
         warp.start { [weak self] st in Task { @MainActor in self?.warpState = st } }
     }
 

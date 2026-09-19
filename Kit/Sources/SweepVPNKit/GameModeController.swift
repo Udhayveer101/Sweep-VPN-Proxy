@@ -36,7 +36,11 @@ public final class GameModeController: @unchecked Sendable {
         case standby
         case rotate
 
-        var flowTTL: String { self == .rotate ? "45s" : "0" }
+        /// The ISP's sweep lands every 1-4 minutes, so 45s retired a healthy
+        /// flow about twice as often as the threat needed — and every rotation
+        /// costs a swap window where a *new* connection can stall. 90s (±20%
+        /// jitter, applied in usque) still rotates well inside the sweep.
+        var flowTTL: String { self == .rotate ? "90s" : "0" }
 
         public var title: String {
             switch self {

@@ -1,0 +1,113 @@
+From 2a90a45fb5e0e08b11c772d2612d9e38412f189a Mon Sep 17 00:00:00 2001
+From: ci <ci@localhost>
+Date: Sat, 19 Sep 2026 23:36:06 +0530
+Subject: [PATCH] Put a brake back under standby promotion and standby dialling
+
+The standby patch skipped the reconnect delay whenever a warm session was
+parked, which is right for the promotion itself - waiting would spend the very
+gap the standby was paid for - but it left session churn with no rate limit at
+all. A path that flaps became a promote/dial spin. A 500ms floor under one
+cycle keeps promotion effectively instant while capping the spin.
+
+fillStandby had the same shape: re-dial every ReconnectDelay (1s) forever on a
+down path, logging each failure. Inside an iOS packet-tunnel extension that is
+a 1Hz TLS-handshake loop plus a synchronous journal append per line, under a
+32MB Go memory limit and a 50MB jetsam ceiling. It now backs off 1s -> 30s and
+logs once per backoff step.
+---
+ api/standby.go | 32 ++++++++++++++++++++++++++++++--
+ api/tunnel.go  |  9 ++++++++-
+ 2 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/api/standby.go b/api/standby.go
+index c1f41ae..58deb11 100644
+--- a/api/standby.go
++++ b/api/standby.go
+@@ -32,6 +32,26 @@ var errFlowRotate = errors.New("rotating MASQUE flow before it ages out")
+ // this exists to remove, so a rotation is always deferred, never forced.
+ const standbyWaitRetry = 5 * time.Second
+ 
++// standbyDialBackoff bounds how hard fillStandby re-dials when the path is
++// down. It used to retry at ReconnectDelay (1s) forever, logging each failure:
++// on a flaky path that is a 1Hz TLS-handshake loop inside an iOS packet-tunnel
++// extension that is jetsammed past 50MB, and every one of those log lines is a
++// synchronous journal append. Back off to a half-minute instead.
++var standbyDialBackoff = []time.Duration{
++	1 * time.Second, 2 * time.Second, 5 * time.Second,
++	10 * time.Second, 20 * time.Second, 30 * time.Second,
++}
++
++// minCycleInterval is the floor under one promote/dial cycle in MaintainTunnel.
++//
++// Promoting a warm standby deliberately skips the reconnect delay - spending it
++// would cost the very gap the standby was paid for. But skipping it outright
++// left session churn with no rate limit at all, so a path that flaps turns into
++// a promote/dial spin that burns CPU and battery and hammers the endpoint. A
++// promotion is still effectively instant; it just cannot repeat faster than
++// this.
++const minCycleInterval = 500 * time.Millisecond
++
+ // tunnelSession owns the three handles that make up one MASQUE session.
+ // Grouping them keeps a promoted standby impossible to half-close: the
+ // relay-era bug (a retired adapter arming a second tunnel) came from exactly
+@@ -91,6 +111,7 @@ func dialSession(ctx context.Context, cfg MaintainTunnelConfig) (*tunnelSession,
+ // session waiting, a false positive costs a promotion instead, so detection
+ // can be aggressive.
+ func fillStandby(ctx context.Context, cfg MaintainTunnelConfig, ch chan *tunnelSession) {
++	fails := 0
+ 	for {
+ 		if ctx.Err() != nil {
+ 			return
+@@ -108,12 +129,19 @@ func fillStandby(ctx context.Context, cfg MaintainTunnelConfig, ch chan *tunnelS
+ 			if ctx.Err() != nil {
+ 				return
+ 			}
+-			log.Printf("Standby dial failed: %v", err)
+-			if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
++			wait := standbyDialBackoff[min(fails, len(standbyDialBackoff)-1)]
++			// Once per backoff step, not once per second: a down path used to
++			// fill the journal faster than anything else in the tunnel.
++			if fails == 0 || wait != standbyDialBackoff[min(fails-1, len(standbyDialBackoff)-1)] {
++				log.Printf("Standby dial failed: %v (retrying in %s)", err, wait)
++			}
++			fails++
++			if sleepErr := sleepCtx(ctx, wait); sleepErr != nil {
+ 				return
+ 			}
+ 			continue
+ 		}
++		fails = 0
+ 
+ 		select {
+ 		case ch <- sess:
+diff --git a/api/tunnel.go b/api/tunnel.go
+index ba3c551..5b5c9e1 100644
+--- a/api/tunnel.go
++++ b/api/tunnel.go
+@@ -263,6 +263,7 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 		if ctx.Err() != nil {
+ 			return
+ 		}
++		cycleStart := time.Now()
+ 
+ 		// A warm session means there is nothing to wait for: promoting it is
+ 		// the whole point, and the idle wait below would park us in a
+@@ -449,8 +450,14 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 
+ 		// A warm standby is the whole reason a kill can be invisible: waiting
+ 		// out the reconnect delay before promoting it would spend the gap we
+-		// just paid to avoid.
++		// just paid to avoid. Only the full delay is skipped, not every brake -
++		// see minCycleInterval.
+ 		if len(standbyCh) > 0 {
++			if rest := minCycleInterval - time.Since(cycleStart); rest > 0 {
++				if sleepErr := sleepCtx(ctx, rest); sleepErr != nil {
++					return
++				}
++			}
+ 			continue
+ 		}
+ 		if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
+-- 
+2.50.1 (Apple Git-155)
+

@@ -17,7 +17,8 @@ git -C "$WORK" fetch -q --depth 1 origin "$(cat "$HERE/BASE_COMMIT")"
 git -C "$WORK" checkout -q FETCH_HEAD
 git -C "$WORK" -c user.name=ci -c user.email=ci@localhost am -q \
   "$HERE/masque-keepalive.patch" "$HERE/masque-handshake-timeout.patch" "$HERE/masque-closed-pipe.patch" \
-    "$HERE/flow-standby-rotation.patch" "$HERE/darwin-tun-framing.patch"
+    "$HERE/flow-standby-rotation.patch" "$HERE/darwin-tun-framing.patch" \
+    "$HERE/standby-backoff.patch"
 
 for ARCH in arm64 amd64; do
   (cd "$WORK" && CGO_ENABLED=0 GOOS=darwin GOARCH=$ARCH go build -trimpath -ldflags "-s -w" -o "usque-$ARCH" .)

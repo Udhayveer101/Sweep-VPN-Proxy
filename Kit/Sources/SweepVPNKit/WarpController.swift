@@ -30,10 +30,15 @@ public final class WarpController: @unchecked Sendable {
     private let lock = NSLock()
     private var onState: (@Sendable (State) -> Void)?
     private var stallTimer: DispatchSourceTimer?
-    private var failureTimes: [Date] = []
+    private var recoveryTimer: DispatchSourceTimer?
     private var lastRestart: Date = .distantPast
     private var restarting = false
     private var stopped = false
+    private var restartStreak = StartBackoff()
+    /// Partial line left over from the last `availableData` chunk. Without it a
+    /// log line split across a read boundary is classified as two fragments and
+    /// the event in it — a loss, a reconnect — is simply never seen.
+    private var logTail = ""
     private(set) public var state: State = .stopped {
         didSet { if state != oldValue { onState?(state) } }
     }
@@ -161,6 +166,9 @@ public final class WarpController: @unchecked Sendable {
         stopped = true
         stallTimer?.cancel()
         stallTimer = nil
+        recoveryTimer?.cancel()
+        recoveryTimer = nil
+        logTail = ""
         lock.unlock()
         p?.terminate()
         if p != nil { record(.info, "stopped", "asked to stop") }
@@ -184,57 +192,115 @@ public final class WarpController: @unchecked Sendable {
     }
 
     /// Lines from usque 2026-09 (see WarpControllerTests for real samples).
+    ///
+    /// `availableData` splits wherever the pipe buffer happened to end, not on
+    /// newlines, so the trailing fragment is held back and prepended to the next
+    /// chunk instead of being classified as a line of its own.
     func ingest(log text: String) {
-        for raw in text.split(whereSeparator: \.isNewline) {
-            let line = String(raw)
+        lock.lock()
+        let buffered = logTail + text
+        var lines = buffered.components(separatedBy: .newlines)
+        logTail = buffered.hasSuffix("\n") ? "" : (lines.popLast() ?? "")
+        lock.unlock()
+
+        for line in lines where !line.isEmpty {
             switch Self.classify(line) {
             case .listening:
-                stallTimer?.cancel()
-                stallTimer = nil
+                lock.lock(); stallTimer?.cancel(); stallTimer = nil; lock.unlock()
                 state = .running
                 record(.info, "listening", line)
             case .connected:
+                // usque rebuilt the session by itself: whatever we were waiting
+                // on healed, so stand the wedge deadline down.
+                noteRecovered()
                 record(.info, "connected", line)
-            // A loss line only counted when it named a failure, as before .lost existed.
-            case .error, .lost where line.lowercased().contains("failed") || line.lowercased().contains("error"):
+            // A loss is usque telling us it is already reconnecting, not a fault
+            // to act on. Both it and an outright error only start the clock; the
+            // wedge is the clock running out, handled in armRecoveryDeadline.
+            case .lost:
+                record(.info, "lost", line)
+                armRecoveryDeadline(line)
+            case .error:
                 record(.warn, "log", line)
-                if noteFailure(line) { restartWedgedTunnel(line) }
-            case .lost, nil:
+                armRecoveryDeadline(line)
+            case nil:
                 break
             }
         }
     }
 
-    /// usque only tears the session down when a write fails with a connect-ip
-    /// CloseError (api/tunnel.go). A MASQUE session whose HTTP/2 pipe has been
-    /// closed underneath it fails with `io: read/write on closed pipe` instead,
-    /// which it logs as "continuing..." forever while the read pump stays parked
-    /// — so it reports Connected while nothing flows and never reconnects. Seen
-    /// 2026-09-13: a minute of traffic, then every lookup timing out for good.
-    /// We supervise the process, so we are the ones who can end that: a write
-    /// failure is acted on at once, and a burst of dial failures counts as the
-    /// same wedge in case the write pump stays quiet.
-    static let wedgeWindow: TimeInterval = 10
-    static let wedgeBurst = 4
+    /// usque heals its own session losses: `masque-closed-pipe.patch` ends a
+    /// session whose HTTP/2 pipe died under a write, and `--always-reconnect`
+    /// rebuilds it in about a second.
+    ///
+    /// Until now this supervisor relaunched the whole child process on the very
+    /// first write error, so that cheap in-process reconnect was pre-empted by a
+    /// cold restart — terminate, wait, reload the config, redo the TLS handshake,
+    /// open a new listener — and for all of it the SOCKS port was *gone*, so
+    /// every app connection failed outright. On a path that sweeps long-lived
+    /// flows every 1-4 minutes that fired every 1-4 minutes. It is the regression
+    /// testers felt from v1.3.0 (see docs/research-warp-stability-2026-09.md).
+    ///
+    /// So the supervisor now only acts when usque has *failed* to heal. A failure
+    /// arms a deadline; a "Connected to MASQUE server" line disarms it; only an
+    /// expired deadline is a wedge. That still catches the 2026-09-13 case — a
+    /// pipe closed underneath a parked read pump, where usque logs
+    /// "continuing..." forever and never reconnects — because in that case the
+    /// reconnect line never comes.
+    static let recoveryGrace: TimeInterval = 15
     static let restartFloor: TimeInterval = 20
 
-    /// `true` when this error line means the tunnel is wedged and the child
-    /// should be relaunched. Bookkeeping only — the process work is separate so
-    /// this stays testable. `now` is injectable for the same reason.
+    /// Start the clock on a failure line. Returns `true` if this call armed the
+    /// deadline (bookkeeping only, so it stays testable); `now` is injectable
+    /// for the same reason.
+    @discardableResult
     func noteFailure(_ line: String, now: Date = Date()) -> Bool {
-        let writeFailed = line.contains("closed pipe")
-            || line.contains("Error writing to IP connection")
         lock.lock()
-        defer { lock.unlock() }
-        failureTimes.append(now)
-        failureTimes.removeAll { now.timeIntervalSince($0) > Self.wedgeWindow }
-        let wedged = writeFailed || failureTimes.count >= Self.wedgeBurst
-        guard wedged, !restarting, process != nil,
-              now.timeIntervalSince(lastRestart) >= Self.restartFloor else { return false }
-        lastRestart = now
-        failureTimes.removeAll()
-        restarting = true
+        guard !restarting, process != nil, recoveryTimer == nil,
+              now.timeIntervalSince(lastRestart) >= Self.restartFloor else {
+            lock.unlock(); return false
+        }
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now() + Self.recoveryGrace)
+        timer.setEventHandler { [weak self] in self?.recoveryDeadlineExpired(line) }
+        recoveryTimer = timer
+        lock.unlock()
+        timer.resume()
         return true
+    }
+
+    /// usque reconnected on its own — the common case, and the one that must
+    /// cost nothing.
+    func noteRecovered() {
+        lock.lock()
+        let timer = recoveryTimer
+        recoveryTimer = nil
+        restartStreak = restartStreak.recordingSuccess()
+        lock.unlock()
+        timer?.cancel()
+    }
+
+    /// `true` when a failure is currently being waited on. Tests read it.
+    var isAwaitingRecovery: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return recoveryTimer != nil
+    }
+
+    private func armRecoveryDeadline(_ line: String) {
+        guard noteFailure(line) else { return }
+        record(.info, "watching", "no reconnect within \(Int(Self.recoveryGrace))s is a wedge")
+    }
+
+    private func recoveryDeadlineExpired(_ line: String) {
+        lock.lock()
+        recoveryTimer = nil
+        guard !restarting, process != nil, !stopped else { lock.unlock(); return }
+        restarting = true
+        lastRestart = Date()
+        restartStreak = restartStreak.recordingFailure()
+        let delay = restartStreak.delay()
+        lock.unlock()
+        restartWedgedTunnel(line, after: delay)
     }
 
     /// Tests need a controller that believes a child is running without one —
@@ -245,9 +311,15 @@ public final class WarpController: @unchecked Sendable {
         restarting = false
     }
 
-    private func restartWedgedTunnel(_ line: String) {
-        record(.warn, "restarting", "tunnel wedged: \(line)")
-        DispatchQueue.global().async { [self] in
+    /// Relaunch, after `delay`. usque failing to reconnect usually means the
+    /// path is down, not that the child is sick, so repeated restarts back off
+    /// (StartBackoff: 0, 2, 5, 15, 30, 60, 120s) rather than respawning every
+    /// 20 seconds forever.
+    private func restartWedgedTunnel(_ line: String, after delay: TimeInterval = 0) {
+        record(.warn, "restarting",
+               "no reconnect within \(Int(Self.recoveryGrace))s after: \(line)"
+               + (delay > 0 ? " (waiting \(Int(delay))s)" : ""))
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [self] in
             lock.lock()
             let doomed = process
             process = nil

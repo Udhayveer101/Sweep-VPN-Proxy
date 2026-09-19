@@ -116,8 +116,14 @@ public final class WarpController: @unchecked Sendable {
         case .disconnected:
             connection.fetchLastDisconnectError { [weak self] error in
                 // A user-initiated stop carries no error.
-                if let error { self?.onState?(.failed(Self.describe(error))) }
-                else { self?.onState?(.stopped) }
+                guard let error else { return self?.onState?(.stopped) ?? () }
+                // The single most useful disconnect field iOS exposes, and until
+                // now it only ever reached the UI — so the journal the user sends
+                // us after a drop never said why the tunnel went away.
+                let ns = error as NSError
+                EventLog.shared.record(phase: "warp", level: .error, kind: "disconnected",
+                                       detail: "\(ns.domain) \(ns.code): \(ns.localizedDescription)")
+                self?.onState?(.failed(Self.describe(error)))
             }
         @unknown default: onState?(.stopped)
         }

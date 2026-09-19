@@ -66,10 +66,25 @@ public final class EventLog: @unchecked Sendable {
     private static let maxBytes = 4 * 1024 * 1024
     private static let trimTo = 2 * 1024 * 1024
 
+    /// How often the journal may be measured for trimming. Every append used to
+    /// stat the file, and past the cap every append read the whole 4MB in and
+    /// wrote 2MB back — inside an iOS packet-tunnel extension with a 32MB Go
+    /// memory limit and a 50MB jetsam ceiling. Under a reconnect storm that was
+    /// the most expensive thing the tunnel did.
+    private static let trimCheckInterval: TimeInterval = 60
+
     private let lock = NSLock()
     private let directory: URL?
     private let runKeyStore: UserDefaults?
     private let processName: String
+    /// Appends happen here, not on the caller's thread. usque's logging
+    /// goroutine and the extension's start path both call `record` directly;
+    /// neither should ever wait on the filesystem.
+    private let writeQueue = DispatchQueue(label: "sweep.eventlog", qos: .utility)
+    private var lastTrimCheck: Date = .distantPast
+    /// Reported once rather than every line, so a broken journal is visible in
+    /// the console without becoming its own storm.
+    private var reportedWriteFailure = false
 
     public var fileURL: URL? { directory?.appendingPathComponent("events.jsonl") }
 
@@ -124,8 +139,13 @@ public final class EventLog: @unchecked Sendable {
         let entry = LogEntry(process: processName, phase: phase, level: level,
                              kind: kind, detail: detail, elapsedMs: elapsed,
                              run: currentRun)
-        append(entry)
+        writeQueue.async { [self] in append(entry) }
     }
+
+    /// Waits for every queued line to reach the file. Readers call this first,
+    /// so the Connection Log still shows a line the instant it is recorded even
+    /// though the write itself is off the hot path.
+    public func flush() { writeQueue.sync {} }
 
     private func append(_ entry: LogEntry) {
         guard let url = fileURL,
@@ -136,25 +156,49 @@ public final class EventLog: @unchecked Sendable {
         if !fm.fileExists(atPath: url.path) {
             fm.createFile(atPath: url.path, contents: nil)
         }
-        guard let handle = try? FileHandle(forWritingTo: url) else { return }
-        defer { try? handle.close() }
-        // O_APPEND is what makes this safe against the other process; seeking to
-        // a cached end offset would let two writers land on the same bytes.
-        _ = fcntl(handle.fileDescriptor, F_SETFL, O_APPEND)
-        _ = try? handle.seekToEnd()
-        try? handle.write(contentsOf: data)
+        do {
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            // O_APPEND is what makes this safe against the other process; seeking
+            // to a cached end offset would let two writers land on the same
+            // bytes. It is also why the handle is not cached: a trim in either
+            // process replaces the inode, and a cached descriptor would go on
+            // writing to the file nobody can read any more.
+            guard fcntl(handle.fileDescriptor, F_SETFL, O_APPEND) != -1 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            try handle.write(contentsOf: data)
+            reportedWriteFailure = false
+        } catch {
+            // A diagnostic that fails silently is worse than no diagnostic: the
+            // user sends a journal with the interesting minute simply missing.
+            if !reportedWriteFailure {
+                reportedWriteFailure = true
+                FileHandle.standardError.write(
+                    Data("sweep: event log unwritable at \(url.path): \(error)\n".utf8))
+            }
+            return
+        }
         trimIfNeeded(url)
     }
 
     /// Drops the oldest whole lines once the journal outgrows its cap. Whole
     /// lines, because a half-line is not decodable and would poison the reader.
+    ///
+    /// Measured at most once a `trimCheckInterval`, and it reads only the tail
+    /// it intends to keep rather than the whole file.
     private func trimIfNeeded(_ url: URL) {
+        let now = Date()
+        guard now.timeIntervalSince(lastTrimCheck) >= Self.trimCheckInterval else { return }
+        lastTrimCheck = now
         guard let size = try? FileManager.default
                 .attributesOfItem(atPath: url.path)[.size] as? Int,
               size > Self.maxBytes,
-              let data = try? Data(contentsOf: url) else { return }
-        let keep = data.suffix(Self.trimTo)
-        guard let newlineIndex = keep.firstIndex(of: 0x0A) else { return }
+              let reader = try? FileHandle(forReadingFrom: url) else { return }
+        defer { try? reader.close() }
+        guard (try? reader.seek(toOffset: UInt64(size - Self.trimTo))) != nil,
+              let keep = try? reader.readToEnd(),
+              let newlineIndex = keep.firstIndex(of: 0x0A) else { return }
         try? Data(keep[keep.index(after: newlineIndex)...]).write(to: url, options: .atomic)
     }
 
@@ -164,6 +208,7 @@ public final class EventLog: @unchecked Sendable {
     /// than failing the read — a torn tail must not hide the 2,000 good lines
     /// above it.
     public func entries() -> [LogEntry] {
+        flush()
         guard let url = fileURL, let data = try? Data(contentsOf: url) else { return [] }
         return data.split(separator: 0x0A).compactMap {
             try? JSONDecoder.logDecoder.decode(LogEntry.self, from: Data($0))
@@ -171,6 +216,7 @@ public final class EventLog: @unchecked Sendable {
     }
 
     public func clear() {
+        flush()   // else a line already queued lands after the truncate
         lock.lock(); defer { lock.unlock() }
         guard let url = fileURL else { return }
         try? Data().write(to: url, options: .atomic)
