@@ -81,3 +81,37 @@ blocks UDP. Not available here.
   stalled state, and the stalls are invisible to every reactive mechanism.
   Worth testing with `--hot-standby --flow-ttl 90s` on a normal-mode port.
 - Anything on iOS/iPadOS. Every number here is macOS.
+
+## Head to head: gaming mode's flow rotation
+
+Both tunnels up at once again, 18 minutes each. A ran the gaming-mode recipe
+(`--hot-standby --flow-ttl 90s`), B the shipping flags. 16 rotations happened.
+
+| | A: rotate (90s TTL) | B: no rotation |
+|---|---|---|
+| transfers | 86 ok, 1 failed | 87 ok, 0 failed |
+| median | 23.05 Mbit/s | 22.89 Mbit/s |
+| mean | 22.32 Mbit/s | 23.40 Mbit/s |
+| **p10** | **1.76 Mbit/s** | **19.95 Mbit/s** |
+| longest unbroken | 611s | 654s |
+
+Rotation itself works exactly as designed — retire, promote, new standby warm,
+all inside about two seconds, 16 times with no lost session. The problem is what
+it costs. **The tenth-percentile transfer collapses from 19.95 Mbit/s to
+1.76 Mbit/s.** The median is untouched, which is precisely why this was never
+noticed: on average nothing is wrong, and every so often everything is.
+
+That is the "~1 in 20 new connections stalls in the swap window" the original
+rotation commit admitted, measured. For bulk transfer it averages out. For a
+game it does not average out — a periodic collapse to 1.76 Mbit/s *is* an
+interruption, which is the one thing gaming mode promises not to have.
+
+Note also that B suffered **zero** stalls across the whole 18 minutes. Rotation
+spent a real, repeated cost defending against something that did not happen in
+this window.
+
+**Conclusion: rotation should stay off by default**, which it already is —
+`gameDisguise` defaults to `.standby`. It is the wrong default to reach for when
+someone reports that gaming mode stutters, and the UI should stop implying
+otherwise. Raising the TTL from 45s to 90s halves how often the cost is paid,
+which is worth keeping, but it does not remove it.

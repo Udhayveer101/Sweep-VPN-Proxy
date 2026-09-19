@@ -37,9 +37,18 @@ public final class GameModeController: @unchecked Sendable {
         case rotate
 
         /// The ISP's sweep lands every 1-4 minutes, so 45s retired a healthy
-        /// flow about twice as often as the threat needed — and every rotation
-        /// costs a swap window where a *new* connection can stall. 90s (±20%
-        /// jitter, applied in usque) still rotates well inside the sweep.
+        /// flow about twice as often as the threat needed. 90s (±20% jitter,
+        /// applied in usque) still rotates well inside the sweep.
+        ///
+        /// Rotation stays opt-in, and `.standby` stays the default, because the
+        /// swap window is expensive in a way the median hides. Measured
+        /// 2026-09-20 over 18 minutes and 16 rotations (see
+        /// docs/measurements-2026-09-20.md): median throughput was unchanged at
+        /// 23 Mbit/s, but the tenth-percentile transfer fell from 19.95 Mbit/s
+        /// to 1.76 Mbit/s. For a download that averages out. For a game it does
+        /// not — a periodic collapse to 1.76 Mbit/s is exactly the interruption
+        /// this mode exists to avoid. Do not reach for rotation when someone
+        /// reports stutter; it is the cause, not the cure.
         var flowTTL: String { self == .rotate ? "90s" : "0" }
 
         public var title: String {
