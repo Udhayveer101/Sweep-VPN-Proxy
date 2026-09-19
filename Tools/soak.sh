@@ -34,20 +34,26 @@ SAMPLES="$OUT/samples.tsv"
 ok=0; fail=0; longest=0; streak=0
 
 while [ "$(date +%s)" -lt "$END" ]; do
-  t0=$(date +%s)
+  # curl's own timing, not `date +%s`. Whole-second arithmetic quantised a
+  # 10MB transfer to 3s or 4s and nothing between, so two runs that differed by
+  # well under a second read as "28 Mbit/s vs 21 Mbit/s" — a measurement
+  # artefact that looked exactly like a regression. speed_download is bytes/s
+  # measured by curl over the transfer itself.
+  #
   # --max-time bounds a stall so one hang does not eat the whole window; the
   # failure itself is the datum we are here for.
-  bytes=$(curl -sS --socks5-hostname "$PROXY" --max-time 60 -o /dev/null \
-                -w '%{size_download}' "$URL" 2>"$OUT/last.err")
+  read -r bytes speed secs <<<"$(curl -sS --socks5-hostname "$PROXY" --max-time 60 -o /dev/null \
+                -w '%{size_download} %{speed_download} %{time_total}' "$URL" 2>"$OUT/last.err")"
   rc=$?
-  t1=$(date +%s); dt=$(( t1 - t0 )); [ "$dt" -eq 0 ] && dt=1
+  t1=$(date +%s)
+  dt=$(printf '%.0f' "${secs:-1}"); [ "$dt" -lt 1 ] && dt=1
 
   if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 0 ]; then
-    mbps=$(echo "scale=2; $bytes * 8 / $dt / 1000000" | bc)
-    printf '%s\tok\t%s\t%s\n' "$t1" "$mbps" "$dt" >> "$SAMPLES"
+    mbps=$(echo "scale=2; $speed * 8 / 1000000" | bc)
+    printf '%s\tok\t%s\t%s\n' "$t1" "$mbps" "${secs:-0}" >> "$SAMPLES"
     ok=$(( ok + 1 )); streak=$(( streak + dt ))
     [ "$streak" -gt "$longest" ] && longest=$streak
-    printf '  %s  %6s Mbit/s\n' "$(date +%H:%M:%S)" "$mbps"
+    printf '  %s  %7s Mbit/s  (%ss)\n' "$(date +%H:%M:%S)" "$mbps" "${secs:-?}"
   else
     printf '%s\tfail\t0\t%s\t%s\n' "$t1" "$dt" "$(tr -d '\n' < "$OUT/last.err" | cut -c1-120)" >> "$SAMPLES"
     fail=$(( fail + 1 )); streak=0
