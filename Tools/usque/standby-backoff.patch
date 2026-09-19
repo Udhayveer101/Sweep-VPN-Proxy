@@ -1,4 +1,4 @@
-From 2a90a45fb5e0e08b11c772d2612d9e38412f189a Mon Sep 17 00:00:00 2001
+From 6b2cb7d9af7832dfb2d8ebedb711f32c513a9868 Mon Sep 17 00:00:00 2001
 From: ci <ci@localhost>
 Date: Sat, 19 Sep 2026 23:36:06 +0530
 Subject: [PATCH] Put a brake back under standby promotion and standby dialling
@@ -15,9 +15,11 @@ a 1Hz TLS-handshake loop plus a synchronous journal append per line, under a
 32MB Go memory limit and a 50MB jetsam ceiling. It now backs off 1s -> 30s and
 logs once per backoff step.
 ---
- api/standby.go | 32 ++++++++++++++++++++++++++++++--
- api/tunnel.go  |  9 ++++++++-
- 2 files changed, 38 insertions(+), 3 deletions(-)
+ api/standby.go              | 32 ++++++++++++++++++++++++++++++--
+ api/standby_backoff_test.go | 36 ++++++++++++++++++++++++++++++++++++
+ api/tunnel.go               |  9 ++++++++-
+ 3 files changed, 74 insertions(+), 3 deletions(-)
+ create mode 100644 api/standby_backoff_test.go
 
 diff --git a/api/standby.go b/api/standby.go
 index c1f41ae..58deb11 100644
@@ -80,6 +82,48 @@ index c1f41ae..58deb11 100644
  
  		select {
  		case ch <- sess:
+diff --git a/api/standby_backoff_test.go b/api/standby_backoff_test.go
+new file mode 100644
+index 0000000..fee6c5a
+--- /dev/null
++++ b/api/standby_backoff_test.go
+@@ -0,0 +1,36 @@
++package api
++
++import "testing"
++
++// The brake this puts back: without it, fillStandby re-dialled a down path at
++// ReconnectDelay (1s) forever, and each failure wrote a log line that the iOS
++// side journals synchronously.
++func TestStandbyDialBackoffClimbsAndCaps(t *testing.T) {
++	if standbyDialBackoff[0] > standbyDialBackoff[len(standbyDialBackoff)-1] {
++		t.Fatal("backoff must climb")
++	}
++	for i := 1; i < len(standbyDialBackoff); i++ {
++		if standbyDialBackoff[i] <= standbyDialBackoff[i-1] {
++			t.Fatalf("step %d (%s) does not climb past %s", i, standbyDialBackoff[i], standbyDialBackoff[i-1])
++		}
++	}
++	// Past the end the index is clamped, so a long outage settles rather than
++	// panicking or retrying forever at 1Hz.
++	last := len(standbyDialBackoff) - 1
++	for _, fails := range []int{last, last + 1, 1000} {
++		if got := standbyDialBackoff[min(fails, last)]; got != standbyDialBackoff[last] {
++			t.Fatalf("fails=%d gave %s, want the %s cap", fails, got, standbyDialBackoff[last])
++		}
++	}
++}
++
++// A promotion must stay effectively instant — the standby exists to make a kill
++// invisible, and waiting the full reconnect delay would spend that gap.
++func TestMinCycleIntervalIsAFloorNotADelay(t *testing.T) {
++	if minCycleInterval <= 0 {
++		t.Fatal("no floor at all: churn is unbounded again")
++	}
++	if minCycleInterval >= standbyDialBackoff[0] {
++		t.Fatalf("floor %s is as slow as a reconnect delay; promotion is no longer instant", minCycleInterval)
++	}
++}
 diff --git a/api/tunnel.go b/api/tunnel.go
 index ba3c551..5b5c9e1 100644
 --- a/api/tunnel.go

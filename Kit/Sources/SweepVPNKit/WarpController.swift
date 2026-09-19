@@ -53,7 +53,7 @@ public final class WarpController: @unchecked Sendable {
     /// registration may still sit in the old container; prefer it rather than
     /// making the user register again.
     public static var defaultDirectory: URL {
-        let plain = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let plain = SupportDirectory.base
             .appendingPathComponent("SweepVPN/warp", isDirectory: true)
         if FileManager.default.fileExists(atPath: plain.appendingPathComponent("config.json").path) {
             return plain

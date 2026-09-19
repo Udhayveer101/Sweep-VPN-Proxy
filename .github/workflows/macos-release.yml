@@ -44,10 +44,7 @@ jobs:
           go-version: "1.26.x"
 
       - name: Tools
-        run: |
-          brew install xcodegen tor
-          # Tor's pluggable transports are optional; the bundler warns if absent.
-          brew install obfs4proxy snowflake || true
+        run: brew install xcodegen
 
       - name: Import Developer ID certificate
         env:

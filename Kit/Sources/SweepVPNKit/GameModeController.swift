@@ -97,7 +97,7 @@ public final class GameModeController: @unchecked Sendable {
     /// could not read the registration and the script could not write its own
     /// log - so a failed run left an empty log and no way to see why.
     public static var defaultWorkDir: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        SupportDirectory.base
             .appendingPathComponent("SweepVPN/gamemode", isDirectory: true)
     }
 
@@ -156,7 +156,26 @@ public final class GameModeController: @unchecked Sendable {
             .map { "'" + $0.replacingOccurrences(of: "'", with: "'\\''") + "'" }
             .joined(separator: " ")
 
+        let scriptArgs = [usque.path, configFile.path, controlFile.path,
+                          logFile.path, sni, disguise.flowTTL]
+
         DispatchQueue.global().async { [self] in
+            // Preferred: the system's own authorization dialog, which offers
+            // Touch ID where the Mac allows it. Anything other than the user
+            // saying no falls through to the AppleScript prompt below, so this
+            // can only improve on the old behaviour, never replace it.
+            switch Elevator.run(tool: script.path, arguments: scriptArgs) {
+            case .launched:
+                record(.info, "elevated", "system authorization")
+                self.armMonitor()
+                return
+            case .cancelled:
+                self.teardown(reason: "Gaming mode needs your permission to change routing.")
+                return
+            case .unavailable(let why):
+                record(.info, "elevateFallback", why)
+            }
+
             let osa = Process()
             osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
             osa.arguments = ["-e",

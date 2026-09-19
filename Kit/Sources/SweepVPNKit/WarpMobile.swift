@@ -26,7 +26,7 @@ public final class WarpController: @unchecked Sendable {
     /// Shared app-group container, so the app registers and the extension reads.
     public static var defaultDirectory: URL {
         let base = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: AppGroupID.resolved)
-            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            ?? SupportDirectory.base
         return base.appendingPathComponent("warp", isDirectory: true)
     }
 

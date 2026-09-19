@@ -137,17 +137,7 @@ public struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
 
-                Section("Tor and proxy") {
-                    Toggle("Tor over VPN", isOn: Binding(
-                        get: { model.options.torEnabled },
-                        set: { model.setTor(enabled: $0) }))
-                    if let progress = model.torProgressText {
-                        Text(progress).font(.footnote).foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                    }
-                    Text("Runs Tor inside Sweep and sends its circuits through the VPN, so the exit relay sees the VPN server rather than your connection. Connect the VPN first — your ISP blocks Tor directly, and with the VPN up it only sees WireGuard traffic. Without the VPN, Sweep still tries bridges, Snowflake and meek in turn, but none of them completed on this network.")
-                        .font(.footnote).foregroundStyle(.secondary)
-
+                Section("Proxy") {
                     Toggle("Route this whole Mac through WARP", isOn: Binding(
                         get: { model.systemProxyEnabled },
                         set: { model.setEverythingThroughWarp($0) }))

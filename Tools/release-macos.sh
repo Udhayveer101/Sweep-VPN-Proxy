@@ -47,7 +47,7 @@ APP="$ARCHIVE/Products/Applications/Sweep VPN.app"
 [ -d "$APP" ] || { echo "archive produced no app" >&2; exit 1; }
 
 Tools/usque/build.sh "$OUT/usque"
-USQUE="$OUT/usque" SIGN_TIMESTAMP=--timestamp Tools/bundle-tor.sh "$APP" "$IDENTITY"
+USQUE="$OUT/usque" SIGN_TIMESTAMP=--timestamp Tools/bundle-warp.sh "$APP" "$IDENTITY"
 
 codesign --verify --deep --strict --verbose=2 "$APP"
 if codesign -d --entitlements - "$APP" 2>/dev/null | grep -q get-task-allow; then

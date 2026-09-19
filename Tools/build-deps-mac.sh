@@ -3,7 +3,7 @@
 # the app's deployment target. Homebrew only bottles for the host OS (Tahoe), so
 # its tor and static libs are stamped minos 26 and dyld refuses them on Sequoia.
 #
-# Output: build/deps/{bin,lib,include}. bundle-tor.sh and sweepovpn/package.sh
+# Output: build/deps/{bin,lib,include}. bundle-warp.sh and sweepovpn/package.sh
 # use it when it exists (TOR_PREFIX / BREW_PREFIX).
 set -euo pipefail
 cd "$(dirname "$0")/.."

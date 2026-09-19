@@ -275,19 +275,27 @@ func SweepWarpStop() {
 // with a 4-byte address-family header.
 type utun struct {
 	fd int
-	// usque's per-cycle read lock does not span reconnects, so a reader from
-	// the previous session can still be parked in read(2) when the next one
-	// starts. Both share rbuf.
-	rmu   sync.Mutex
-	rbuf  [4 + 65535]byte
+	// One scratch buffer per read, from a pool, rather than one shared buffer
+	// under a mutex. usque's per-cycle read lock does not span reconnects, so a
+	// reader from the previous session can still be parked in read(2) when the
+	// next one starts — with a shared buffer that had to be serialized, which
+	// made every packet on the device wait behind a reader that was blocked in
+	// poll(2). read(2) on a utun returns whole packets, so concurrent readers
+	// with their own buffers need no lock at all.
+	rpool sync.Pool
 	wpool sync.Pool
 }
 
 func (t *utun) ReadPacket(buf []byte) (int, error) {
-	t.rmu.Lock()
-	defer t.rmu.Unlock()
+	rp, _ := t.rpool.Get().(*[]byte)
+	if rp == nil {
+		b := make([]byte, 4+65535)
+		rp = &b
+	}
+	defer t.rpool.Put(rp)
+	rbuf := *rp
 	for {
-		n, err := unix.Read(t.fd, t.rbuf[:])
+		n, err := unix.Read(t.fd, rbuf)
 		if err != nil {
 			if err == unix.EINTR {
 				continue
@@ -311,13 +319,13 @@ func (t *utun) ReadPacket(buf []byte) (int, error) {
 		// The extension still claims the v6 default route so nothing leaks
 		// around the tunnel; dropping it here keeps it out of the session and
 		// apps fall back to IPv4.
-		if t.rbuf[4]>>4 != 4 {
+		if rbuf[4]>>4 != 4 {
 			continue
 		}
 		if n-4 > len(buf) {
 			continue // larger than the tunnel MTU we configured; cannot carry it
 		}
-		return copy(buf, t.rbuf[4:n]), nil
+		return copy(buf, rbuf[4:n]), nil
 	}
 }
 

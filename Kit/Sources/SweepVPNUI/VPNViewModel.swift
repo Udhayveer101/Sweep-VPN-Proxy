@@ -118,21 +118,9 @@ public final class VPNViewModel: ObservableObject {
     #endif
 
     #if os(macOS)
-    @Published public private(set) var torState: TorController.State = .stopped
     @Published public private(set) var proxyState: LocalProxy.State = .stopped
-    private var tor: TorController?
     private var proxy: LocalProxy?
 
-    /// Tor bootstrap is a foreground concern: on a network that blocks Tor it can
-    /// sit at 14% indefinitely, and a spinner with no number reads as a hang.
-    public var torProgressText: String? {
-        switch torState {
-        case .stopped: return nil
-        case .starting(let pct, let summary): return "Tor \(pct)% — \(summary)"
-        case .running: return "Tor ready on 127.0.0.1:\(tor?.socksPort ?? 9150)"
-        case .failed(let why): return why
-        }
-    }
 
     @Published public internal(set) var warpState: WarpController.State = .stopped
     private var warp: WarpController?
@@ -289,7 +277,7 @@ public final class VPNViewModel: ObservableObject {
 
     /// Gaming mode routes the entire Mac at the IP layer, so it cannot coexist
     /// with the proxy modes that claim the same traffic: turning it on takes
-    /// the system proxy, WARP and Tor down first, and turning it off leaves
+    /// the system proxy and WARP down first, and turning it off leaves
     /// them off rather than silently restoring a state the user did not pick.
     public func setGameMode(enabled: Bool) {
         guard enabled else {
@@ -303,7 +291,6 @@ public final class VPNViewModel: ObservableObject {
         applySystemProxy(false)
         setLocalProxy(enabled: false)
         if options.warpEnabled { setWarp(enabled: false) }
-        if options.torEnabled { setTor(enabled: false) }
 
         guard let controller = GameModeController.bundled() else {
             gameState = .failed("This build has no bundled usque. Build it and run `make bundle-tor`.")
@@ -323,10 +310,8 @@ public final class VPNViewModel: ObservableObject {
         setGameMode(enabled: false)
     }
 
-    /// WARP and Tor both want to be the proxy's SOCKS upstream; only one can be.
     public func setWarp(enabled: Bool) {
         if enabled, game != nil { setGameMode(enabled: false) }
-        if enabled, options.torEnabled { setTor(enabled: false) }
         var o = options
         o.warpEnabled = enabled
         apply(options: o)
@@ -349,32 +334,6 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
-    public func setTor(enabled: Bool) {
-        if enabled, options.warpEnabled { setWarp(enabled: false) }
-        var o = options
-        o.torEnabled = enabled
-        apply(options: o)
-        guard enabled else {
-            tor?.stop()
-            tor = nil
-            torState = .stopped
-            syncProxyUpstream()
-            return
-        }
-        guard let controller = TorController() else {
-            torState = .failed("This build has no bundled Tor. Run `make bundle-tor`.")
-            return
-        }
-        tor = controller
-        controller.start(userBridges: options.torBridges) { [weak self] st in
-            Task { @MainActor in
-                self?.torState = st
-                // The proxy's upstream depends on whether Tor is actually ready;
-                // pointing at a half-bootstrapped Tor would fail every connection.
-                self?.syncProxyUpstream()
-            }
-        }
-    }
 
     public func setLocalProxy(enabled: Bool) {
         var o = options
@@ -405,7 +364,7 @@ public final class VPNViewModel: ObservableObject {
     public var proxyUpstreamLabel: String {
         switch currentUpstream() {
         case .direct: return "VPN"
-        case .socks5: return options.warpEnabled ? "WARP" : "Tor"
+        case .socks5: return "WARP"
         case .worker: return "Worker"
         }
     }
@@ -425,9 +384,6 @@ public final class VPNViewModel: ObservableObject {
         // out to the ISP — a leak, and the harder kind to notice because it works.
         if options.warpEnabled {
             return .socks5(host: "127.0.0.1", port: options.warpSocksPort)
-        }
-        if options.torEnabled, torState == .running, let port = tor?.socksPort {
-            return .socks5(host: "127.0.0.1", port: port)
         }
         if options.proxyThroughWorker {
             let settings = RelayTunnelSettings.load(appGroup: appGroup)
@@ -631,6 +587,11 @@ public final class VPNViewModel: ObservableObject {
             }
         }
         #endif
+        // Proxy-only builds ship no packet-tunnel extension, so every one of
+        // these IPC calls fails — forever, every 5 seconds, silently. The iOS
+        // app guards this already (Apps/iOS/SweepVPNApp.swift); the guard was
+        // simply missing here.
+        guard !proxyOnly else { return }
         // Status is event-driven off NEVPNStatusDidChange; the timer is only a
         // slow safety net so we never poll hard in the background.
         // Scope the observation to *our* connection. With `object: nil` every VPN
@@ -654,7 +615,13 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
-    public func onDisappear() { pollTask?.cancel(); pollTask = nil; stopWatchingLog() }
+    public func onDisappear() {
+        pollTask?.cancel(); pollTask = nil
+        #if os(macOS)
+        updateTimer?.invalidate(); updateTimer = nil   // it repeated for the life of the process
+        #endif
+        stopWatchingLog()
+    }
 
     /// Follows the journal while the log screen is open. One second, because the
     /// thing being watched is a connect that can stall for tens of seconds and

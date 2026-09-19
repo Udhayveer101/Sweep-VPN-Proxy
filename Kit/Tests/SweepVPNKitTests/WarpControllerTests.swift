@@ -115,7 +115,6 @@ final class WarpUpstreamTests: XCTestCase {
     func testRunningWarpIsTheUpstream() {
         let m = makeModel()
         m.options.warpEnabled = true
-        m.options.torEnabled = true          // WARP wins even if both flags leak through
         m.warpState = .running
         XCTAssertEqual(m.currentUpstream(), .socks5(host: "127.0.0.1", port: 1081))
         XCTAssertEqual(m.proxyUpstreamLabel, "WARP")
@@ -135,21 +134,6 @@ final class WarpUpstreamTests: XCTestCase {
         }
     }
 
-    func testEnablingTorTurnsWarpOff() {
-        let m = makeModel()
-        m.options.warpEnabled = true
-        m.setTor(enabled: true)
-        XCTAssertFalse(m.options.warpEnabled)
-        m.setTor(enabled: false)
-    }
 
-    func testEnablingWarpTurnsTorOff() {
-        let m = makeModel()
-        m.options.torEnabled = true
-        m.setWarp(enabled: true)
-        XCTAssertFalse(m.options.torEnabled)
-        XCTAssertTrue(m.options.warpEnabled)
-        m.setWarp(enabled: false)
-    }
 }
 #endif

@@ -45,8 +45,6 @@ public struct SecurityPolicyOptions: Sendable, Equatable, Codable {
 
     /// Route app traffic through Tor *on top of* the tunnel. Tor runs in the app,
     /// not the extension, so its circuits are built through the VPN — which is
-    /// what makes the ordering "Tor over VPN" rather than "Tor beside VPN".
-    public var torEnabled: Bool = false
     /// Bridge lines from https://bridges.torproject.org. Only needed when the
     /// network blocks Tor and the VPN is not carrying it; empty means direct.
     public var torBridges: [String] = []
