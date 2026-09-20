@@ -90,12 +90,17 @@ func (w *Warp) Args() []string {
 	// MASQUE session hands out a different public address, so a reconnect
 	// changes the player's IP mid-game and the game server drops them
 	// (measured 2026-09-18 - v4 held one address across every rotation).
-	// --hot-standby keeps a warm session so a killed flow is replaced by a
-	// promotion rather than a rebuild.
+	// --hot-standby goes with rotation and nothing else. A parked standby is
+	// swept in the same sweep as the live flow at whatever age it has reached,
+	// so as kill recovery it hands the tunnel a corpse and costs a wasted
+	// promote cycle (~2s) before the dial that works — measured 2026-09-20,
+	// 11 of 26 promotions already dead (docs/measurements-2026-09-20.md).
+	// Rotation is the one case that needs a warm session, because there the
+	// promotion is planned rather than a response to a kill.
 	args := append([]string{"-c", w.Config, "nativetun"}, common...)
-	args = append(args, "-S", "--hot-standby")
+	args = append(args, "-S")
 	if w.FlowTTL != "" && w.FlowTTL != "0" {
-		args = append(args, "--flow-ttl", w.FlowTTL)
+		args = append(args, "--hot-standby", "--flow-ttl", w.FlowTTL)
 	}
 	return args
 }

@@ -133,7 +133,7 @@ public struct SettingsView: View {
                             }
                         }
                         .disabled(model.gameState != .stopped)
-                    Text("Routes the whole Mac, games included, through WARP at the packet level, so traffic games send over UDP is carried too — the proxy modes above cannot do that. Needs your admin password, and turns the proxy modes off while it runs. Standby keeps a spare tunnel warm so the network's connection drops are invisible, and is the right choice for games. Rotating flows retires each tunnel before the network can drop it, but measured cost is a stall every minute or two — fine for downloads, bad for a game. Change the disguise with gaming mode off.")
+                    Text("Routes the whole Mac, games included, through WARP at the packet level, so traffic games send over UDP is carried too — the proxy modes above cannot do that. Needs your admin password, and turns the proxy modes off while it runs. Reconnecting on drops rebuilds the tunnel each time the network drops it, in about a second, and is the right choice for games. Rotating flows retires each tunnel before the network can drop it, but measured cost is a stall every minute or two — fine for downloads, bad for a game. Change the disguise with gaming mode off.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
 

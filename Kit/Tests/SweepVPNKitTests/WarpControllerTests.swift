@@ -75,6 +75,50 @@ final class WarpControllerTests: XCTestCase {
         XCTAssertFalse(w.isAwaitingRecovery)
     }
 
+    /// The false wedge of 2026-09-20, from the macOS journal.
+    ///
+    /// One SOCKS client asked for a name that does not resolve. The MASQUE
+    /// session was healthy and was never lost, so no "Connected to MASQUE
+    /// server" line could ever follow to stand the deadline down — and 15s
+    /// later the supervisor restarted a working tunnel and took the SOCKS
+    /// listener down with it. A failure that belongs to one client connection
+    /// must never arm a deadline only a session event can disarm.
+    func testAPerConnectionFailureIsNotAWedge() {
+        let w = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),
+                               socksPort: 1081, sni: "example.com", directory: tmpDir())
+        w.pretendRunningForTests()
+        w.ingest(log: "2026/09/20 15:38:19 IST SOCKS TCP handle from 127.0.0.1:63517 failed: dial: lookup wpad.lan. on 1.1.1.1:53: no such host\n")
+        XCTAssertFalse(w.isAwaitingRecovery, "one client's dial failure is not a tunnel fault")
+        w.ingest(log: "2026/09/20 15:38:20 IST SOCKS client 127.0.0.1:63518 failed during negotiation: unexpected EOF\n")
+        w.ingest(log: "2026/09/20 15:38:21 IST socks5: invalid version\n")
+        XCTAssertFalse(w.isAwaitingRecovery)
+        XCTAssertFalse(w.state.isFailed)
+    }
+
+    /// The standby dialer failing says nothing about the live session, and no
+    /// reconnect line follows it either.
+    func testAStandbyDialFailureIsNotAWedge() {
+        let w = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),
+                               socksPort: 1081, sni: "example.com", directory: tmpDir())
+        w.pretendRunningForTests()
+        w.ingest(log: "2026/09/20 IST Standby dial failed: dial tcp 162.159.198.2:443: i/o timeout\n")
+        XCTAssertFalse(w.isAwaitingRecovery)
+    }
+
+    /// Session-level faults must keep arming it — this is the 2026-09-13 wedge,
+    /// where usque logs "continuing..." forever and never reconnects.
+    func testSessionFaultsStillArmTheDeadline() {
+        for line in ["2026/09/13 IST Error writing to IP connection: connect-ip: failed to send datagram capsule: io: read/write on closed pipe, continuing...",
+                     "2026/09/13 IST Error reading from IP connection: io: read/write on closed pipe, continuing...",
+                     "2026/09/11 IST Failed to connect tunnel: context deadline exceeded"] {
+            let w = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),
+                                   socksPort: 1081, sni: "example.com", directory: tmpDir())
+            w.pretendRunningForTests()
+            w.ingest(log: line + "\n")
+            XCTAssertTrue(w.isAwaitingRecovery, "should arm on: \(line)")
+        }
+    }
+
     /// A line split across two pipe reads must still be classified once.
     func testALineSplitAcrossReadsIsStillSeen() {
         let w = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),

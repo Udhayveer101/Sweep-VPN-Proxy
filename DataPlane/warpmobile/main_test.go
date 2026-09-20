@@ -176,3 +176,14 @@ func TestSaveConfigWritesTheGivenConfig(t *testing.T) {
 		t.Fatalf("config holds the private key; mode %v", info.Mode().Perm())
 	}
 }
+
+// A standby is swept along with the live flow, so it is only worth keeping
+// where the promotion is planned. See hotStandby for the measurement.
+func TestStandbyOnlyForRotation(t *testing.T) {
+	if hotStandby(0) {
+		t.Fatal("normal mode must not park a standby: it is swept with the live flow")
+	}
+	if !hotStandby(90) {
+		t.Fatal("rotation needs a warm session to rotate into")
+	}
+}

@@ -199,12 +199,32 @@ func SweepWarpStart(configPath, sni *C.char, tunFd C.int) *C.char {
 // ordinary mode; what they cannot ride out is this network's habit of killing
 // long-lived TCP flows, which stalls the tunnel for seconds. flowTTLSeconds
 // additionally retires each flow before the sweep can reach it - opt-in,
-// because the swap can briefly stall new connections. 0 keeps standby only.
+// because the swap can briefly stall new connections. 0 is then the same as
+// SweepWarpStart: see hotStandby for why a parked standby is not a mitigation.
 //
 //export SweepWarpStartGaming
 func SweepWarpStartGaming(configPath, sni *C.char, tunFd C.int, flowTTLSeconds C.int) *C.char {
 	return cError(start(C.GoString(configPath), C.GoString(sni), int(tunFd), int(flowTTLSeconds)))
 }
+
+// hotStandby reports whether to keep a warm MASQUE session parked.
+//
+// It used to be on in every mode, on the theory that a killed flow becomes a
+// promotion instead of a rebuild. Measured 2026-09-20 on the filtered network,
+// logging the parked session's age at each promotion: the standby is swept in
+// the *same* sweep as the live flow. Live flows died at 23.1s, 28.1s, 33.2s and
+// 55.9s, and the standby promoted after each was 21.8s, 27.9s, 34.0s and 49.7s
+// old and already dead - "Promoted standby MASQUE session" and "Tunnel
+// connection lost" in the same second, twice in a row, which is the churn the
+// iOS journal of 2026-09-20 shows. Only a session dialled after the kill
+// survived. So in kill recovery a standby buys nothing and costs a wasted
+// promote cycle (~2s) ahead of the dial that actually works.
+//
+// It stays on for flow rotation, where the promotion is planned rather than a
+// response to a kill and there has to be a warm session to rotate into. That
+// matches macOS (WarpController passes no --hot-standby; gamemode.sh does) and
+// Windows.
+func hotStandby(flowTTLSeconds int) bool { return flowTTLSeconds > 0 }
 
 func start(path, sni string, fd int, flowTTLSeconds int) error {
 	if fd < 0 {
@@ -242,9 +262,6 @@ func start(path, sni string, fd int, flowTTLSeconds int) error {
 	}
 	ctx, c := context.WithCancel(context.Background())
 	cancel = c
-	// A warm standby costs one idle session and turns a killed flow into a
-	// promotion instead of a rebuild. It is on for every mode: the phone has
-	// the same ISP, and there is no downside to the user.
 	go api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
 		TLSConfig:       tlsConfig,
 		KeepalivePeriod: keepalive,
@@ -254,7 +271,7 @@ func start(path, sni string, fd int, flowTTLSeconds int) error {
 		ReconnectDelay:  reconnectDelay,
 		AlwaysReconnect: true,
 		UseHTTP2:        true,
-		HotStandby:      true,
+		HotStandby:      hotStandby(flowTTLSeconds),
 		FlowTTL:         time.Duration(flowTTLSeconds) * time.Second,
 	})
 	log.Printf("WARP tunnel starting: endpoint %s, SNI %s, flow ttl %ds", endpoint, sni, flowTTLSeconds)

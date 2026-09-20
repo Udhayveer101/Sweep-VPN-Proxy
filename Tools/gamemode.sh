@@ -74,10 +74,14 @@ log "pinned $ENDPOINT_IP via $ORIG_GW"
 # No --dns-timeout or -d here: nativetun moves packets and has no in-process
 # resolver, unlike socks/http-proxy, and usque exits on an unknown flag. DNS is
 # the system's job, which is why we point it at 1.1.1.1 below.
-ARGS=(-c "$CONFIG" nativetun -s "$SNI" --http2 --always-reconnect
-      --hot-standby -k 5s -S)
+# --hot-standby only with rotation. A parked standby is swept in the same sweep
+# as the live flow whatever age it has reached, so as kill recovery it delivers a
+# corpse and costs ~2s before the dial that works (measured 2026-09-20: 11 of 26
+# promotions were already dead — docs/measurements-2026-09-20.md). Rotation is
+# the one case that needs it, because there the promotion is planned.
+ARGS=(-c "$CONFIG" nativetun -s "$SNI" --http2 --always-reconnect -k 5s -S)
 if [ "$ROTATE" != "0" ]; then
-    ARGS+=(--flow-ttl "$ROTATE")
+    ARGS+=(--hot-standby --flow-ttl "$ROTATE")
     log "flow rotation every $ROTATE"
 fi
 

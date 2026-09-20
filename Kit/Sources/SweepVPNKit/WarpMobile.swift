@@ -254,9 +254,10 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
             DispatchQueue.global().asyncAfter(deadline: .now() + Self.startTimeout, execute: deadline)
 
             EventLog.shared.record(phase: "warp", kind: "starting", detail: "sni=\(sni) flowTTL=\(flowTTL)")
-            // The warm standby is on for every start (SweepWarpStartGaming
-            // with ttl 0): the phone sits behind the same ISP, and turning a
-            // killed flow into a promotion has no downside.
+            // SweepWarpStartGaming with ttl 0 is the ordinary tunnel: the warm
+            // standby it used to keep in every mode was swept along with the
+            // live flow, so it delivered a dead session and cost ~2s before the
+            // dial that worked (see hotStandby in warpmobile/main.go).
             if let failure = SweepWarpStartGaming(strdup(configFile.path), strdup(sni), fd, flowTTL) {
                 let message = String(cString: failure)
                 SweepWarpFree(failure)
@@ -321,6 +322,8 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
         case .error:
             EventLog.shared.record(phase: "warp", level: .warn, kind: "log", detail: line)
             lock.lock(); lastError = line; lock.unlock()
+        case .connectionError:
+            EventLog.shared.record(phase: "warp", level: .warn, kind: "clientLog", detail: line)
         case .listening, nil:
             EventLog.shared.record(phase: "warp", kind: "log", detail: line)
         }

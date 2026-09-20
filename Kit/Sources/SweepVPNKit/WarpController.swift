@@ -238,6 +238,9 @@ public final class WarpController: @unchecked Sendable {
             case .error:
                 record(.warn, "log", line)
                 armRecoveryDeadline(line)
+            case .connectionError:
+                // One client's failure. Log it and leave the tunnel alone.
+                record(.warn, "clientLog", line)
             case nil:
                 break
             }
@@ -366,7 +369,36 @@ public final class WarpController: @unchecked Sendable {
 import Foundation
 
 extension WarpController {
-    enum LogEvent: Equatable { case listening, connected, lost, error }
+    enum LogEvent: Equatable {
+        case listening, connected, lost
+        /// The MASQUE session itself is in trouble, so usque owes us a
+        /// reconnect and the wedge deadline means something.
+        case error
+        /// A failure that belongs to one SOCKS client — a dial, a DNS answer, a
+        /// malformed datagram. Worth logging, never worth supervising.
+        case connectionError
+    }
+
+    /// The only failures usque prints that are about the *session*.
+    ///
+    /// 2026-09-20: `SOCKS TCP handle from 127.0.0.1:63517 failed: dial: lookup
+    /// ...: no such host` armed the wedge deadline. That is one client asking
+    /// for a name that does not exist, over a tunnel that was working and was
+    /// never lost — so no "Connected to MASQUE server" line could ever follow
+    /// to disarm it, and 15s later the supervisor restarted a healthy tunnel
+    /// and took the SOCKS listener down with it. Every per-connection failure
+    /// has that shape: nothing reconnects, because nothing was disconnected.
+    ///
+    /// Matching on the session lines by name rather than excluding client lines
+    /// by name is deliberate. usque logs a bare `log.Println(err)` for a bad
+    /// SOCKS datagram (internal/socks5.go), so the text of a client failure is
+    /// not something a deny-list can enumerate.
+    static let sessionFaultPhrases = [
+        "Failed to connect tunnel",          // dial half of MaintainTunnel's loop
+        "Error writing to IP connection",    // the 2026-09-13 wedge: "continuing..." forever
+        "Error reading from IP connection",
+        "Failed to read from TUN device",
+    ]
 
     /// Lines from usque 2026-09 (see WarpControllerTests for real samples).
     /// Shared by the macOS child-process supervisor and the iOS extension.
@@ -374,8 +406,9 @@ extension WarpController {
         if line.contains("SOCKS proxy listening on") { return .listening }
         if line.contains("Connected to MASQUE server") { return .connected }
         if line.contains("Tunnel connection lost") { return .lost }
+        if sessionFaultPhrases.contains(where: line.contains) { return .error }
         let l = line.lowercased()
-        if l.contains("failed") || l.contains("error") { return .error }
+        if l.contains("failed") || l.contains("error") { return .connectionError }
         return nil
     }
 }

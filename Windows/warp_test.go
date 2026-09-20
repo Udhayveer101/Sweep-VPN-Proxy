@@ -137,8 +137,10 @@ func TestGameArgsUseNativeTun(t *testing.T) {
 	if !strings.Contains(args, "-S") {
 		t.Fatalf("gaming mode must keep IPv6 out of the tunnel, got: %s", args)
 	}
-	if !strings.Contains(args, "--hot-standby") {
-		t.Fatalf("gaming mode must keep a warm session, got: %s", args)
+	// A parked standby is swept with the live flow, so it only earns its place
+	// where the promotion is planned (rotation). See Args.
+	if strings.Contains(args, "--hot-standby") {
+		t.Fatalf("a standby without rotation is a corpse waiting to be promoted, got: %s", args)
 	}
 	// Rotation is opt-in: it stalls roughly one new connection in twenty.
 	if strings.Contains(args, "--flow-ttl") {
@@ -156,12 +158,18 @@ func TestGameArgsUseNativeTun(t *testing.T) {
 
 func TestFlowTTLIsOptIn(t *testing.T) {
 	w := &Warp{Config: "c.json", SNI: "example.com", Game: true, FlowTTL: "45s"}
-	if !strings.Contains(strings.Join(w.Args(), " "), "--flow-ttl 45s") {
+	args := strings.Join(w.Args(), " ")
+	if !strings.Contains(args, "--flow-ttl 45s") {
 		t.Fatalf("flow-ttl was not passed through: %v", w.Args())
 	}
+	// Rotation has to rotate *into* something, so this is where a standby belongs.
+	if !strings.Contains(args, "--hot-standby") {
+		t.Fatalf("rotation needs a warm session to rotate into: %s", args)
+	}
 	w.FlowTTL = "0"
-	if strings.Contains(strings.Join(w.Args(), " "), "--flow-ttl") {
-		t.Fatal(`"0" must disable rotation`)
+	args = strings.Join(w.Args(), " ")
+	if strings.Contains(args, "--flow-ttl") || strings.Contains(args, "--hot-standby") {
+		t.Fatalf(`"0" must disable rotation and its standby: %s`, args)
 	}
 }
 

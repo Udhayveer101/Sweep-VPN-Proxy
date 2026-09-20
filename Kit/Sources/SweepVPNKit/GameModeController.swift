@@ -27,11 +27,18 @@ public final class GameModeController: @unchecked Sendable {
     /// How aggressively to hide the ISP's flow kills.
     ///
     /// The network sweeps established TCP flows and tears down every long-lived
-    /// one at once. `standby` keeps a warm session so a kill is replaced by a
-    /// promotion instead of a rebuild. `rotate` additionally retires each flow
-    /// before it is old enough to be swept — measured zero kills over 11
-    /// rotations, but ~1 in 20 new connections stalls in the swap window, so it
-    /// stays opt-in.
+    /// one at once. `standby` used to mean "keep a warm session so a kill is a
+    /// promotion instead of a rebuild", and it turned out to mean nothing: the
+    /// standby is swept in the same sweep as the live flow, at whatever age it
+    /// has reached, so promoting it hands the tunnel a dead session (measured
+    /// 2026-09-20, 11 of 26 promotions already dead — see
+    /// docs/measurements-2026-09-20.md). So `standby` now keeps no standby; it
+    /// is the plain tunnel, reconnecting after each kill, which is what the
+    /// numbers favour. The case name is kept because it is a stored setting.
+    /// `rotate` retires each flow before it is old enough to be swept, and is
+    /// the one mode that does park a warm session, because it has to rotate
+    /// *into* one. It stays opt-in: ~1 in 20 new connections stalls in the swap
+    /// window.
     public enum Disguise: String, Sendable, CaseIterable {
         case standby
         case rotate
@@ -53,8 +60,8 @@ public final class GameModeController: @unchecked Sendable {
 
         public var title: String {
             switch self {
-            case .standby: return "Standby (recommended)"
-            case .rotate:  return "Standby + rotate flows"
+            case .standby: return "Reconnect on drops (recommended)"
+            case .rotate:  return "Rotate flows early"
             }
         }
     }
