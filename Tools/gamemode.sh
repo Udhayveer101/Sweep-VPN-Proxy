@@ -54,6 +54,14 @@ trap cleanup EXIT INT TERM
 
 log "starting"
 
+# Without root every route change silently no-ops and usque cannot make a utun,
+# which used to surface as "usque exited during setup" and sent people to the
+# WARP settings for a privilege problem.
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    log "FATAL not running as root"
+    exit 1
+fi
+
 ORIG_GW=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
 ORIG_IF=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
 if [ -z "$ORIG_GW" ]; then

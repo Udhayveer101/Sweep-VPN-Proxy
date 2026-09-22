@@ -25,6 +25,8 @@ final class GameModeTests: XCTestCase {
     func testFatalLinesBecomeSomethingAPlayerCanActetOn() {
         XCTAssertTrue(GameModeController.reason(for: "gamemode: FATAL no default gateway; refusing to start")
             .contains("No network connection"))
+        XCTAssertTrue(GameModeController.reason(for: "gamemode: FATAL not running as root")
+                        .contains("administrator"))
         XCTAssertTrue(GameModeController.reason(for: "gamemode: FATAL usque exited during setup")
             .contains("WARP setup"))
         XCTAssertTrue(GameModeController.reason(for: "gamemode: FATAL tunnel interface never came up")

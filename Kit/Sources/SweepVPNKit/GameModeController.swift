@@ -180,7 +180,14 @@ public final class GameModeController: @unchecked Sendable {
             // Touch ID where the Mac allows it. Anything other than the user
             // saying no falls through to the AppleScript prompt below, so this
             // can only improve on the old behaviour, never replace it.
-            switch Elevator.run(tool: script.path, arguments: scriptArgs) {
+            // Via /bin/bash -p, never the script path directly: the
+            // authorization trampoline hands the child an elevated euid with
+            // the real uid unchanged, and bash drops that euid on startup
+            // unless -p says otherwise. Exec'ing the script itself therefore
+            // ran the whole of gaming mode as the logged-in user, where every
+            // route change silently no-ops and usque cannot create a utun.
+            switch Elevator.run(tool: "/bin/bash",
+                                arguments: ["-p", script.path] + scriptArgs) {
             case .launched:
                 record(.info, "elevated", "system authorization")
                 self.armMonitor()
@@ -296,6 +303,9 @@ public final class GameModeController: @unchecked Sendable {
     static func reason(for line: String) -> String {
         if line.contains("no default gateway") {
             return "No network connection, so gaming mode has nothing to tunnel over."
+        }
+        if line.contains("not running as root") {
+            return "Gaming mode did not get administrator rights, so it could not change routing."
         }
         if line.contains("usque exited during setup") {
             return "The WARP tunnel would not start. Check Settings ▸ WARP setup."
