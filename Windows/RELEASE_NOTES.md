@@ -6,6 +6,9 @@ Sweep VPN for Windows 10/11 (64-bit). One file, no installer, no account.
 
 **First run:** the setup guide opens by itself: tick Cloudflare's terms and press **Register**. Then press **Route this PC through WARP**. The tray icon turns green when connected.
 
+**Fixed in 1.5.1**
+- Gaming mode works again: 1.5.0 was missing `wintun.dll`, so turning it on looped on "Error loading wintun.dll".
+
 **Fixed in 1.5**
 - The tunnel is no longer restarted while WARP is already reconnecting by itself, or because one website failed to load (the same fix the Mac got in 1.4.1). This was the main cause of short drop-outs.
 - Gaming mode re-applies its routes when the tunnel reconnects, retries after a failure, works on non-English Windows, and turning it off then using the proxy mode now works in the same session.
