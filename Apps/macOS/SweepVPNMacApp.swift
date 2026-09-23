@@ -114,6 +114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        GameModeController.withdrawOrphanedRuns()
     }
 
     /// The system SOCKS proxy points at a listener that dies with this app, so

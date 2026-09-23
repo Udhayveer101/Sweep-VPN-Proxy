@@ -450,15 +450,22 @@ public final class LocalProxy: @unchecked Sendable {
         pump(from: b, to: a)
     }
 
+    /// The next read waits for the previous write to be taken, so a fast
+    /// sender cannot queue unbounded data behind a slower tunnel, and the last
+    /// chunk before a close is delivered before the pair is torn down.
     private func pump(from: NWConnection, to: NWConnection) {
         from.receive(minimumIncompleteLength: 1, maximumLength: 32 * 1024) { data, _, done, error in
-            if let data, !data.isEmpty {
-                to.send(content: data, completion: .contentProcessed { _ in })
+            let finished = done || error != nil
+            guard let data, !data.isEmpty else {
+                if finished { to.cancel(); from.cancel() } else { self.pump(from: from, to: to) }
+                return
             }
-            if done || error != nil {
-                to.cancel(); from.cancel(); return
-            }
-            self.pump(from: from, to: to)
+            to.send(content: data, completion: .contentProcessed { sendError in
+                if finished || sendError != nil {
+                    to.cancel(); from.cancel(); return
+                }
+                self.pump(from: from, to: to)
+            })
         }
     }
 

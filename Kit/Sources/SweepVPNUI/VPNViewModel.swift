@@ -245,10 +245,13 @@ public final class VPNViewModel: ObservableObject {
         Task { @MainActor in
             do {
                 let dmg = try await checker.download(update)
-                try checker.reveal(dmg)
+                // hdiutil and codesign take seconds; keep them off the main thread.
+                try await Task.detached { try checker.reveal(dmg) }.value
                 self.updateState = .idle
             } catch UpdateChecker.UpdateError.digestMismatch {
                 self.updateState = .failed("The downloaded update did not match its published checksum, so it was discarded.")
+            } catch UpdateChecker.UpdateError.untrustedSignature {
+                self.updateState = .failed("The downloaded app is not signed by Sweep's developer, so it was not opened.")
             } catch {
                 self.updateState = .failed("Could not download the update: \(error.localizedDescription)")
             }
@@ -543,6 +546,7 @@ public final class VPNViewModel: ObservableObject {
 
     private let configurator: VPNConfigurator
     private var catalog = ServerCatalog()
+    private var statusObserver: NSObjectProtocol?
     private var pollTask: Task<Void, Never>?
 
     /// App group shared with the extension. `AppConfig` owns the real value but
@@ -600,7 +604,9 @@ public final class VPNViewModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             _ = try? await self.configurator.loadManager()
-            NotificationCenter.default.addObserver(forName: .NEVPNStatusDidChange,
+            // onAppear runs on every window reopen; one observer, not one each.
+            if let old = self.statusObserver { NotificationCenter.default.removeObserver(old) }
+            self.statusObserver = NotificationCenter.default.addObserver(forName: .NEVPNStatusDidChange,
                                                    object: self.configurator.ourConnection,
                                                    queue: .main) { [weak self] _ in
                 Task { @MainActor in await self?.refresh() }
@@ -628,11 +634,13 @@ public final class VPNViewModel: ObservableObject {
     /// the user needs to see which step it stopped on as it stops.
     public func startWatchingLog() {
         logTask?.cancel()
-        logTask = Task { [weak self] in
+        // Detached: reading and decoding the whole journal every second on the
+        // main actor stuttered the UI once the journal grew to a few MB.
+        let log = self.log
+        logTask = Task.detached { [weak self] in
             while !Task.isCancelled {
-                guard let self else { return }
-                let entries = self.log.entries()
-                await MainActor.run { self.logEntries = entries }
+                let entries = log.entries()
+                await MainActor.run { self?.logEntries = entries }
                 try? await Task.sleep(for: .seconds(1))
             }
         }

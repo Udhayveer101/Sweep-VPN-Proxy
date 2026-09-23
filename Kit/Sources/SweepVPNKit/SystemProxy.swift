@@ -41,8 +41,18 @@ public enum SystemProxy {
             && networksetup -setsocksfirewallproxystate "$svc" on
             """
         }
-        return serviceScript + """
-        ; networksetup -setsocksfirewallproxystate "$svc" off
+        // Off everywhere it points at us, not just on the service carrying the
+        // default route now: after a move from Wi-Fi to Ethernet (or offline at
+        // quit) that is a different service, and the one we set would be left
+        // aimed at a listener that no longer exists.
+        return """
+        networksetup -listallnetworkservices | tail -n +2 | sed 's/^\\*//' | \
+        while IFS= read -r svc; do \
+          cfg=$(networksetup -getsocksfirewallproxy "$svc" 2>/dev/null); \
+          echo "$cfg" | grep -q '^Enabled: Yes' && echo "$cfg" | grep -q '^Server: 127.0.0.1$' \
+            && echo "$cfg" | grep -q '^Port: \(port)$' \
+            && networksetup -setsocksfirewallproxystate "$svc" off; \
+        done; true
         """
     }
 

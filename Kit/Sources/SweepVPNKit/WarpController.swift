@@ -160,7 +160,30 @@ public final class WarpController: @unchecked Sendable {
             guard wasOurs else { return }            // stop() already reported
             self.record(.warn, "exited", "status \(proc.terminationStatus)")
             if case .failed = self.state { return }  // keep the parsed reason
-            self.state = .failed("WARP exited unexpectedly (status \(proc.terminationStatus)).")
+            // A crash is a disconnect nobody asked for, and in "route this Mac
+            // through WARP" the system proxy points at this listener: come back,
+            // with the same backoff as a wedge, instead of failing closed until
+            // the user notices and toggles it (Windows' warp.go already does).
+            self.lock.lock()
+            self.restartStreak = self.restartStreak.recordingFailure()
+            let tries = self.restartStreak.consecutiveFailures
+            let delay = self.restartStreak.delay()
+            let callback = self.onState
+            let giveUp = self.stopped || tries > Self.maxRespawns
+            self.lock.unlock()
+            guard !giveUp, let callback else {
+                self.state = .failed("WARP exited unexpectedly (status \(proc.terminationStatus)).")
+                return
+            }
+            self.state = .starting
+            self.record(.info, "respawning", "in \(Int(delay))s (attempt \(tries))")
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                let abandoned = self.stopped || self.process != nil
+                self.lock.unlock()
+                if !abandoned { self.start(onState: callback) }
+            }
         }
 
         do {
@@ -266,6 +289,8 @@ public final class WarpController: @unchecked Sendable {
     /// "continuing..." forever and never reconnects — because in that case the
     /// reconnect line never comes.
     static let recoveryGrace: TimeInterval = 15
+    /// Crashes in a row (within StartBackoff's 10-minute streak) before giving up.
+    static let maxRespawns = 5
     static let restartFloor: TimeInterval = 20
 
     /// Start the clock on a failure line. Returns `true` if this call armed the

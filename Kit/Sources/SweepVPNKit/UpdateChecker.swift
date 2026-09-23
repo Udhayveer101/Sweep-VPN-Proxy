@@ -1,6 +1,7 @@
 #if os(macOS)
 import Foundation
 import CryptoKit
+import CoreServices
 
 /// Finds, downloads and verifies a newer build from the project's GitHub
 /// releases, so the app does not depend on the user visiting the repo.
@@ -22,6 +23,7 @@ public struct UpdateChecker: @unchecked Sendable {
         case transport
         case noAsset
         case digestMismatch
+        case untrustedSignature
     }
 
     /// Both products publish into one release list, so `latest` is whichever
@@ -162,8 +164,20 @@ public struct UpdateChecker: @unchecked Sendable {
             throw UpdateError.digestMismatch
         }
         try payload.write(to: destination, options: .atomic)
+        // This app is not sandboxed, so nothing marks the file as downloaded
+        // and Gatekeeper would never assess it. Mark it the way a browser would.
+        var url = destination
+        var values = URLResourceValues()
+        values.quarantineProperties = [kLSQuarantineAgentNameKey as String: "Sweep VPN",
+                                       kLSQuarantineTypeKey as String: kLSQuarantineTypeWebDownload as String]
+        try? url.setResourceValues(values)
         return destination
     }
+
+    /// The team every Sweep release is signed by. The digest comes from the
+    /// same release as the DMG, so it only proves the download is intact; this
+    /// proves the app inside was built and signed by us.
+    static let releaseTeam = "P66SB4MX92"
 
     /// `shasum -a 256` writes "<hex>  <filename>".
     static func expectedDigest(from data: Data) -> String? {
@@ -177,12 +191,27 @@ public struct UpdateChecker: @unchecked Sendable {
     /// signed app bundle from inside itself - while a tunnel may be up - buys
     /// one less drag at the cost of the riskiest code in the app, so we stop
     /// here.
+    static func signedByUs(_ app: URL) -> Bool {
+        let check = Process()
+        check.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        check.arguments = ["--verify", "--deep", "--strict",
+                           "-R=anchor apple generic and certificate leaf[subject.OU] = \"\(releaseTeam)\"",
+                           app.path]
+        check.standardOutput = FileHandle.nullDevice
+        check.standardError = FileHandle.nullDevice
+        guard (try? check.run()) != nil else { return false }
+        check.waitUntilExit()
+        return check.terminationStatus == 0
+    }
+
     public func reveal(_ dmg: URL) throws {
         let attach = Process()
         attach.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-        attach.arguments = ["attach", "-nobrowse", dmg.path]
+        attach.arguments = ["attach", "-nobrowse", "-noverify", dmg.path]
         let pipe = Pipe()
         attach.standardOutput = pipe
+        // A licence prompt would wait on stdin forever; with none it declines.
+        attach.standardInput = FileHandle.nullDevice
         try attach.run()
         let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         attach.waitUntilExit()
@@ -194,9 +223,20 @@ public struct UpdateChecker: @unchecked Sendable {
                 return String(line[range.lowerBound...]).trimmingCharacters(in: .whitespaces)
             }.last
 
+        guard let mount else { throw UpdateError.transport }
+        let apps = (try? FileManager.default.contentsOfDirectory(atPath: mount))?
+            .filter { $0.hasSuffix(".app") } ?? []
+        guard !apps.isEmpty, apps.allSatisfy({ Self.signedByUs(URL(fileURLWithPath: mount).appendingPathComponent($0)) }) else {
+            let detach = Process()
+            detach.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+            detach.arguments = ["detach", "-quiet", mount]
+            try? detach.run()
+            throw UpdateError.untrustedSignature
+        }
+
         let open = Process()
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        open.arguments = [mount ?? dmg.path]
+        open.arguments = [mount]
         try open.run()
     }
 }

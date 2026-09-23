@@ -16,6 +16,29 @@ final class GameModeTests: XCTestCase {
         XCTAssertNil(GameModeController.classify("2026/09/18 00:14:01 IST Connected to MASQUE server"))
     }
 
+    /// After "ready", usque dying ends the script and restores direct routing.
+    /// The app used to miss it and keep claiming the Mac went through WARP.
+    func testUsqueDyingAfterReadyIsNoticed() {
+        let line = "00:31:40 gamemode: usque exited; shutting down"
+        XCTAssertEqual(GameModeController.classify(line), .fatal)
+        XCTAssertTrue(GameModeController.reason(for: line).contains("normal routing back"))
+    }
+
+    /// A control file left by a crashed run keeps its root script alive; it
+    /// must be withdrawn, and only our own files touched.
+    func testStaleRunsAreWithdrawn() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for name in ["gamemode-ABC.control", "gamemode.control", "config.json"] {
+            FileManager.default.createFile(atPath: dir.appendingPathComponent(name).path, contents: nil)
+        }
+        let c = GameModeController(script: dir, usque: dir, directory: dir, workDir: dir)
+        XCTAssertTrue(c.withdrawStaleRuns())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), ["config.json"])
+        XCTAssertFalse(c.withdrawStaleRuns())
+    }
+
     func testRotationIsReportedButIsNotAFailure() {
         let line = "2026/09/18 00:05:14 IST Retiring MASQUE flow before it ages out; promoting standby"
         XCTAssertEqual(GameModeController.classify(line), .rotated)

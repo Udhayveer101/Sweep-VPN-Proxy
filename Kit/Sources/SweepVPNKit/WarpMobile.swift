@@ -211,6 +211,7 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
     nonisolated(unsafe) fileprivate static weak var current: WarpPacketTunnelProvider?
 
     private let lock = NSLock()
+    private var stopRequested = false
     private var pendingStart: ((Error?) -> Void)?
     private var lastError: String?
     private var startDeadline: DispatchWorkItem?
@@ -231,6 +232,7 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
         }
 
         Self.current = self
+        lock.lock(); stopRequested = false; lock.unlock()
         SweepWarpSetLogger { line in
             guard let line else { return }
             WarpPacketTunnelProvider.current?.ingest(String(cString: line))
@@ -243,6 +245,12 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
                                        detail: "\(error.localizedDescription) remote=\(Self.remoteAddress(iface.endpointH2V4)) v4=\(iface.ipv4) v6=\(iface.ipv6.isEmpty ? "none" : "set")")
                 return completionHandler(error)
             }
+            // stopTunnel can land while iOS applies the settings; starting the
+            // Go tunnel after it would dial for a provider that is gone.
+            self.lock.lock()
+            let stopped = self.stopRequested
+            self.lock.unlock()
+            if stopped { return completionHandler(Self.error("Stopped before WARP connected.")) }
             let fd = SweepWarpFindTunnelFd()
             guard fd >= 0 else { return completionHandler(Self.error("Could not find the tunnel interface.")) }
 
@@ -269,6 +277,7 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
     open override func stopTunnel(with reason: NEProviderStopReason,
                                   completionHandler: @escaping () -> Void) {
         EventLog.shared.record(phase: "warp", kind: "stopped", detail: "reason \(reason.rawValue)")
+        lock.lock(); stopRequested = true; lock.unlock()
         SweepWarpStop()
         finishStart(Self.error("Stopped before WARP connected."))
         completionHandler()

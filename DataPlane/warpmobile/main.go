@@ -30,6 +30,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -261,12 +262,13 @@ func start(path, sni string, fd int, flowTTLSeconds int) error {
 		cancel()
 	}
 	ctx, c := context.WithCancel(context.Background())
-	cancel = c
+	d := &utun{fd: fd}
+	cancel = func() { c(); d.closed.Store(true) }
 	go api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
 		TLSConfig:       tlsConfig,
 		KeepalivePeriod: keepalive,
 		Endpoint:        endpoint,
-		Device:          &utun{fd: fd},
+		Device:          d,
 		MTU:             mtu,
 		ReconnectDelay:  reconnectDelay,
 		AlwaysReconnect: true,
@@ -301,7 +303,13 @@ type utun struct {
 	// with their own buffers need no lock at all.
 	rpool sync.Pool
 	wpool sync.Pool
+	// closed ends readers parked in poll once this tunnel is stopped. iOS can
+	// reuse the extension process, and the next utun often gets the same fd
+	// number: a reader left behind would steal a packet from the new tunnel.
+	closed atomic.Bool
 }
+
+var errDeviceClosed = errors.New("tunnel stopped")
 
 func (t *utun) ReadPacket(buf []byte) (int, error) {
 	rp, _ := t.rpool.Get().(*[]byte)
@@ -321,8 +329,11 @@ func (t *utun) ReadPacket(buf []byte) (int, error) {
 			// flag, so don't clear it): wait for a packet instead of
 			// reporting an idle device as dead.
 			if err == unix.EAGAIN {
-				if _, err := unix.Poll([]unix.PollFd{{Fd: int32(t.fd), Events: unix.POLLIN}}, -1); err != nil && err != unix.EINTR {
+				if _, err := unix.Poll([]unix.PollFd{{Fd: int32(t.fd), Events: unix.POLLIN}}, 1000); err != nil && err != unix.EINTR {
 					return 0, err
+				}
+				if t.closed.Load() {
+					return 0, errDeviceClosed
 				}
 				continue
 			}

@@ -216,7 +216,10 @@ struct ProxyHomePanel: View {
         if model.warpState == .running { return "This \(DeviceNoun.current) is using WARP" }
         if model.warpState == .starting { return "Connecting to WARP…" }
         #endif
-        if model.options.warpEnabled { return model.warpState == .running ? "WARP is ready" : "Starting WARP…" }
+        if model.options.warpEnabled {
+            if model.warpState == .running { return "WARP is ready" }
+            return model.warpState.isFailed ? "WARP could not start" : "Starting WARP…"
+        }
         return "Proxy is off"
     }
 

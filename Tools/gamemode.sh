@@ -22,12 +22,22 @@ LOG="${4:?log path required}"
 SNI="${5:-example.com}"
 ROTATE="${6:-0}"        # flow-ttl; "0" disables rotation
 
-ENDPOINT_IP="162.159.198.2"
+# usque --http2 dials endpoint_h2_v4 from the registration, or this default
+# (config/endpoints.go). Pinning a different address than the one it dials
+# would route the tunnel's own packets into the tunnel.
+ENDPOINT_IP=$(/usr/bin/plutil -extract endpoint_h2_v4 raw -o - "$CONFIG" 2>/dev/null)
+[[ "$ENDPOINT_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ENDPOINT_IP="162.159.198.2"
 IFACE=""
 ORIG_GW=""
 ORIG_SVC=""
 ORIG_DNS=""
 USQUE_PID=""
+
+# We run as root and the log sits in the user's Library: never follow a link
+# someone swapped in, or root would append to whatever it points at.
+if [ -L "$LOG" ] || [ -L "$CONTROL" ]; then
+    exit 1
+fi
 
 log() { echo "$(date '+%H:%M:%S') gamemode: $*" >> "$LOG"; }
 
@@ -40,7 +50,8 @@ cleanup() {
     route -n delete -net 128.0.0.0/1 >/dev/null 2>&1
     [ -n "$ORIG_GW" ] && route -n delete -host "$ENDPOINT_IP" "$ORIG_GW" >/dev/null 2>&1
     if [ -n "$ORIG_SVC" ]; then
-        if [ -z "$ORIG_DNS" ] || [ "$ORIG_DNS" = "There aren't any DNS Servers set on ${ORIG_SVC}." ]; then
+        # networksetup's "none set" answer is a sentence, not an address list.
+        if [ -z "${ORIG_DNS// /}" ] || [[ "$ORIG_DNS" == *"aren't any DNS Servers"* ]]; then
             networksetup -setdnsservers "$ORIG_SVC" "Empty" >/dev/null 2>&1
         else
             # shellcheck disable=SC2086
@@ -100,9 +111,10 @@ log "usque pid $USQUE_PID"
 # Wait for the utun to appear and carry our address.
 for _ in $(seq 1 40); do
     kill -0 "$USQUE_PID" 2>/dev/null || { log "FATAL usque exited during setup"; exit 1; }
-    IFACE=$(ifconfig 2>/dev/null | awk '/^utun[0-9]+:/{name=substr($1,1,length($1)-1)} /inet /{if(name!=""){print name; name=""}}' | tail -1)
-    CANDIDATE=$(grep -oE 'Created TUN device: utun[0-9]+' "$LOG" | tail -1 | awk '{print $4}')
-    [ -n "$CANDIDATE" ] && IFACE="$CANDIDATE"
+    # Only usque's own announcement names our device. Guessing from ifconfig
+    # picked up whatever other VPN's utun happened to be last (Tailscale, the
+    # Sweep packet tunnel) and routed the whole Mac into it.
+    IFACE=$(grep -oE 'Created TUN device: utun[0-9]+' "$LOG" | tail -1 | awk '{print $4}')
     if [ -n "$IFACE" ] && ifconfig "$IFACE" 2>/dev/null | grep -q 'inet '; then
         break
     fi
