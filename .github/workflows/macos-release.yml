@@ -4,11 +4,16 @@ name: macOS release
 # like Sweep. This manual workflow is the CI alternative; it needs the
 # DEVELOPER_ID_P12_BASE64 / DEVELOPER_ID_P12_PASSWORD / ASC_* secrets.
 on:
+  # A tag is what actually publishes: the release step below only runs on a
+  # push, so dispatch alone builds and uploads an artifact but never makes a
+  # GitHub Release.
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
         description: "Marketing version (e.g. 1.2.0)"
-        required: true
+        required: false
 
 permissions:
   contents: write
@@ -39,10 +44,7 @@ jobs:
           go-version: "1.26.x"
 
       - name: Tools
-        run: |
-          brew install xcodegen tor
-          # Tor's pluggable transports are optional; the bundler warns if absent.
-          brew install obfs4proxy snowflake || true
+        run: brew install xcodegen
 
       - name: Import Developer ID certificate
         env:

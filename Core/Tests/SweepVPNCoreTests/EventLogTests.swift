@@ -40,8 +40,12 @@ final class EventLogTests: XCTestCase {
     /// The reason the journal exists: a line written by the extension and a line
     /// written by the app land in the same file, in the order they happened.
     func testBothProcessesAppendToOneJournal() {
-        makeLog(process: "app").record(phase: "connect", kind: "userPressedConnect")
-        makeLog(process: "tunnel").record(phase: "tunnel", kind: "startTunnelCalled")
+        let app = makeLog(process: "app")
+        app.record(phase: "connect", kind: "userPressedConnect")
+        app.flush()
+        let tunnel = makeLog(process: "tunnel")
+        tunnel.record(phase: "tunnel", kind: "startTunnelCalled")
+        tunnel.flush()
 
         let entries = makeLog().entries()
         XCTAssertEqual(entries.map(\.process), ["app", "tunnel"])
@@ -66,6 +70,7 @@ final class EventLogTests: XCTestCase {
     func testUndecodableLineIsSkippedNotFatal() throws {
         let log = makeLog()
         log.record(phase: "connect", kind: "good")
+        log.flush()
         let url = try XCTUnwrap(log.fileURL)
         let handle = try FileHandle(forWritingTo: url)
         try handle.seekToEnd()

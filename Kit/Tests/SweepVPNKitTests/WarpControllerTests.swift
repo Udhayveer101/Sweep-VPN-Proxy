@@ -24,6 +24,7 @@ final class WarpControllerTests: XCTestCase {
         XCTAssertEqual(WarpController.classify("2026/09/11 23:55:51 IST Connected to MASQUE server"), .connected)
         XCTAssertEqual(WarpController.classify("2026/09/11 IST Failed to connect tunnel: timeout"), .error)
         XCTAssertNil(WarpController.classify("2026/09/11 23:55:42 IST Tunnel idle. Waiting for outbound activity before reconnecting..."))
+        XCTAssertEqual(WarpController.classify("2026/09/13 IST Tunnel connection lost: io: read/write on closed pipe. Reconnecting..."), .lost)
     }
 
     func testArgumentsUseSpoofedSNIOverHTTP2OnLoopback() {
@@ -38,39 +39,94 @@ final class WarpControllerTests: XCTestCase {
     }
 
     /// Real lines from the wedged session of 2026-09-13.
-    func testWriteFailureOnAClosedPipeIsAWedgeAndABurstOfDialFailuresIsToo() {
+    ///
+    /// The rule these pin down: usque reconnecting on its own must cost nothing,
+    /// and only usque *failing* to reconnect may relaunch the child. Before
+    /// v1.3.0 the first write error relaunched it outright, which is the
+    /// regression testers reported.
+    func testALossThatHealsItselfDoesNotRestartAnything() {
         let w = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),
                                socksPort: 1081, sni: "example.com", directory: tmpDir())
-        let t0 = Date()
-        let writeFail = "2026/09/13 IST Error writing to IP connection: connect-ip: failed to send datagram capsule: io: read/write on closed pipe, continuing..."
-        let dialFail = "2026/09/13 IST SOCKS TCP handle from 127.0.0.1:60777 failed: dial: lookup example.com. on 1.1.1.1:53: read udp 1.2.3.4:29805: i/o timeout"
+        w.pretendRunningForTests()
+        w.ingest(log: "2026/09/13 IST Tunnel connection lost: connection closed while writing to IP connection: io: read/write on closed pipe. Reconnecting...\n")
+        XCTAssertTrue(w.isAwaitingRecovery, "a loss should start the clock")
+        w.ingest(log: "2026/09/13 IST Connected to MASQUE server\n")
+        XCTAssertFalse(w.isAwaitingRecovery, "usque healed it; the clock must stand down")
+        XCTAssertFalse(w.state.isFailed)
+    }
 
-        // No child running: nothing to restart.
-        XCTAssertFalse(w.noteFailure(writeFail, now: t0))
+    /// The write error that used to relaunch the child immediately. It may arm
+    /// the deadline, never more.
+    func testAWriteErrorOnlyArmsTheDeadline() {
+        let w = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),
+                               socksPort: 1081, sni: "example.com", directory: tmpDir())
+        let writeFail = "2026/09/13 IST Error writing to IP connection: connect-ip: failed to send datagram capsule: io: read/write on closed pipe, continuing..."
+
+        // No child running: nothing to supervise, so nothing is armed.
+        XCTAssertFalse(w.noteFailure(writeFail))
 
         w.pretendRunningForTests()
-        XCTAssertTrue(w.noteFailure(writeFail, now: t0))
-        // Second wedge inside the floor is swallowed, so a wedge loop cannot spin.
-        w.pretendRunningForTests()                      // the relaunch finished
-        XCTAssertFalse(w.noteFailure(writeFail, now: t0.addingTimeInterval(5)))
-        XCTAssertTrue(w.noteFailure(writeFail, now: t0.addingTimeInterval(21)))
+        XCTAssertTrue(w.noteFailure(writeFail))
+        // Already waiting: a burst of further errors must not pile up timers.
+        XCTAssertFalse(w.noteFailure(writeFail))
+        XCTAssertFalse(w.noteFailure(writeFail))
+        XCTAssertTrue(w.isAwaitingRecovery)
+        w.noteRecovered()
+        XCTAssertFalse(w.isAwaitingRecovery)
+    }
 
-        // Dial failures: three is churn, four inside the window is the wedge.
-        let w2 = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),
+    /// The false wedge of 2026-09-20, from the macOS journal.
+    ///
+    /// One SOCKS client asked for a name that does not resolve. The MASQUE
+    /// session was healthy and was never lost, so no "Connected to MASQUE
+    /// server" line could ever follow to stand the deadline down — and 15s
+    /// later the supervisor restarted a working tunnel and took the SOCKS
+    /// listener down with it. A failure that belongs to one client connection
+    /// must never arm a deadline only a session event can disarm.
+    func testAPerConnectionFailureIsNotAWedge() {
+        let w = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),
                                socksPort: 1081, sni: "example.com", directory: tmpDir())
-        w2.pretendRunningForTests()
-        XCTAssertFalse(w2.noteFailure(dialFail, now: t0))
-        XCTAssertFalse(w2.noteFailure(dialFail, now: t0.addingTimeInterval(1)))
-        XCTAssertFalse(w2.noteFailure(dialFail, now: t0.addingTimeInterval(2)))
-        XCTAssertTrue(w2.noteFailure(dialFail, now: t0.addingTimeInterval(3)))
+        w.pretendRunningForTests()
+        w.ingest(log: "2026/09/20 15:38:19 IST SOCKS TCP handle from 127.0.0.1:63517 failed: dial: lookup wpad.lan. on 1.1.1.1:53: no such host\n")
+        XCTAssertFalse(w.isAwaitingRecovery, "one client's dial failure is not a tunnel fault")
+        w.ingest(log: "2026/09/20 15:38:20 IST SOCKS client 127.0.0.1:63518 failed during negotiation: unexpected EOF\n")
+        w.ingest(log: "2026/09/20 15:38:21 IST socks5: invalid version\n")
+        XCTAssertFalse(w.isAwaitingRecovery)
+        XCTAssertFalse(w.state.isFailed)
+    }
 
-        // Spread wider than the window, the same four are just churn.
-        let w3 = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),
+    /// The standby dialer failing says nothing about the live session, and no
+    /// reconnect line follows it either.
+    func testAStandbyDialFailureIsNotAWedge() {
+        let w = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),
                                socksPort: 1081, sni: "example.com", directory: tmpDir())
-        w3.pretendRunningForTests()
-        for i in 0..<4 {
-            XCTAssertFalse(w3.noteFailure(dialFail, now: t0.addingTimeInterval(Double(i) * 11)))
+        w.pretendRunningForTests()
+        w.ingest(log: "2026/09/20 IST Standby dial failed: dial tcp 162.159.198.2:443: i/o timeout\n")
+        XCTAssertFalse(w.isAwaitingRecovery)
+    }
+
+    /// Session-level faults must keep arming it — this is the 2026-09-13 wedge,
+    /// where usque logs "continuing..." forever and never reconnects.
+    func testSessionFaultsStillArmTheDeadline() {
+        for line in ["2026/09/13 IST Error writing to IP connection: connect-ip: failed to send datagram capsule: io: read/write on closed pipe, continuing...",
+                     "2026/09/13 IST Error reading from IP connection: io: read/write on closed pipe, continuing...",
+                     "2026/09/11 IST Failed to connect tunnel: context deadline exceeded"] {
+            let w = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),
+                                   socksPort: 1081, sni: "example.com", directory: tmpDir())
+            w.pretendRunningForTests()
+            w.ingest(log: line + "\n")
+            XCTAssertTrue(w.isAwaitingRecovery, "should arm on: \(line)")
         }
+    }
+
+    /// A line split across two pipe reads must still be classified once.
+    func testALineSplitAcrossReadsIsStillSeen() {
+        let w = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),
+                               socksPort: 1081, sni: "example.com", directory: tmpDir())
+        w.ingest(log: "2026/09/11 23:55:42 IST SOCKS proxy listen")
+        XCTAssertNotEqual(w.state, .running, "half a line is not an event")
+        w.ingest(log: "ing on 127.0.0.1:1081\n")
+        XCTAssertEqual(w.state, .running)
     }
 
     func testMissingConfigFailsWithoutLaunching() {
@@ -103,7 +159,6 @@ final class WarpUpstreamTests: XCTestCase {
     func testRunningWarpIsTheUpstream() {
         let m = makeModel()
         m.options.warpEnabled = true
-        m.options.torEnabled = true          // WARP wins even if both flags leak through
         m.warpState = .running
         XCTAssertEqual(m.currentUpstream(), .socks5(host: "127.0.0.1", port: 1081))
         XCTAssertEqual(m.proxyUpstreamLabel, "WARP")
@@ -123,21 +178,6 @@ final class WarpUpstreamTests: XCTestCase {
         }
     }
 
-    func testEnablingTorTurnsWarpOff() {
-        let m = makeModel()
-        m.options.warpEnabled = true
-        m.setTor(enabled: true)
-        XCTAssertFalse(m.options.warpEnabled)
-        m.setTor(enabled: false)
-    }
 
-    func testEnablingWarpTurnsTorOff() {
-        let m = makeModel()
-        m.options.torEnabled = true
-        m.setWarp(enabled: true)
-        XCTAssertFalse(m.options.torEnabled)
-        XCTAssertTrue(m.options.warpEnabled)
-        m.setWarp(enabled: false)
-    }
 }
 #endif

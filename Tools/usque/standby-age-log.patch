@@ -1,0 +1,99 @@
+From 9dfb725a6a637441090477ee305aa3c77feb8f0e Mon Sep 17 00:00:00 2001
+From: ci <ci@localhost>
+Date: Sun, 20 Sep 2026 16:53:25 +0530
+Subject: [PATCH] Log a session's age, and a promoted standby's, so the sweep
+ can be measured
+
+Every mitigation for this network's flow sweep was argued about without a
+number: nobody could say how old a flow was when it died, or how old the
+standby was when it replaced it. Stamp each session at dial time and print
+the age in the two lines that matter.
+
+The first run answered the question the standby machinery existed for: a
+parked standby is swept in the same sweep as the live flow (live died at
+23.1s/28.1s/33.2s/55.9s, the standby promoted after each was
+21.8s/27.9s/34.0s/49.7s old and already dead), and only a session dialled
+after the kill survives.
+---
+ api/standby.go | 28 ++++++++++++++++++++++++++--
+ api/tunnel.go  |  4 ++--
+ 2 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/api/standby.go b/api/standby.go
+index c1f41ae..777968a 100644
+--- a/api/standby.go
++++ b/api/standby.go
+@@ -40,6 +40,18 @@ type tunnelSession struct {
+ 	udpConn *net.UDPConn
+ 	tr      *http3.Transport
+ 	ipConn  *connectip.Conn
++	// dialedAt is when this session's flow was established. A standby's age at
++	// promotion is the number that says whether a standby can work at all on a
++	// network that sweeps established flows.
++	dialedAt time.Time
++}
++
++// age reports how long this session's flow has existed.
++func (s *tunnelSession) age() time.Duration {
++	if s == nil || s.dialedAt.IsZero() {
++		return 0
++	}
++	return time.Since(s.dialedAt)
+ }
+ 
+ // Close releases every handle the session owns. Safe on a partially dialed
+@@ -71,7 +83,7 @@ func dialSession(ctx context.Context, cfg MaintainTunnelConfig) (*tunnelSession,
+ 		cfg.Endpoint,
+ 		cfg.UseHTTP2,
+ 	)
+-	sess := &tunnelSession{udpConn: udpConn, tr: tr, ipConn: ipConn}
++	sess := &tunnelSession{udpConn: udpConn, tr: tr, ipConn: ipConn, dialedAt: time.Now()}
+ 	if err != nil {
+ 		sess.Close()
+ 		return nil, err
+@@ -85,7 +97,19 @@ func dialSession(ctx context.Context, cfg MaintainTunnelConfig) (*tunnelSession,
+ 
+ // fillStandby keeps one warm session parked in ch until ctx ends.
+ //
+-// A standby makes fast kill detection safe. Tightening the keepalive alone was
++// Measured 2026-09-20, with the promotion log line above reporting the parked
++// session's age: a standby is swept in the *same* sweep as the live flow, at
++// whatever age it has reached. Live flows died at 23.1s, 28.1s, 33.2s and
++// 55.9s; the standby promoted after each was 21.8s, 27.9s, 34.0s and 49.7s old
++// and was already dead, logging "Tunnel connection lost" in the same second as
++// its promotion. Only a session dialled *after* the kill (1.4-2.7s old here)
++// survived. So no parking policy — no age bound, no refresh timer — can make a
++// standby useful against a sweep: by the time it is needed it has been swept
++// too, and promoting the corpse costs an extra ~2s before the dial that
++// actually works. A standby is only worth having where the promotion is
++// *planned* (flow rotation), never as kill recovery.
++//
++// A standby also makes fast kill detection safe. Tightening the keepalive alone was
+ // measured to be worse than leaving it (-k 2s produced more false positives
+ // than -k 5s) because every false positive cost a full rebuild. With a warm
+ // session waiting, a false positive costs a promotion instead, so detection
+diff --git a/api/tunnel.go b/api/tunnel.go
+index ba3c551..d876f54 100644
+--- a/api/tunnel.go
++++ b/api/tunnel.go
+@@ -285,7 +285,7 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 
+ 		sess := takeStandby(standbyCh)
+ 		if sess != nil {
+-			log.Println("Promoted standby MASQUE session")
++			log.Printf("Promoted standby MASQUE session (age %.1fs)", sess.age().Seconds())
+ 		} else {
+ 			log.Printf("Establishing MASQUE connection to %s", cfg.Endpoint)
+ 			var err error
+@@ -398,7 +398,7 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 		if errors.Is(err, errFlowRotate) {
+ 			log.Println("Retiring MASQUE flow before it ages out; promoting standby")
+ 		} else {
+-			log.Printf("Tunnel connection lost: %v. Reconnecting...", err)
++			log.Printf("Tunnel connection lost after %.1fs: %v. Reconnecting...", sess.age().Seconds(), err)
+ 		}
+ 
+ 		if cfg.OnDisconnect != "" {
+-- 
+2.50.1 (Apple Git-155)
+

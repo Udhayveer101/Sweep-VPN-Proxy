@@ -14,9 +14,13 @@ let package = Package(
         // condition keeps the iOS build working in the meantime rather than
         // failing on a missing slice.
         .binaryTarget(name: "SweepOpenVPNC", path: "../DataPlane/SweepOpenVPN.xcframework"),
+        // iOS WARP data plane (patched usque as a C archive); macOS runs the
+        // usque binary instead. Built by DataPlane/warpmobile/build.sh.
+        .binaryTarget(name: "SweepWarpC", path: "../DataPlane/SweepWarp.xcframework"),
         .target(name: "SweepVPNKit", dependencies: [
             .product(name: "SweepVPNCore", package: "Core"), "SweepWireGuardC",
             .target(name: "SweepOpenVPNC", condition: .when(platforms: [.macOS])),
+            .target(name: "SweepWarpC", condition: .when(platforms: [.iOS])),
         ],
         // OpenVPN 3 is C++; a Swift target linking a C++ static library has to
         // ask for the standard library itself.

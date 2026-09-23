@@ -77,9 +77,15 @@ public final class LocalProxy: @unchecked Sendable {
         // Connections already spliced keep the upstream they were dialled with;
         // only new ones follow the change, which is what a user changing a
         // setting expects anyway.
-        if listener != nil, case .listening = state {
-            onState(state)
-            return
+        // A listener still binding counts too: the WARP switch calls this again
+        // from WARP's first state change, before the first bind reports ready,
+        // and cancelling it there rebound into its own cancel (log 2026-09-15).
+        if listener != nil {
+            switch state {
+            case .listening: onState(state); return
+            case .stopped: return            // still binding
+            case .failed: break              // rebind below
+            }
         }
         stop()
         do {
@@ -444,15 +450,22 @@ public final class LocalProxy: @unchecked Sendable {
         pump(from: b, to: a)
     }
 
+    /// The next read waits for the previous write to be taken, so a fast
+    /// sender cannot queue unbounded data behind a slower tunnel, and the last
+    /// chunk before a close is delivered before the pair is torn down.
     private func pump(from: NWConnection, to: NWConnection) {
         from.receive(minimumIncompleteLength: 1, maximumLength: 32 * 1024) { data, _, done, error in
-            if let data, !data.isEmpty {
-                to.send(content: data, completion: .contentProcessed { _ in })
+            let finished = done || error != nil
+            guard let data, !data.isEmpty else {
+                if finished { to.cancel(); from.cancel() } else { self.pump(from: from, to: to) }
+                return
             }
-            if done || error != nil {
-                to.cancel(); from.cancel(); return
-            }
-            self.pump(from: from, to: to)
+            to.send(content: data, completion: .contentProcessed { sendError in
+                if finished || sendError != nil {
+                    to.cancel(); from.cancel(); return
+                }
+                self.pump(from: from, to: to)
+            })
         }
     }
 

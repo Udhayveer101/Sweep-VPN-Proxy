@@ -1,5 +1,7 @@
 export PATH := /opt/homebrew/opt/rustup/bin:$(PATH)
 RUSTUP :=
+# Stamp native libs for the app floor, not the host OS, so they load on Sequoia.
+export MACOSX_DEPLOYMENT_TARGET := 14.0
 LOCAL  := Config/Local.xcconfig
 # Signing identity and team come from your own Config/Local.xcconfig, not from
 # the repo. Override on the command line if you keep them somewhere else.
@@ -7,13 +9,16 @@ TEAM   ?= $(shell sed -n 's/^[[:space:]]*DEVELOPMENT_TEAM[[:space:]]*=[[:space:]
 CRATE  := DataPlane/sweepwg
 TARGETS := aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin
 
-.PHONY: config dataplane test project ios macos install-macos bundle-tor release
+.PHONY: deps-mac config dataplane warp-ios test test-go soak project ios ios-ipa macos install-macos bundle-warp release
 
 # First thing to run after cloning. Creates the gitignored file that holds your
 # team, your pinned key and your own Worker.
 config:
 	@if [ -f $(LOCAL) ]; then echo "$(LOCAL) already exists, leaving it alone"; \
 	else cp $(LOCAL).example $(LOCAL); echo "created $(LOCAL) - fill it in"; fi
+
+deps-mac:
+	Tools/build-deps-mac.sh
 
 dataplane:
 	cd $(CRATE) && $(RUSTUP) $(foreach t,$(TARGETS),cargo build --release --target $(t) &&) true
@@ -27,10 +32,16 @@ dataplane:
 	  -library $(CRATE)/fat/mac/libsweepwg.a -headers $(CRATE)/include \
 	  -output DataPlane/SweepWireGuard.xcframework
 
-test:
+test: test-go
 	cd Core && swift test
 	cd Kit && swift test
 	cd $(CRATE) && $(RUSTUP) cargo test --release
+
+# The Go data plane carries every packet and had no target here at all: its
+# tests only ran as a side effect of `make warp-ios`, and the Windows ones ran
+# nowhere. usque's own tests need the patched tree, so they stay with warp-ios.
+test-go:
+	cd Windows && go test ./...
 
 project: $(LOCAL)
 	xcodegen generate
@@ -38,8 +49,14 @@ project: $(LOCAL)
 $(LOCAL):
 	@$(MAKE) config
 
+warp-ios:
+	DataPlane/warpmobile/build.sh
+
+ios-ipa:
+	Tools/release-ios.sh
+
 ios: project
-	xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-iOS -sdk iphonesimulator \
+	xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-iOS -sdk iphonesimulator ARCHS=arm64 \
 	  -destination 'generic/platform=iOS Simulator' CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO build
 
 # NetworkExtension entitlements cannot be ad-hoc signed: xcodebuild rejects the
@@ -53,19 +70,19 @@ macos: project
 
 # Install where OSSystemExtensionManager will accept it. Activation requests
 # from an app outside /Applications are rejected before they reach the daemon.
-# Tor ships inside the app; see Tools/bundle-tor.sh for why the dylibs must be
-# rewritten. Signed with the development identity so the bundle stays valid.
+# usque and gaming mode's script ship inside the app; see Tools/bundle-warp.sh.
+# Signed with the development identity so the bundle stays valid.
 # Whichever development identity this Mac holds. Set SIGN_ID yourself if you
 # have more than one and want a particular certificate.
 SIGN_ID ?= $(shell security find-identity -v -p codesigning | sed -n 's/.*"\(Apple Development: .*\)"/\1/p' | head -1)
 
-bundle-tor:
+bundle-warp:
 	@APP=$$(xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-macOS \
 	    -destination 'platform=macOS' -showBuildSettings 2>/dev/null \
 	    | awk -F' = ' '/ BUILT_PRODUCTS_DIR /{d=$$2} / FULL_PRODUCT_NAME /{n=$$2} END{print d"/"n}'); \
-	  ./Tools/bundle-tor.sh "$$APP" "$(SIGN_ID)"
+	  ./Tools/bundle-warp.sh "$$APP" "$(SIGN_ID)"
 
-install-macos: macos bundle-tor
+install-macos: macos bundle-warp
 	@APP=$$(xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-macOS \
 	    -destination 'platform=macOS' -showBuildSettings 2>/dev/null \
 	    | awk -F' = ' '/ BUILT_PRODUCTS_DIR /{d=$$2} / FULL_PRODUCT_NAME /{n=$$2} END{print d"/"n}'); \
@@ -81,3 +98,8 @@ release:
 	VERSION=$(VERSION) TEAM_ID=$(TEAM) NOTARY_PROFILE=$${NOTARY_PROFILE:-sweep-notary} \
 	  SWEEP_CONFIG_SIGNING_KEY=$$(sed -n 's/^[[:space:]]*SWEEP_CONFIG_SIGNING_KEY[[:space:]]*=[[:space:]]*//p' $(LOCAL)) \
 	  Tools/release-macos.sh
+
+# Measure the tunnel instead of guessing: throughput and every interruption.
+# Run it before a change and after, same network, same hour.
+soak:
+	Tools/soak.sh $(MINUTES) $(PROXY)

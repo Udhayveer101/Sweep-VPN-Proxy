@@ -1,0 +1,926 @@
+From 6d2deb01b45c8dea2af41f62807409e8d748772b Mon Sep 17 00:00:00 2001
+From: Udhayveer Singh <udhayveersingh@Udhayveer.local>
+Date: Fri, 18 Sep 2026 00:28:45 +0530
+Subject: [PATCH] Carry the tunnel across a flow kill instead of rebuilding
+ after it
+
+The ISP on the target network sweeps established TCP flows and tears
+down every long-lived one at once (measured 2026-09-15: Google, Apple
+and Cloudflare TLS flows all stalled in the same second while ICMP kept
+flowing). Every mitigation so far has been reactive - PINGs to spot a
+black-holed flow, wedge detection, always-reconnect - so the floor
+stayed "notice the kill, rebuild, stall".
+
+Three pieces make a kill survivable instead:
+
+  --hot-standby keeps a second MASQUE session handshaken and idle, so a
+  lost flow is replaced by a promotion rather than a dial. This is also
+  what makes aggressive detection safe: the -k 2s experiment was worse
+  than -k 5s because every false positive cost a rebuild, and a warm
+  standby reduces that cost to a promotion.
+
+  --flow-ttl retires a healthy flow before it is old enough to be swept,
+  jittered so the cadence is not itself a signature. A rotation with no
+  warm standby is deferred, never forced.
+
+  A retired flow lingers, still draining into the device, and the packet
+  its device pump had already read is carried into the next session
+  instead of dropped - the same fault d5068ff fixed for the wake packet.
+
+Measured over the real network, 30s TTL: 11 rotations, zero kills, zero
+failed requests, promotion within the same second.
+
+nativetun gains a darwin backend (utun via wireguard/tun); routing is
+left to the caller, which owns the original gateway.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ api/standby.go           | 226 +++++++++++++++++++++++++++++++++++++++
+ api/standby_test.go      | 147 +++++++++++++++++++++++++
+ api/tunnel.go            | 196 +++++++++++++++++++++++----------
+ cmd/httpproxy.go         |  16 +++
+ cmd/nativetun.go         |  16 +++
+ cmd/nativetun_darwin.go  |  72 +++++++++++++
+ cmd/nativetun_default.go |   2 +-
+ cmd/socks.go             |  16 +++
+ 8 files changed, 632 insertions(+), 59 deletions(-)
+ create mode 100644 api/standby.go
+ create mode 100644 api/standby_test.go
+ create mode 100644 cmd/nativetun_darwin.go
+
+diff --git a/api/standby.go b/api/standby.go
+new file mode 100644
+index 0000000..c1f41ae
+--- /dev/null
++++ b/api/standby.go
+@@ -0,0 +1,226 @@
++package api
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"log"
++	"math/rand"
++	"net"
++	"sync"
++	"time"
++
++	connectip "github.com/Diniboy1123/connect-ip-go"
++	"github.com/Diniboy1123/usque/internal"
++	"github.com/quic-go/quic-go/http3"
++)
++
++// errFlowRotate retires a MASQUE session that is still healthy.
++//
++// The ISP on the target network sweeps established TCP flows and tears down
++// every long-lived one at once (measured 2026-09-15: Google, Apple and
++// Cloudflare TLS flows all stalled in the same second while ICMP kept
++// flowing). Every previous mitigation was reactive - PINGs, wedge detection,
++// always-reconnect - so the best case was still "notice the kill, rebuild,
++// stall for a second or two". Rotating on a timer means the flow never gets
++// old enough to be swept, and because the replacement is already handshaken
++// the handover costs no downtime.
++var errFlowRotate = errors.New("rotating MASQUE flow before it ages out")
++
++// standbyWaitRetry is how long a due rotation waits when no standby is ready
++// yet. Rotating without a warm replacement would reintroduce the very gap
++// this exists to remove, so a rotation is always deferred, never forced.
++const standbyWaitRetry = 5 * time.Second
++
++// tunnelSession owns the three handles that make up one MASQUE session.
++// Grouping them keeps a promoted standby impossible to half-close: the
++// relay-era bug (a retired adapter arming a second tunnel) came from exactly
++// that kind of split ownership.
++type tunnelSession struct {
++	udpConn *net.UDPConn
++	tr      *http3.Transport
++	ipConn  *connectip.Conn
++}
++
++// Close releases every handle the session owns. Safe on a partially dialed
++// session, so failure paths can call it unconditionally.
++func (s *tunnelSession) Close() {
++	if s == nil {
++		return
++	}
++	if s.ipConn != nil {
++		_ = s.ipConn.Close()
++	}
++	if s.tr != nil {
++		_ = s.tr.Close()
++	}
++	if s.udpConn != nil {
++		_ = s.udpConn.Close()
++	}
++}
++
++// dialSession establishes one MASQUE session and returns it ready to pump.
++// It is the connect half of MaintainTunnel's loop, extracted so the standby
++// dialer can run the identical path off the critical path.
++func dialSession(ctx context.Context, cfg MaintainTunnelConfig) (*tunnelSession, error) {
++	udpConn, tr, ipConn, rsp, err := ConnectTunnel(
++		ctx,
++		cfg.TLSConfig,
++		internal.DefaultQuicConfig(cfg.KeepalivePeriod, cfg.InitialPacketSize),
++		internal.ConnectURI,
++		cfg.Endpoint,
++		cfg.UseHTTP2,
++	)
++	sess := &tunnelSession{udpConn: udpConn, tr: tr, ipConn: ipConn}
++	if err != nil {
++		sess.Close()
++		return nil, err
++	}
++	if rsp.StatusCode != 200 {
++		sess.Close()
++		return nil, fmt.Errorf("tunnel connection failed: %s", rsp.Status)
++	}
++	return sess, nil
++}
++
++// fillStandby keeps one warm session parked in ch until ctx ends.
++//
++// A standby makes fast kill detection safe. Tightening the keepalive alone was
++// measured to be worse than leaving it (-k 2s produced more false positives
++// than -k 5s) because every false positive cost a full rebuild. With a warm
++// session waiting, a false positive costs a promotion instead, so detection
++// can be aggressive.
++func fillStandby(ctx context.Context, cfg MaintainTunnelConfig, ch chan *tunnelSession) {
++	for {
++		if ctx.Err() != nil {
++			return
++		}
++		if len(ch) > 0 {
++			// Already warm; wait for a promotion to drain it.
++			if err := sleepCtx(ctx, cfg.ReconnectDelay); err != nil {
++				return
++			}
++			continue
++		}
++
++		sess, err := dialSession(ctx, cfg)
++		if err != nil {
++			if ctx.Err() != nil {
++				return
++			}
++			log.Printf("Standby dial failed: %v", err)
++			if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
++				return
++			}
++			continue
++		}
++
++		select {
++		case ch <- sess:
++			log.Println("Standby MASQUE session warm")
++		case <-ctx.Done():
++			sess.Close()
++			return
++		default:
++			// Raced with another fill; keep only one.
++			sess.Close()
++		}
++	}
++}
++
++// takeStandby returns the warm session if one is parked, else nil.
++func takeStandby(ch chan *tunnelSession) *tunnelSession {
++	if ch == nil {
++		return nil
++	}
++	select {
++	case sess := <-ch:
++		return sess
++	default:
++		return nil
++	}
++}
++
++// drainStandby closes any parked session. Called when the tunnel stops so a
++// warm session is never left holding a socket.
++func drainStandby(ch chan *tunnelSession) {
++	if ch == nil {
++		return
++	}
++	for {
++		select {
++		case sess := <-ch:
++			sess.Close()
++		default:
++			return
++		}
++	}
++}
++
++// nextFlowTTL jitters the rotation interval by +/-20%.
++//
++// A flow retired on an exact cadence is itself a signature, and synchronized
++// rotation across sessions would put every dial in the same instant. The
++// jitter keeps the pattern irregular without widening the window enough for a
++// sweep to catch the flow.
++func nextFlowTTL(ttl time.Duration) time.Duration {
++	if ttl <= 0 {
++		return 0
++	}
++	spread := int64(ttl / 5)
++	if spread <= 0 {
++		return ttl
++	}
++	return ttl + time.Duration(rand.Int63n(2*spread)-spread)
++}
++
++// rotationShutdownGrace bounds the wait for the retiring pumps on a planned
++// rotation. Unlike a real failure there is nothing to drain - the flow is
++// healthy and we chose the moment - so the wait is only long enough for the
++// IP-connection reader to notice its closed conn.
++const rotationShutdownGrace = 100 * time.Millisecond
++
++// carriedPacket carries one already-read packet across a reconnect.
++//
++// The device pump can be parked in a blocking read when its cycle ends. It
++// wakes holding a real packet it can no longer send, and dropping it costs a
++// retransmit: a multi-second stall for whatever flow owned it. Parking it here
++// lets the next session send it as its first packet instead.
++type carriedPacket struct {
++	mu  sync.Mutex
++	buf []byte
++	n   int
++}
++
++// put parks a packet, reporting false if one is already parked (the caller
++// then owns the buffer and should return it to the pool).
++func (c *carriedPacket) put(buf []byte, n int) bool {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.buf != nil {
++		return false
++	}
++	c.buf, c.n = buf, n
++	return true
++}
++
++// take removes the parked packet, transferring buffer ownership to the caller.
++func (c *carriedPacket) take() ([]byte, int, bool) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.buf == nil {
++		return nil, 0, false
++	}
++	buf, n := c.buf, c.n
++	c.buf, c.n = nil, 0
++	return buf, n, true
++}
++
++// rotationLinger is how long a retired flow keeps being drained into the
++// device after a rotation.
++//
++// Outbound traffic moves to the new session at once, but replies to requests
++// already sent are still coming back on the old one. A dropped TCP segment
++// would only cost a retransmit; a dropped DNS answer costs the resolver's
++// whole timeout, which showed up as 5.2s stalls before this existed.
++const rotationLinger = 3 * time.Second
+diff --git a/api/standby_test.go b/api/standby_test.go
+new file mode 100644
+index 0000000..0613a23
+--- /dev/null
++++ b/api/standby_test.go
+@@ -0,0 +1,147 @@
++package api
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++)
++
++// Rotation exists to retire a flow before the ISP's sweep does. It may only
++// fire when a warm session is parked, otherwise it would open the very gap it
++// exists to close.
++func TestRotationFiresOnlyWithAWarmStandby(t *testing.T) {
++	ch := make(chan *tunnelSession, 1)
++	ch <- &tunnelSession{}
++	defer drainStandby(ch)
++
++	start := time.Now()
++	err := waitForTunnelEnd(context.Background(), make(chan error), 20*time.Millisecond, ch)
++	if !errors.Is(err, errFlowRotate) {
++		t.Fatalf("expected a rotation, got %v", err)
++	}
++	// The promotion must not cost a dial: the session is already handshaken.
++	if d := time.Since(start); d > 300*time.Millisecond {
++		t.Fatalf("rotation took %v, over the 300ms handover budget", d)
++	}
++}
++
++// With no standby warm, a due rotation must defer rather than tear down the
++// only working flow. This is the guard that keeps aggressive timing safe -
++// the -k 2s experiment showed that faster action without a warm replacement
++// is worse than doing nothing.
++func TestRotationDefersWithoutStandby(t *testing.T) {
++	ch := make(chan *tunnelSession, 1)
++	errChan := make(chan error, 1)
++
++	done := make(chan error, 1)
++	go func() {
++		done <- waitForTunnelEnd(context.Background(), errChan, 10*time.Millisecond, ch)
++	}()
++
++	select {
++	case err := <-done:
++		t.Fatalf("rotated with no standby warm: %v", err)
++	case <-time.After(120 * time.Millisecond):
++	}
++
++	// A real pump error still ends the session while the rotation is deferred.
++	want := errors.New("pump died")
++	errChan <- want
++	select {
++	case got := <-done:
++		if !errors.Is(got, want) {
++			t.Fatalf("got %v, want %v", got, want)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("pump error did not end the wait")
++	}
++}
++
++// A lost flow must still surface immediately when rotation is disabled, so
++// the existing reactive path is unchanged for proxy mode.
++func TestPumpErrorEndsWaitWithoutRotation(t *testing.T) {
++	errChan := make(chan error, 1)
++	want := errors.New("connection closed while reading")
++	errChan <- want
++
++	got := waitForTunnelEnd(context.Background(), errChan, 0, nil)
++	if !errors.Is(got, want) {
++		t.Fatalf("got %v, want %v", got, want)
++	}
++}
++
++func TestWaitForTunnelEndHonoursContext(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if err := waitForTunnelEnd(ctx, make(chan error), 0, nil); !errors.Is(err, context.Canceled) {
++		t.Fatalf("got %v, want context.Canceled", err)
++	}
++}
++
++// Rotating on an exact cadence is itself a signature, and would also line
++// every session's dial up in the same instant.
++func TestFlowTTLIsJittered(t *testing.T) {
++	const ttl = time.Second
++	seen := map[time.Duration]bool{}
++	for i := 0; i < 200; i++ {
++		d := nextFlowTTL(ttl)
++		if d < 800*time.Millisecond || d > 1200*time.Millisecond {
++			t.Fatalf("jittered ttl %v outside +/-20%% of %v", d, ttl)
++		}
++		seen[d] = true
++	}
++	if len(seen) < 10 {
++		t.Fatalf("only %d distinct intervals; jitter is not spreading", len(seen))
++	}
++	if d := nextFlowTTL(0); d != 0 {
++		t.Fatalf("disabled rotation returned %v", d)
++	}
++}
++
++func TestTakeStandbyIsNonBlocking(t *testing.T) {
++	if got := takeStandby(nil); got != nil {
++		t.Fatal("nil channel must yield no session")
++	}
++	ch := make(chan *tunnelSession, 1)
++	if got := takeStandby(ch); got != nil {
++		t.Fatal("empty channel must yield no session")
++	}
++	want := &tunnelSession{}
++	ch <- want
++	if got := takeStandby(ch); got != want {
++		t.Fatal("warm session was not promoted")
++	}
++	if got := takeStandby(ch); got != nil {
++		t.Fatal("a promoted session must not be handed out twice")
++	}
++}
++
++// A packet already read off the device when its cycle ends must survive the
++// handover. Dropping it costs a retransmit, which is a multi-second stall for
++// the flow that owned it - the same fault d5068ff fixed for the wake packet.
++func TestCarriedPacketSurvivesHandover(t *testing.T) {
++	var c carriedPacket
++
++	if _, _, ok := c.take(); ok {
++		t.Fatal("empty carrier yielded a packet")
++	}
++
++	buf := []byte("packet")
++	if !c.put(buf, len(buf)) {
++		t.Fatal("first put was refused")
++	}
++	// Only one packet is ever in flight per cycle; a second must be refused
++	// so the caller can return the buffer to the pool rather than leak it.
++	if c.put([]byte("second"), 6) {
++		t.Fatal("carrier accepted a second packet")
++	}
++
++	got, n, ok := c.take()
++	if !ok || n != len(buf) || string(got[:n]) != "packet" {
++		t.Fatalf("got %q/%d ok=%v, want the parked packet", got, n, ok)
++	}
++	if _, _, ok := c.take(); ok {
++		t.Fatal("packet was handed out twice")
++	}
++}
+diff --git a/api/tunnel.go b/api/tunnel.go
+index 6da78e3..ba3c551 100644
+--- a/api/tunnel.go
++++ b/api/tunnel.go
+@@ -13,7 +13,6 @@ import (
+ 	"time"
+ 
+ 	connectip "github.com/Diniboy1123/connect-ip-go"
+-	"github.com/Diniboy1123/usque/internal"
+ 	"github.com/songgao/water"
+ 	"golang.zx2c4.com/wireguard/tun"
+ )
+@@ -172,6 +171,14 @@ type MaintainTunnelConfig struct {
+ 	ReconnectDelay    time.Duration
+ 	AlwaysReconnect   bool
+ 	UseHTTP2          bool
++	// HotStandby keeps a second MASQUE session handshaken and idle so a lost
++	// or rotated flow is replaced by a promotion instead of a rebuild.
++	HotStandby bool
++	// FlowTTL retires a healthy flow once it reaches this age (jittered), so
++	// it never lives long enough for the ISP's sweep of long-lived TCP flows
++	// to tear it down. Zero disables rotation. Requires HotStandby: without a
++	// warm replacement, rotating would cause the gap it exists to prevent.
++	FlowTTL time.Duration
+ 	// OnConnect is a path to an executable run after every successful tunnel
+ 	// connect. It is exec'd directly (no shell, no args) and runs fire-and-forget.
+ 	OnConnect string
+@@ -234,12 +241,33 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 
+ 	packetBufferPool := NewNetBuffer(cfg.MTU + datagramContextIDHeadroom)
+ 
++	// readMu is held across reconnect cycles on purpose: a pump parked in a
++	// blocking device read outlives its cycle, and a fresh reader must not
++	// race it for the same device.
++	var readMu sync.Mutex
++	// carried holds the packet a retiring pump had already read. Dropping it
++	// costs a TCP retransmit - seconds of stall for the game - which is the
++	// same fault d5068ff fixed for the wake-up packet.
++	var carried carriedPacket
++
++	var standbyCh chan *tunnelSession
++	if cfg.HotStandby {
++		standbyCh = make(chan *tunnelSession, 1)
++		standbyCtx, stopStandby := context.WithCancel(ctx)
++		defer stopStandby()
++		defer drainStandby(standbyCh)
++		go fillStandby(standbyCtx, cfg, standbyCh)
++	}
++
+ 	for {
+ 		if ctx.Err() != nil {
+ 			return
+ 		}
+ 
+-		if !cfg.AlwaysReconnect {
++		// A warm session means there is nothing to wait for: promoting it is
++		// the whole point, and the idle wait below would park us in a
++		// blocking TUN read instead.
++		if !cfg.AlwaysReconnect && len(standbyCh) == 0 {
+ 			log.Println("Tunnel idle. Waiting for outbound activity before reconnecting...")
+ 			buf := packetBufferPool.Get()
+ 			n, err := cfg.Device.ReadPacket(buf[datagramContextIDHeadroom:])
+@@ -255,45 +283,22 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 			log.Printf("Detected outbound activity (%d bytes). Reconnecting...", n)
+ 		}
+ 
+-		log.Printf("Establishing MASQUE connection to %s", cfg.Endpoint)
+-		udpConn, tr, ipConn, rsp, err := ConnectTunnel(
+-			ctx,
+-			cfg.TLSConfig,
+-			internal.DefaultQuicConfig(cfg.KeepalivePeriod, cfg.InitialPacketSize),
+-			internal.ConnectURI,
+-			cfg.Endpoint,
+-			cfg.UseHTTP2,
+-		)
+-		if err != nil {
+-			log.Printf("Failed to connect tunnel: %v", err)
+-			if ipConn != nil {
+-				_ = ipConn.Close()
+-			}
+-			if tr != nil {
+-				_ = tr.Close()
+-			}
+-			if udpConn != nil {
+-				_ = udpConn.Close()
+-			}
+-			if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
+-				return
+-			}
+-			continue
+-		}
+-		if rsp.StatusCode != 200 {
+-			log.Printf("Tunnel connection failed: %s", rsp.Status)
+-			_ = ipConn.Close()
+-			if tr != nil {
+-				_ = tr.Close()
+-			}
+-			if udpConn != nil {
+-				_ = udpConn.Close()
+-			}
+-			if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
+-				return
++		sess := takeStandby(standbyCh)
++		if sess != nil {
++			log.Println("Promoted standby MASQUE session")
++		} else {
++			log.Printf("Establishing MASQUE connection to %s", cfg.Endpoint)
++			var err error
++			sess, err = dialSession(ctx, cfg)
++			if err != nil {
++				log.Printf("Failed to connect tunnel: %v", err)
++				if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
++					return
++				}
++				continue
+ 			}
+-			continue
+ 		}
++		udpConn, tr, ipConn := sess.udpConn, sess.tr, sess.ipConn
+ 
+ 		log.Println("Connected to MASQUE server")
+ 
+@@ -304,10 +309,18 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 			RunHook(cfg.OnConnect, env)
+ 		}
+ 
++		// Hand the retiring cycle's already-read packet to the new session
++		// before anything else, so a rotation loses nothing.
++		if buf, n, ok := carried.take(); ok {
++			if _, err := ipConn.WritePacketBuffer(buf, datagramContextIDHeadroom, n); err != nil {
++				log.Printf("Failed to forward the carried packet: %v", err)
++			}
++			packetBufferPool.Put(buf)
++		}
++
+ 		errChan := make(chan error, 2)
+ 		pumpCtx, cancelPumps := context.WithCancel(ctx)
+ 		var wg sync.WaitGroup
+-		var readMu sync.Mutex
+ 
+ 		wg.Add(2)
+ 
+@@ -327,7 +340,11 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 					return
+ 				}
+ 				if pumpCtx.Err() != nil {
+-					packetBufferPool.Put(buf)
++					// This cycle is over, but the packet is real. Park it for
++					// the next session instead of dropping it.
++					if !carried.put(buf, n) {
++						packetBufferPool.Put(buf)
++					}
+ 					return
+ 				}
+ 				icmp, err := ipConn.WritePacketBuffer(buf, datagramContextIDHeadroom, n)
+@@ -377,8 +394,12 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 			}
+ 		}()
+ 
+-		err = <-errChan
+-		log.Printf("Tunnel connection lost: %v. Reconnecting...", err)
++		err := waitForTunnelEnd(ctx, errChan, cfg.FlowTTL, standbyCh)
++		if errors.Is(err, errFlowRotate) {
++			log.Println("Retiring MASQUE flow before it ages out; promoting standby")
++		} else {
++			log.Printf("Tunnel connection lost: %v. Reconnecting...", err)
++		}
+ 
+ 		if cfg.OnDisconnect != "" {
+ 			env := cloneHookEnv(cfg.HookEnv)
+@@ -387,25 +408,50 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 			RunHook(cfg.OnDisconnect, env)
+ 		}
+ 
++		// cancelPumps stops the device reader, so outbound packets move to the
++		// new session immediately. The IP-connection reader is not cancelled
++		// here: it exits when its conn closes, which is what makes the linger
++		// below possible.
+ 		cancelPumps()
+-		_ = ipConn.Close()
+ 
+-		done := make(chan struct{})
+-		go func() {
+-			wg.Wait()
+-			close(done)
+-		}()
+-		select {
+-		case <-done:
+-		case <-time.After(pumpShutdownGrace):
+-			log.Printf("Pump shutdown grace of %s expired; a stale TUN reader may still be parked (readMu will serialize next cycle)", pumpShutdownGrace)
+-		}
++		if errors.Is(err, errFlowRotate) {
++			// Make before break. The retired flow is still healthy and may be
++			// carrying replies we already asked for - a DNS answer above all,
++			// which has no retransmit of its own and costs a full resolver
++			// timeout (measured: 5.2s stalls) if it is dropped. Keep draining
++			// it into the device for a moment, then close it. Outbound traffic
++			// is already on the new session, so nothing new is sent here.
++			retired := sess
++			time.AfterFunc(rotationLinger, func() {
++				retired.Close()
++			})
++		} else {
++			_ = ipConn.Close()
+ 
+-		if tr != nil {
+-			_ = tr.Close()
++			done := make(chan struct{})
++			go func() {
++				wg.Wait()
++				close(done)
++			}()
++			select {
++			case <-done:
++			case <-time.After(pumpShutdownGrace):
++				log.Printf("Pump shutdown grace of %s expired; a stale TUN reader may still be parked (readMu will serialize next cycle)", pumpShutdownGrace)
++			}
++
++			if tr != nil {
++				_ = tr.Close()
++			}
++			if udpConn != nil {
++				_ = udpConn.Close()
++			}
+ 		}
+-		if udpConn != nil {
+-			_ = udpConn.Close()
++
++		// A warm standby is the whole reason a kill can be invisible: waiting
++		// out the reconnect delay before promoting it would spend the gap we
++		// just paid to avoid.
++		if len(standbyCh) > 0 {
++			continue
+ 		}
+ 		if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
+ 			return
+@@ -413,6 +459,40 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 	}
+ }
+ 
++// waitForTunnelEnd blocks until the session should end: a pump error, ctx
++// cancellation, or the flow reaching its TTL.
++//
++// A due rotation with no warm standby is deferred rather than forced. Retiring
++// the only working flow would open exactly the gap rotation exists to close,
++// so the timer simply re-arms and tries again once a standby lands.
++func waitForTunnelEnd(ctx context.Context, errChan <-chan error, flowTTL time.Duration, standbyCh chan *tunnelSession) error {
++	if flowTTL > 0 && standbyCh != nil {
++		timer := time.NewTimer(nextFlowTTL(flowTTL))
++		defer timer.Stop()
++
++		for {
++			select {
++			case err := <-errChan:
++				return err
++			case <-ctx.Done():
++				return ctx.Err()
++			case <-timer.C:
++				if len(standbyCh) > 0 {
++					return errFlowRotate
++				}
++				timer.Reset(standbyWaitRetry)
++			}
++		}
++	}
++
++	select {
++	case err := <-errChan:
++		return err
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
+ // isClosedPipe reports a MASQUE session whose HTTP/2 stream was closed
+ // underneath it. connect-ip-go surfaces that as io.ErrClosedPipe rather than a
+ // CloseError, so without this the write pump logs "continuing..." forever while
+diff --git a/cmd/httpproxy.go b/cmd/httpproxy.go
+index 505cffa..26a3085 100644
+--- a/cmd/httpproxy.go
++++ b/cmd/httpproxy.go
+@@ -210,6 +210,18 @@ var httpProxyCmd = &cobra.Command{
+ 			return
+ 		}
+ 
++		hotStandby, err := cmd.Flags().GetBool("hot-standby")
++		if err != nil {
++			cmd.Printf("Failed to get hot-standby: %v\n", err)
++			return
++		}
++
++		flowTTL, err := cmd.Flags().GetDuration("flow-ttl")
++		if err != nil {
++			cmd.Printf("Failed to get flow-ttl: %v\n", err)
++			return
++		}
++
+ 		alwaysReconnect, err := cmd.Flags().GetBool("always-reconnect")
+ 		if err != nil {
+ 			cmd.Printf("Failed to get always-reconnect flag: %v\n", err)
+@@ -258,6 +270,8 @@ var httpProxyCmd = &cobra.Command{
+ 			ReconnectDelay:    reconnectDelay,
+ 			AlwaysReconnect:   alwaysReconnect,
+ 			UseHTTP2:          useHTTP2,
++			HotStandby:        hotStandby,
++			FlowTTL:           flowTTL,
+ 			OnConnect:         onConnect,
+ 			OnDisconnect:      onDisconnect,
+ 			HookEnv:           hookEnv,
+@@ -443,6 +457,8 @@ func init() {
+ 	httpProxyCmd.Flags().IntP("mtu", "m", 1280, "MTU for MASQUE connection")
+ 	httpProxyCmd.Flags().Uint16P("initial-packet-size", "i", 0, "Custom initial packet size for MASQUE connection (default: auto with PMTU discovery)")
+ 	httpProxyCmd.Flags().DurationP("reconnect-delay", "r", 1*time.Second, "Delay between reconnect attempts")
++	httpProxyCmd.Flags().Bool("hot-standby", false, "Keep a second MASQUE session handshaken and idle so a lost or rotated flow is replaced by a promotion instead of a rebuild")
++	httpProxyCmd.Flags().Duration("flow-ttl", 0, "Retire a healthy MASQUE flow at this age (jittered +/-20%) so a network that sweeps long-lived TCP flows never catches it. Requires --hot-standby; 0 disables")
+ 	httpProxyCmd.Flags().Bool("always-reconnect", false, "Always reconnect after tunnel loss, even when idle")
+ 	httpProxyCmd.Flags().Bool("http2", false, "Use HTTP/2 over TCP+TLS instead of HTTP/3 over QUIC."+config.EndpointHelpSuffixH2)
+ 	httpProxyCmd.Flags().Bool("insecure", false, "Disable endpoint certificate pinning and trust any certificate")
+diff --git a/cmd/nativetun.go b/cmd/nativetun.go
+index 840c999..1d1c87d 100644
+--- a/cmd/nativetun.go
++++ b/cmd/nativetun.go
+@@ -141,6 +141,18 @@ var nativeTunCmd = &cobra.Command{
+ 			return
+ 		}
+ 
++		hotStandby, err := cmd.Flags().GetBool("hot-standby")
++		if err != nil {
++			cmd.Printf("Failed to get hot-standby: %v\n", err)
++			return
++		}
++
++		flowTTL, err := cmd.Flags().GetDuration("flow-ttl")
++		if err != nil {
++			cmd.Printf("Failed to get flow-ttl: %v\n", err)
++			return
++		}
++
+ 		alwaysReconnect, err := cmd.Flags().GetBool("always-reconnect")
+ 		if err != nil {
+ 			cmd.Printf("Failed to get always-reconnect flag: %v\n", err)
+@@ -213,6 +225,8 @@ var nativeTunCmd = &cobra.Command{
+ 			ReconnectDelay:    reconnectDelay,
+ 			AlwaysReconnect:   alwaysReconnect,
+ 			UseHTTP2:          useHTTP2,
++			HotStandby:        hotStandby,
++			FlowTTL:           flowTTL,
+ 			OnConnect:         onConnect,
+ 			OnDisconnect:      onDisconnect,
+ 			HookEnv:           hookEnv,
+@@ -235,6 +249,8 @@ func init() {
+ 	nativeTunCmd.Flags().Uint16P("initial-packet-size", "i", 0, "Custom initial packet size for MASQUE connection (default: auto with PMTU discovery)")
+ 	nativeTunCmd.Flags().BoolP("no-iproute2", "I", false, "Linux only: Do not set up IP addresses and do not set the link up")
+ 	nativeTunCmd.Flags().DurationP("reconnect-delay", "r", 1*time.Second, "Delay between reconnect attempts")
++	nativeTunCmd.Flags().Bool("hot-standby", false, "Keep a second MASQUE session handshaken and idle so a lost or rotated flow is replaced by a promotion instead of a rebuild")
++	nativeTunCmd.Flags().Duration("flow-ttl", 0, "Retire a healthy MASQUE flow at this age (jittered +/-20%) so a network that sweeps long-lived TCP flows never catches it. Requires --hot-standby; 0 disables")
+ 	nativeTunCmd.Flags().Bool("always-reconnect", false, "Always reconnect after tunnel loss, even when idle")
+ 	nativeTunCmd.Flags().Bool("http2", false, "Use HTTP/2 over TCP+TLS instead of HTTP/3 over QUIC."+config.EndpointHelpSuffixH2)
+ 	nativeTunCmd.Flags().Bool("insecure", false, "Disable endpoint certificate pinning and trust any certificate")
+diff --git a/cmd/nativetun_darwin.go b/cmd/nativetun_darwin.go
+new file mode 100644
+index 0000000..1fa1113
+--- /dev/null
++++ b/cmd/nativetun_darwin.go
+@@ -0,0 +1,72 @@
++//go:build darwin
++
++package cmd
++
++import (
++	"fmt"
++	"os/exec"
++	"strings"
++
++	"github.com/Diniboy1123/usque/api"
++	"github.com/Diniboy1123/usque/config"
++	"golang.zx2c4.com/wireguard/tun"
++)
++
++var longDescription = "Expose Warp as a native TUN device that accepts any IP traffic." +
++	" Requires root. Routing is left to the caller; see --help for the two-halves default route."
++
++// create brings up a utun interface and addresses it.
++//
++// macOS utun is point-to-point: ifconfig needs both the local and the peer
++// address, and BSD route/ifconfig have no netmask form that works here, so the
++// tunnel address is used for both ends. Routing is deliberately NOT set up
++// here - the caller owns it, because tearing routes down correctly needs the
++// original default gateway, which only the supervising app knows.
++func (t *tunDevice) create() (api.TunnelDevice, error) {
++	if t.name == "" {
++		t.name = "utun"
++	}
++	if t.name != "utun" && !strings.HasPrefix(t.name, "utun") {
++		return nil, fmt.Errorf("darwin interface names must start with utun, got %q", t.name)
++	}
++
++	dev, err := tun.CreateTUN(t.name, t.mtu)
++	if err != nil {
++		return nil, fmt.Errorf("failed to create utun (are we root?): %w", err)
++	}
++
++	t.name, err = dev.Name()
++	if err != nil {
++		_ = dev.Close()
++		return nil, err
++	}
++
++	if t.ipv4 {
++		addr := config.AppConfig.IPv4
++		if err := ifconfig(t.name, "inet", addr, addr, "mtu", fmt.Sprint(t.mtu), "up"); err != nil {
++			_ = dev.Close()
++			return nil, fmt.Errorf("failed to set IPv4 address: %w", err)
++		}
++	}
++
++	if t.ipv6 {
++		// IPv6 does not route inside the MASQUE session on the networks this
++		// is used on; addressing it anyway is harmless, but callers are
++		// expected to leave v6 out of the tunnel routes.
++		if err := ifconfig(t.name, "inet6", config.AppConfig.IPv6, "prefixlen", "128", "up"); err != nil {
++			_ = dev.Close()
++			return nil, fmt.Errorf("failed to set IPv6 address: %w", err)
++		}
++	}
++
++	return api.NewNetstackAdapter(dev), nil
++}
++
++func ifconfig(args ...string) error {
++	cmd := exec.Command("/sbin/ifconfig", args...)
++	out, err := cmd.CombinedOutput()
++	if err != nil {
++		return fmt.Errorf("ifconfig %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
++	}
++	return nil
++}
+diff --git a/cmd/nativetun_default.go b/cmd/nativetun_default.go
+index 2a19cd0..62254b0 100644
+--- a/cmd/nativetun_default.go
++++ b/cmd/nativetun_default.go
+@@ -1,4 +1,4 @@
+-//go:build !linux && !windows
++//go:build !linux && !windows && !darwin
+ 
+ package cmd
+ 
+diff --git a/cmd/socks.go b/cmd/socks.go
+index 26345bd..734e193 100644
+--- a/cmd/socks.go
++++ b/cmd/socks.go
+@@ -217,6 +217,18 @@ var socksCmd = &cobra.Command{
+ 			log.Println("Warning: --udp-timeout is 0; idle UDP ASSOCIATE exchanges will never expire. Memory will grow under heavy UDP traffic (DHT, uTP, etc.).")
+ 		}
+ 
++		hotStandby, err := cmd.Flags().GetBool("hot-standby")
++		if err != nil {
++			cmd.Printf("Failed to get hot-standby: %v\n", err)
++			return
++		}
++
++		flowTTL, err := cmd.Flags().GetDuration("flow-ttl")
++		if err != nil {
++			cmd.Printf("Failed to get flow-ttl: %v\n", err)
++			return
++		}
++
+ 		alwaysReconnect, err := cmd.Flags().GetBool("always-reconnect")
+ 		if err != nil {
+ 			cmd.Printf("Failed to get always-reconnect flag: %v\n", err)
+@@ -258,6 +270,8 @@ var socksCmd = &cobra.Command{
+ 			ReconnectDelay:    reconnectDelay,
+ 			AlwaysReconnect:   alwaysReconnect,
+ 			UseHTTP2:          useHTTP2,
++			HotStandby:        hotStandby,
++			FlowTTL:           flowTTL,
+ 			OnConnect:         onConnect,
+ 			OnDisconnect:      onDisconnect,
+ 			HookEnv:           hookEnv,
+@@ -311,6 +325,8 @@ func init() {
+ 	socksCmd.Flags().Uint16P("initial-packet-size", "i", 0, "Custom initial packet size for MASQUE connection (default: auto with PMTU discovery)")
+ 	socksCmd.Flags().DurationP("reconnect-delay", "r", 1*time.Second, "Delay between reconnect attempts")
+ 	socksCmd.Flags().Duration("udp-timeout", 60*time.Second, "Idle read deadline for each remote UDP relay (SOCKS5 ASSOCIATE). Shorter frees memory sooner; raise (e.g. 300s) if a quiet peer needs longer silence. 0 disables the deadline and risks unbounded growth under DHT/uTP")
++	socksCmd.Flags().Bool("hot-standby", false, "Keep a second MASQUE session handshaken and idle so a lost or rotated flow is replaced by a promotion instead of a rebuild")
++	socksCmd.Flags().Duration("flow-ttl", 0, "Retire a healthy MASQUE flow at this age (jittered +/-20%) so a network that sweeps long-lived TCP flows never catches it. Requires --hot-standby; 0 disables")
+ 	socksCmd.Flags().Bool("always-reconnect", false, "Always reconnect after tunnel loss, even when idle")
+ 	socksCmd.Flags().Bool("http2", false, "Use HTTP/2 over TCP+TLS instead of HTTP/3 over QUIC."+config.EndpointHelpSuffixH2)
+ 	socksCmd.Flags().Bool("insecure", false, "Disable endpoint certificate pinning and trust any certificate")
+-- 
+2.50.1 (Apple Git-155)
+

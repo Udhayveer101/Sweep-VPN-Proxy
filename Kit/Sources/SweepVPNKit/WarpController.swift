@@ -30,10 +30,15 @@ public final class WarpController: @unchecked Sendable {
     private let lock = NSLock()
     private var onState: (@Sendable (State) -> Void)?
     private var stallTimer: DispatchSourceTimer?
-    private var failureTimes: [Date] = []
+    private var recoveryTimer: DispatchSourceTimer?
     private var lastRestart: Date = .distantPast
     private var restarting = false
     private var stopped = false
+    private var restartStreak = StartBackoff()
+    /// Partial line left over from the last `availableData` chunk. Without it a
+    /// log line split across a read boundary is classified as two fragments and
+    /// the event in it — a loss, a reconnect — is simply never seen.
+    private var logTail = ""
     private(set) public var state: State = .stopped {
         didSet { if state != oldValue { onState?(state) } }
     }
@@ -48,7 +53,7 @@ public final class WarpController: @unchecked Sendable {
     /// registration may still sit in the old container; prefer it rather than
     /// making the user register again.
     public static var defaultDirectory: URL {
-        let plain = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let plain = SupportDirectory.base
             .appendingPathComponent("SweepVPN/warp", isDirectory: true)
         if FileManager.default.fileExists(atPath: plain.appendingPathComponent("config.json").path) {
             return plain
@@ -96,6 +101,21 @@ public final class WarpController: @unchecked Sendable {
     /// timeout and every lookup failed. HTTP/2 PINGs now catch it in <=8s, and
     /// the patched resolver re-asks every 1.5s, so a 15s DNS budget spans
     /// detection plus the ~3s redial instead of failing inside it.
+    /// Deliberately *not* `--hot-standby`, which gaming mode does pass.
+    ///
+    /// The theory was good — a warm second session turns a swept flow into a
+    /// promotion instead of a rebuild — but it did not survive measurement.
+    /// Run head to head on 2026-09-20, both tunnels up at once so they saw the
+    /// same network, 14 minutes each through Tools/soak.sh: with standby,
+    /// median 19.77 Mbit/s and 1 failed transfer, longest unbroken 332s;
+    /// without, median 19.34 Mbit/s and 0 failed, longest unbroken 535s. A wash
+    /// on throughput, and if anything worse on the two numbers that matter.
+    ///
+    /// So it stays off here. A standby is a second long-lived TCP flow to the
+    /// same endpoint, on the network that sweeps long-lived TCP flows, and that
+    /// is not a cost worth paying for an effect nobody can measure. Gaming mode
+    /// keeps it because rotation needs a warm session to rotate *into*.
+    /// Re-measure before changing this, don't reason about it.
     var arguments: [String] {
         ["-c", configFile.path, "socks",
          "-s", sni, "--http2",
@@ -140,7 +160,30 @@ public final class WarpController: @unchecked Sendable {
             guard wasOurs else { return }            // stop() already reported
             self.record(.warn, "exited", "status \(proc.terminationStatus)")
             if case .failed = self.state { return }  // keep the parsed reason
-            self.state = .failed("WARP exited unexpectedly (status \(proc.terminationStatus)).")
+            // A crash is a disconnect nobody asked for, and in "route this Mac
+            // through WARP" the system proxy points at this listener: come back,
+            // with the same backoff as a wedge, instead of failing closed until
+            // the user notices and toggles it (Windows' warp.go already does).
+            self.lock.lock()
+            self.restartStreak = self.restartStreak.recordingFailure()
+            let tries = self.restartStreak.consecutiveFailures
+            let delay = self.restartStreak.delay()
+            let callback = self.onState
+            let giveUp = self.stopped || tries > Self.maxRespawns
+            self.lock.unlock()
+            guard !giveUp, let callback else {
+                self.state = .failed("WARP exited unexpectedly (status \(proc.terminationStatus)).")
+                return
+            }
+            self.state = .starting
+            self.record(.info, "respawning", "in \(Int(delay))s (attempt \(tries))")
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                let abandoned = self.stopped || self.process != nil
+                self.lock.unlock()
+                if !abandoned { self.start(onState: callback) }
+            }
         }
 
         do {
@@ -161,6 +204,9 @@ public final class WarpController: @unchecked Sendable {
         stopped = true
         stallTimer?.cancel()
         stallTimer = nil
+        recoveryTimer?.cancel()
+        recoveryTimer = nil
+        logTail = ""
         lock.unlock()
         p?.terminate()
         if p != nil { record(.info, "stopped", "asked to stop") }
@@ -184,56 +230,120 @@ public final class WarpController: @unchecked Sendable {
     }
 
     /// Lines from usque 2026-09 (see WarpControllerTests for real samples).
+    ///
+    /// `availableData` splits wherever the pipe buffer happened to end, not on
+    /// newlines, so the trailing fragment is held back and prepended to the next
+    /// chunk instead of being classified as a line of its own.
     func ingest(log text: String) {
-        for raw in text.split(whereSeparator: \.isNewline) {
-            let line = String(raw)
+        lock.lock()
+        let buffered = logTail + text
+        var lines = buffered.components(separatedBy: .newlines)
+        logTail = buffered.hasSuffix("\n") ? "" : (lines.popLast() ?? "")
+        lock.unlock()
+
+        for line in lines where !line.isEmpty {
             switch Self.classify(line) {
             case .listening:
-                stallTimer?.cancel()
-                stallTimer = nil
+                lock.lock(); stallTimer?.cancel(); stallTimer = nil; lock.unlock()
                 state = .running
                 record(.info, "listening", line)
             case .connected:
+                // usque rebuilt the session by itself: whatever we were waiting
+                // on healed, so stand the wedge deadline down.
+                noteRecovered()
                 record(.info, "connected", line)
+            // A loss is usque telling us it is already reconnecting, not a fault
+            // to act on. Both it and an outright error only start the clock; the
+            // wedge is the clock running out, handled in armRecoveryDeadline.
+            case .lost:
+                record(.info, "lost", line)
+                armRecoveryDeadline(line)
             case .error:
                 record(.warn, "log", line)
-                if noteFailure(line) { restartWedgedTunnel(line) }
+                armRecoveryDeadline(line)
+            case .connectionError:
+                // One client's failure. Log it and leave the tunnel alone.
+                record(.warn, "clientLog", line)
             case nil:
                 break
             }
         }
     }
 
-    /// usque only tears the session down when a write fails with a connect-ip
-    /// CloseError (api/tunnel.go). A MASQUE session whose HTTP/2 pipe has been
-    /// closed underneath it fails with `io: read/write on closed pipe` instead,
-    /// which it logs as "continuing..." forever while the read pump stays parked
-    /// — so it reports Connected while nothing flows and never reconnects. Seen
-    /// 2026-09-13: a minute of traffic, then every lookup timing out for good.
-    /// We supervise the process, so we are the ones who can end that: a write
-    /// failure is acted on at once, and a burst of dial failures counts as the
-    /// same wedge in case the write pump stays quiet.
-    static let wedgeWindow: TimeInterval = 10
-    static let wedgeBurst = 4
+    /// usque heals its own session losses: `masque-closed-pipe.patch` ends a
+    /// session whose HTTP/2 pipe died under a write, and `--always-reconnect`
+    /// rebuilds it in about a second.
+    ///
+    /// Until now this supervisor relaunched the whole child process on the very
+    /// first write error, so that cheap in-process reconnect was pre-empted by a
+    /// cold restart — terminate, wait, reload the config, redo the TLS handshake,
+    /// open a new listener — and for all of it the SOCKS port was *gone*, so
+    /// every app connection failed outright. On a path that sweeps long-lived
+    /// flows every 1-4 minutes that fired every 1-4 minutes. It is the regression
+    /// testers felt from v1.3.0 (see docs/research-warp-stability-2026-09.md).
+    ///
+    /// So the supervisor now only acts when usque has *failed* to heal. A failure
+    /// arms a deadline; a "Connected to MASQUE server" line disarms it; only an
+    /// expired deadline is a wedge. That still catches the 2026-09-13 case — a
+    /// pipe closed underneath a parked read pump, where usque logs
+    /// "continuing..." forever and never reconnects — because in that case the
+    /// reconnect line never comes.
+    static let recoveryGrace: TimeInterval = 15
+    /// Crashes in a row (within StartBackoff's 10-minute streak) before giving up.
+    static let maxRespawns = 5
     static let restartFloor: TimeInterval = 20
 
-    /// `true` when this error line means the tunnel is wedged and the child
-    /// should be relaunched. Bookkeeping only — the process work is separate so
-    /// this stays testable. `now` is injectable for the same reason.
+    /// Start the clock on a failure line. Returns `true` if this call armed the
+    /// deadline (bookkeeping only, so it stays testable); `now` is injectable
+    /// for the same reason.
+    @discardableResult
     func noteFailure(_ line: String, now: Date = Date()) -> Bool {
-        let writeFailed = line.contains("closed pipe")
-            || line.contains("Error writing to IP connection")
         lock.lock()
-        defer { lock.unlock() }
-        failureTimes.append(now)
-        failureTimes.removeAll { now.timeIntervalSince($0) > Self.wedgeWindow }
-        let wedged = writeFailed || failureTimes.count >= Self.wedgeBurst
-        guard wedged, !restarting, process != nil,
-              now.timeIntervalSince(lastRestart) >= Self.restartFloor else { return false }
-        lastRestart = now
-        failureTimes.removeAll()
-        restarting = true
+        guard !restarting, process != nil, recoveryTimer == nil,
+              now.timeIntervalSince(lastRestart) >= Self.restartFloor else {
+            lock.unlock(); return false
+        }
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now() + Self.recoveryGrace)
+        timer.setEventHandler { [weak self] in self?.recoveryDeadlineExpired(line) }
+        recoveryTimer = timer
+        lock.unlock()
+        timer.resume()
         return true
+    }
+
+    /// usque reconnected on its own — the common case, and the one that must
+    /// cost nothing.
+    func noteRecovered() {
+        lock.lock()
+        let timer = recoveryTimer
+        recoveryTimer = nil
+        restartStreak = restartStreak.recordingSuccess()
+        lock.unlock()
+        timer?.cancel()
+    }
+
+    /// `true` when a failure is currently being waited on. Tests read it.
+    var isAwaitingRecovery: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return recoveryTimer != nil
+    }
+
+    private func armRecoveryDeadline(_ line: String) {
+        guard noteFailure(line) else { return }
+        record(.info, "watching", "no reconnect within \(Int(Self.recoveryGrace))s is a wedge")
+    }
+
+    private func recoveryDeadlineExpired(_ line: String) {
+        lock.lock()
+        recoveryTimer = nil
+        guard !restarting, process != nil, !stopped else { lock.unlock(); return }
+        restarting = true
+        lastRestart = Date()
+        restartStreak = restartStreak.recordingFailure()
+        let delay = restartStreak.delay()
+        lock.unlock()
+        restartWedgedTunnel(line, after: delay)
     }
 
     /// Tests need a controller that believes a child is running without one —
@@ -244,9 +354,15 @@ public final class WarpController: @unchecked Sendable {
         restarting = false
     }
 
-    private func restartWedgedTunnel(_ line: String) {
-        record(.warn, "restarting", "tunnel wedged: \(line)")
-        DispatchQueue.global().async { [self] in
+    /// Relaunch, after `delay`. usque failing to reconnect usually means the
+    /// path is down, not that the child is sick, so repeated restarts back off
+    /// (StartBackoff: 0, 2, 5, 15, 30, 60, 120s) rather than respawning every
+    /// 20 seconds forever.
+    private func restartWedgedTunnel(_ line: String, after delay: TimeInterval = 0) {
+        record(.warn, "restarting",
+               "no reconnect within \(Int(Self.recoveryGrace))s after: \(line)"
+               + (delay > 0 ? " (waiting \(Int(delay))s)" : ""))
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [self] in
             lock.lock()
             let doomed = process
             process = nil
@@ -268,23 +384,62 @@ public final class WarpController: @unchecked Sendable {
         }
     }
 
-    enum LogEvent: Equatable { case listening, connected, error }
-
-    static func classify(_ line: String) -> LogEvent? {
-        if line.contains("SOCKS proxy listening on") { return .listening }
-        if line.contains("Connected to MASQUE server") { return .connected }
-        let l = line.lowercased()
-        if l.contains("failed") || l.contains("error") { return .error }
-        return nil
-    }
-
     private func record(_ level: LogEntry.Level, _ kind: String, _ detail: String) {
         EventLog.shared.record(phase: "warp", level: level, kind: kind, detail: detail)
     }
 }
 
+#endif
+
+import Foundation
+
+extension WarpController {
+    enum LogEvent: Equatable {
+        case listening, connected, lost
+        /// The MASQUE session itself is in trouble, so usque owes us a
+        /// reconnect and the wedge deadline means something.
+        case error
+        /// A failure that belongs to one SOCKS client — a dial, a DNS answer, a
+        /// malformed datagram. Worth logging, never worth supervising.
+        case connectionError
+    }
+
+    /// The only failures usque prints that are about the *session*.
+    ///
+    /// 2026-09-20: `SOCKS TCP handle from 127.0.0.1:63517 failed: dial: lookup
+    /// ...: no such host` armed the wedge deadline. That is one client asking
+    /// for a name that does not exist, over a tunnel that was working and was
+    /// never lost — so no "Connected to MASQUE server" line could ever follow
+    /// to disarm it, and 15s later the supervisor restarted a healthy tunnel
+    /// and took the SOCKS listener down with it. Every per-connection failure
+    /// has that shape: nothing reconnects, because nothing was disconnected.
+    ///
+    /// Matching on the session lines by name rather than excluding client lines
+    /// by name is deliberate. usque logs a bare `log.Println(err)` for a bad
+    /// SOCKS datagram (internal/socks5.go), so the text of a client failure is
+    /// not something a deny-list can enumerate.
+    static let sessionFaultPhrases = [
+        "Failed to connect tunnel",          // dial half of MaintainTunnel's loop
+        "Error writing to IP connection",    // the 2026-09-13 wedge: "continuing..." forever
+        "Error reading from IP connection",
+        "Failed to read from TUN device",
+    ]
+
+    /// Lines from usque 2026-09 (see WarpControllerTests for real samples).
+    /// Shared by the macOS child-process supervisor and the iOS extension.
+    static func classify(_ line: String) -> LogEvent? {
+        if line.contains("SOCKS proxy listening on") { return .listening }
+        if line.contains("Connected to MASQUE server") { return .connected }
+        if line.contains("Tunnel connection lost") { return .lost }
+        if sessionFaultPhrases.contains(where: line.contains) { return .error }
+        let l = line.lowercased()
+        if l.contains("failed") || l.contains("error") { return .connectionError }
+        return nil
+    }
+}
+
 /// The one-time WARP setup, done from the app instead of a terminal. WARP needs
-/// no Cloudflare account or API key: `usque register` creates a free, anonymous
+/// no Cloudflare account or API key: registering creates a free, anonymous
 /// device and writes its keys to `config.json`. A WARP+ license key and a Zero
 /// Trust team token are both optional extras on top of that.
 public enum WarpRegistration {
@@ -294,8 +449,13 @@ public enum WarpRegistration {
         public var errorDescription: String? { message }
     }
 
+    /// A config.json with a device private key. The file alone is not enough:
+    /// iOS builds before 1.3.0 (4) saved one with every field blank.
     public static func isRegistered(directory: URL = WarpController.defaultDirectory) -> Bool {
-        FileManager.default.fileExists(atPath: directory.appendingPathComponent("config.json").path)
+        struct Keys: Decodable { let private_key: String? }
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent("config.json")),
+              let keys = try? JSONDecoder().decode(Keys.self, from: data) else { return false }
+        return !(keys.private_key ?? "").isEmpty
     }
 
     /// `xxxxxxxx-xxxxxxxx-xxxxxxxx`, the format usque's `account set` documents.
@@ -303,6 +463,17 @@ public enum WarpRegistration {
         key.range(of: #"^[A-Za-z0-9]{8}-[A-Za-z0-9]{8}-[A-Za-z0-9]{8}$"#, options: .regularExpression) != nil
     }
 
+    static func validated(licenseKey: String) throws -> String {
+        let key = licenseKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !key.isEmpty, !isValidLicenseKey(key) {
+            throw Failure(message: "That license key does not look right. It should be three groups of 8 letters or digits, like ab12cd34-ef56gh78-ij90kl12.")
+        }
+        return key
+    }
+}
+
+#if os(macOS)
+extension WarpRegistration {
     static func registerArguments(configFile: URL, teamToken: String) -> [String] {
         var args = ["-c", configFile.path, "register", "--accept-tos", "-n", "Sweep VPN"]
         if !teamToken.isEmpty { args += ["--jwt", teamToken] }
@@ -323,11 +494,8 @@ public enum WarpRegistration {
         guard let executable else {
             throw Failure(message: "This build has no bundled usque, so WARP cannot be set up. Rebuild with `make install-macos`.")
         }
-        let key = licenseKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = try validated(licenseKey: licenseKey)
         let token = teamToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !key.isEmpty, !isValidLicenseKey(key) {
-            throw Failure(message: "That license key does not look right. It should be three groups of 8 letters or digits, like ab12cd34-ef56gh78-ij90kl12.")
-        }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         let configFile = directory.appendingPathComponent("config.json")

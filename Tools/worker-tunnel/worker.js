@@ -127,7 +127,9 @@ const REFUSED_PORTS = new Set([25, 465, 587, 2525]);
 function isPrivateAddress(host) {
   const h = host.replace(/^\[|\]$/g, "").toLowerCase();
   if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".internal")) return true;
-  if (h === "::1" || h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80:")) return true;
+  // fc00::/7 and fe80::/10 only for addresses: as bare prefixes they also
+  // refused hostnames like fdroid.org and fc2.com.
+  if (h.includes(":") && (h === "::1" || h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80:"))) return true;
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
   if (!m) return false;
   const octets = m.slice(1).map(Number);

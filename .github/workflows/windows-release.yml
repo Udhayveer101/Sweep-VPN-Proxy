@@ -1,0 +1,121 @@
+name: Windows release
+
+# Builds the Windows tray app, tests it on a real Windows machine (unit tests,
+# the live WARP tunnel, and the built .exe routing the system proxy through
+# WARP, surviving a crash, and restoring the proxy), then publishes it.
+on:
+  push:
+    tags: ["windows-v*"]
+    branches: [vpn-overhaul, main]
+    paths: ["Windows/**", "Tools/usque/**", ".github/workflows/windows-release.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: Windows/go.sum
+
+      - name: Version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/windows-v* ]]; then V="${GITHUB_REF_NAME#windows-v}"; else V="0.0.0-ci.${GITHUB_RUN_NUMBER}"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: Windows/build.sh "$VERSION"
+
+      - name: Register a WARP device for the tests
+        run: |
+          mkdir -p "$APPDATA/SweepVPN/warp"
+          Windows/usque.exe -c "$APPDATA/SweepVPN/warp/config.json" register --accept-tos -n "Sweep CI"
+          test -s "$APPDATA/SweepVPN/warp/config.json"
+
+      - name: Unit + live tunnel tests
+        working-directory: Windows
+        run: |
+          SWEEP_USQUE="$PWD/usque.exe" SWEEP_WARP_CONFIG="$APPDATA/SweepVPN/warp/config.json" \
+            go test -race -count=1 -v . 2>&1 | grep -v "usque: " 
+          test "${PIPESTATUS[0]}" = 0
+
+      - name: End-to-end with the built app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = (Resolve-Path "Windows/dist/SweepVPN-$env:VERSION-windows-x64.exe").Path
+          $inet = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+          Set-ItemProperty $inet ProxyEnable 0
+          Set-ItemProperty $inet ProxyServer "original.example:3128"
+          New-Item -Force "HKCU:\Software\SweepVPN" | Out-Null
+          Set-ItemProperty "HKCU:\Software\SweepVPN" Enabled 1 -Type DWord
+
+          function Wait-Proxy {
+            for ($i = 0; $i -lt 90; $i++) {
+              $p = Get-ItemProperty $inet
+              if ($p.ProxyEnable -eq 1 -and $p.ProxyServer -eq "127.0.0.1:1080") { return }
+              Start-Sleep 1
+            }
+            Get-Content "$env:LOCALAPPDATA\SweepVPN\sweep.log" -ErrorAction SilentlyContinue
+            throw "app never pointed the system proxy at WARP"
+          }
+          function Assert-Warp {
+            for ($i = 0; $i -lt 5; $i++) {
+              try {
+                # HttpClient follows the Windows (WinINet) proxy by default.
+                $body = (New-Object System.Net.Http.HttpClient).GetStringAsync("https://www.cloudflare.com/cdn-cgi/trace").Result
+                if ($body -match "warp=on") { Write-Host "system proxy -> WARP OK"; return }
+                Write-Host $body
+              } catch { Write-Host $_ }
+              Start-Sleep 3
+            }
+            throw "traffic through the system proxy is not on WARP"
+          }
+
+          $app = Start-Process $exe -PassThru
+          Wait-Proxy
+          Assert-Warp
+          if (-not (Get-Process | Where-Object { $_.Name -like "usque-*" })) { throw "usque not running" }
+
+          # Crash: Task Manager-style kill. usque must die with it (job object).
+          Stop-Process -Id $app.Id -Force
+          Start-Sleep 3
+          if (Get-Process | Where-Object { $_.Name -like "usque-*" }) { throw "usque outlived the app" }
+          $runOnce = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce" -ErrorAction SilentlyContinue
+          if (-not $runOnce.SweepVPNRestoreProxy) { throw "no sign-in restore armed" }
+
+          # What Windows runs at the next sign-in.
+          Start-Process $exe -ArgumentList "-restore-proxy" -Wait
+          $p = Get-ItemProperty $inet
+          if ($p.ProxyEnable -ne 0 -or $p.ProxyServer -ne "original.example:3128") { throw "proxy not restored: $($p.ProxyEnable) $($p.ProxyServer)" }
+          Write-Host "restore after crash OK"
+
+          # Relaunch: comes back routed.
+          $app = Start-Process $exe -PassThru
+          Wait-Proxy
+          Assert-Warp
+          Stop-Process -Id $app.Id -Force
+          Start-Process $exe -ArgumentList "-restore-proxy" -Wait
+          Get-Content "$env:LOCALAPPDATA\SweepVPN\sweep.log" | Where-Object { $_ -notmatch "usque: " }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SweepVPN-windows
+          path: Windows/dist/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/windows-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" Windows/dist/* \
+            --title "Sweep VPN for Windows $VERSION" --notes-file Windows/RELEASE_NOTES.md

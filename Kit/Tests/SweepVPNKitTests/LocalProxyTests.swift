@@ -182,6 +182,25 @@ final class LocalProxyTests: XCTestCase {
                       "the socket left the listening state: \(seen.states)")
     }
 
+    /// The WARP switch starts the proxy, then WARP's first state change starts
+    /// it again before the bind reports ready. Log 2026-09-15: that second call
+    /// cancelled the pending listener and logged "stopping" + "listenerCancelled".
+    func testSecondStartWhileBindPendingKeepsTheListener() throws {
+        let proxy = try XCTUnwrap(LocalProxy(port: 18083, upstream: .direct))
+        defer { proxy.stop() }
+        let seen = StateRecorder()
+        proxy.start(upstream: .direct) { seen.record($0) }
+        proxy.start(upstream: .socks5(host: "127.0.0.1", port: 1)) { seen.record($0) }
+
+        let settled = expectation(description: "settled")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { settled.fulfill() }
+        wait(for: [settled], timeout: 5)
+
+        XCTAssertEqual(proxy.state, .listening(port: 18083))
+        XCTAssertEqual(seen.states, [.listening(port: 18083)],
+                       "the pending bind was torn down and redone: \(seen.states)")
+    }
+
     /// The state callback fires on the listener's queue, so the test's own view
     /// of it needs a lock rather than an array.
     private final class StateRecorder: @unchecked Sendable {

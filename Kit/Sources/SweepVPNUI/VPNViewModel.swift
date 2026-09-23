@@ -118,21 +118,9 @@ public final class VPNViewModel: ObservableObject {
     #endif
 
     #if os(macOS)
-    @Published public private(set) var torState: TorController.State = .stopped
     @Published public private(set) var proxyState: LocalProxy.State = .stopped
-    private var tor: TorController?
     private var proxy: LocalProxy?
 
-    /// Tor bootstrap is a foreground concern: on a network that blocks Tor it can
-    /// sit at 14% indefinitely, and a spinner with no number reads as a hang.
-    public var torProgressText: String? {
-        switch torState {
-        case .stopped: return nil
-        case .starting(let pct, let summary): return "Tor \(pct)% — \(summary)"
-        case .running: return "Tor ready on 127.0.0.1:\(tor?.socksPort ?? 9150)"
-        case .failed(let why): return why
-        }
-    }
 
     @Published public internal(set) var warpState: WarpController.State = .stopped
     private var warp: WarpController?
@@ -190,6 +178,7 @@ public final class VPNViewModel: ObservableObject {
             setWarp(enabled: false)
             return
         }
+        if game != nil { setGameMode(enabled: false) }
         armSystemProxyWhenReady = true
         setWarp(enabled: true)
         setLocalProxy(enabled: true)
@@ -221,9 +210,111 @@ public final class VPNViewModel: ObservableObject {
         applySystemProxy(false)
     }
 
-    /// WARP and Tor both want to be the proxy's SOCKS upstream; only one can be.
+    // MARK: Updates
+
+    public enum UpdateState: Equatable, Sendable {
+        case idle, checking, downloading, failed(String)
+    }
+
+    @Published public private(set) var availableUpdate: UpdateChecker.Update?
+    @Published public private(set) var updateState: UpdateState = .idle
+    private var updateTimer: Timer?
+    public var appVersion: String { Bundle.main.shortVersion }
+
+    /// Look for a newer build. Silent unless there is something to offer:
+    /// being offline, up to date or snoozed all look the same to the user.
+    /// `force` is the Settings button, which ignores an outstanding "Later".
+    public func checkForUpdates(force: Bool = false) {
+        guard updateState != .checking, updateState != .downloading else { return }
+        updateState = .checking
+        let checker = UpdateChecker()
+        Task { @MainActor in
+            let found = await checker.check(force: force)
+            self.availableUpdate = found
+            self.updateState = .idle
+        }
+    }
+
+    /// Download, verify against the published SHA-256, and open the DMG. The
+    /// app does not replace itself: swapping a signed bundle out from under a
+    /// live tunnel is the one thing here that could leave the Mac unroutable.
+    public func installUpdate() {
+        guard let update = availableUpdate, updateState != .downloading else { return }
+        updateState = .downloading
+        let checker = UpdateChecker()
+        Task { @MainActor in
+            do {
+                let dmg = try await checker.download(update)
+                // hdiutil and codesign take seconds; keep them off the main thread.
+                try await Task.detached { try checker.reveal(dmg) }.value
+                self.updateState = .idle
+            } catch UpdateChecker.UpdateError.digestMismatch {
+                self.updateState = .failed("The downloaded update did not match its published checksum, so it was discarded.")
+            } catch UpdateChecker.UpdateError.untrustedSignature {
+                self.updateState = .failed("The downloaded app is not signed by Sweep's developer, so it was not opened.")
+            } catch {
+                self.updateState = .failed("Could not download the update: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    public func snoozeUpdate() {
+        UpdateChecker().snooze()
+        availableUpdate = nil
+    }
+
+    // MARK: Gaming mode
+
+    @Published public internal(set) var gameState: GameModeController.State = .stopped
+    @Published public var gameDisguise: GameModeController.Disguise = .standby
+    private var game: GameModeController?
+
+    public var gameStatusText: String? {
+        switch gameState {
+        case .stopped:  return nil
+        case .starting: return "Gaming mode starting - this needs your admin password"
+        case .running:  return "Gaming mode on: the whole Mac, games included, goes through WARP"
+        case .failed(let why): return why
+        }
+    }
+
+    /// Gaming mode routes the entire Mac at the IP layer, so it cannot coexist
+    /// with the proxy modes that claim the same traffic: turning it on takes
+    /// the system proxy and WARP down first, and turning it off leaves
+    /// them off rather than silently restoring a state the user did not pick.
+    public func setGameMode(enabled: Bool) {
+        guard enabled else {
+            game?.stop()
+            game = nil
+            gameState = .stopped
+            return
+        }
+
+        armSystemProxyWhenReady = false
+        applySystemProxy(false)
+        setLocalProxy(enabled: false)
+        if options.warpEnabled { setWarp(enabled: false) }
+
+        guard let controller = GameModeController.bundled() else {
+            gameState = .failed("This build has no bundled usque. Build it and run `make bundle-tor`.")
+            return
+        }
+        game = controller
+        let disguise = gameDisguise
+        controller.start(disguise: disguise) { [weak self] st in
+            Task { @MainActor in self?.gameState = st }
+        }
+    }
+
+    /// Gaming mode owns the routing table; leaving it set after the app quits
+    /// would point the Mac at a tunnel that no longer exists.
+    public func stopGameModeOnQuit() {
+        guard game != nil else { return }
+        setGameMode(enabled: false)
+    }
+
     public func setWarp(enabled: Bool) {
-        if enabled, options.torEnabled { setTor(enabled: false) }
+        if enabled, game != nil { setGameMode(enabled: false) }
         var o = options
         o.warpEnabled = enabled
         apply(options: o)
@@ -246,32 +337,6 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
-    public func setTor(enabled: Bool) {
-        if enabled, options.warpEnabled { setWarp(enabled: false) }
-        var o = options
-        o.torEnabled = enabled
-        apply(options: o)
-        guard enabled else {
-            tor?.stop()
-            tor = nil
-            torState = .stopped
-            syncProxyUpstream()
-            return
-        }
-        guard let controller = TorController() else {
-            torState = .failed("This build has no bundled Tor. Run `make bundle-tor`.")
-            return
-        }
-        tor = controller
-        controller.start(userBridges: options.torBridges) { [weak self] st in
-            Task { @MainActor in
-                self?.torState = st
-                // The proxy's upstream depends on whether Tor is actually ready;
-                // pointing at a half-bootstrapped Tor would fail every connection.
-                self?.syncProxyUpstream()
-            }
-        }
-    }
 
     public func setLocalProxy(enabled: Bool) {
         var o = options
@@ -283,18 +348,17 @@ public final class VPNViewModel: ObservableObject {
             proxyState = .stopped
             return
         }
-        guard let listener = LocalProxy(port: options.localProxyPort,
-                                        upstream: currentUpstream()) else {
-            proxyState = .failed("Port \(options.localProxyPort) is not usable.")
-            return
-        }
-        proxy = listener
-        listener.start(upstream: currentUpstream()) { [weak self] st in
-            Task { @MainActor in
-                self?.proxyState = st
-                self?.applySystemProxyWhenReady()
+        // Reuse the running proxy: a second LocalProxy on the same port could
+        // never bind while the first still held it ("Address already in use").
+        if proxy == nil {
+            guard let listener = LocalProxy(port: options.localProxyPort,
+                                            upstream: currentUpstream()) else {
+                proxyState = .failed("Port \(options.localProxyPort) is not usable.")
+                return
             }
+            proxy = listener
         }
+        syncProxyUpstream()
     }
 
     /// What the proxy is actually pointed at, for the line under the toggle.
@@ -303,7 +367,7 @@ public final class VPNViewModel: ObservableObject {
     public var proxyUpstreamLabel: String {
         switch currentUpstream() {
         case .direct: return "VPN"
-        case .socks5: return options.warpEnabled ? "WARP" : "Tor"
+        case .socks5: return "WARP"
         case .worker: return "Worker"
         }
     }
@@ -324,9 +388,6 @@ public final class VPNViewModel: ObservableObject {
         if options.warpEnabled {
             return .socks5(host: "127.0.0.1", port: options.warpSocksPort)
         }
-        if options.torEnabled, torState == .running, let port = tor?.socksPort {
-            return .socks5(host: "127.0.0.1", port: port)
-        }
         if options.proxyThroughWorker {
             let settings = RelayTunnelSettings.load(appGroup: appGroup)
             if settings.enabled, !settings.token.isEmpty {
@@ -339,8 +400,95 @@ public final class VPNViewModel: ObservableObject {
     private func syncProxyUpstream() {
         guard options.localProxyEnabled, let proxy else { return }
         proxy.start(upstream: currentUpstream()) { [weak self] st in
-            Task { @MainActor in self?.proxyState = st }
+            // Same handler as the first start: this one replaces it, and
+            // dropping applySystemProxyWhenReady left the system proxy unarmed.
+            Task { @MainActor in
+                self?.proxyState = st
+                self?.applySystemProxyWhenReady()
+            }
         }
+    }
+    #endif
+    #if os(iOS)
+    // MARK: - WARP (iOS)
+    //
+    // The same WARP as macOS, but as its own packet tunnel: iOS has neither child
+    // processes nor a system SOCKS proxy. `systemProxyEnabled` keeps the macOS
+    // name so the home panel and setup guide are shared; here it means "this
+    // device is routed through WARP".
+
+    @Published public internal(set) var warpState: WarpController.State = .stopped
+    private lazy var warp = WarpController(sni: options.warpSNI)
+
+    @Published public internal(set) var warpRegistered = WarpRegistration.isRegistered()
+    @Published public private(set) var warpSetupBusy = false
+    @Published public var warpSetupError: String?
+
+    public func registerWarp(licenseKey: String, teamToken: String) async {
+        warpSetupBusy = true
+        warpSetupError = nil
+        defer { warpSetupBusy = false }
+        do {
+            try await WarpRegistration.register(licenseKey: licenseKey, teamToken: teamToken)
+        } catch {
+            warpSetupError = error.localizedDescription
+        }
+        warpRegistered = WarpRegistration.isRegistered()
+        if warpRegistered, warpSetupError == nil {
+            completeOnboarding()
+        }
+    }
+
+    public var warpStatusText: String? {
+        switch warpState {
+        case .stopped: return nil
+        case .starting: return "Connecting to WARP… (SNI \(options.warpSNI))"
+        case .running: return "All traffic goes through Cloudflare WARP (SNI \(options.warpSNI))"
+        case .failed(let why): return why
+        }
+    }
+
+    /// The iOS app ships as the WARP build (SweepProxyOnly in Info.plist).
+    public let proxyOnly = Bundle.main.object(forInfoDictionaryKey: "SweepProxyOnly") as? String == "YES"
+
+    public var systemProxyEnabled: Bool { warpState == .running || warpState == .starting }
+    @Published public private(set) var systemProxyError: String?
+
+    public func setEverythingThroughWarp(_ on: Bool) { setWarp(enabled: on) }
+
+    /// Gaming mode on iOS is only about flow rotation.
+    ///
+    /// The packet tunnel already carries every packet, UDP included, so games
+    /// work in the ordinary mode; the warm standby is always on. Rotation is
+    /// the one extra step, and it stays opt-in because the swap can briefly
+    /// stall new connections.
+    @Published public var gameModeEnabled = false {
+        didSet {
+            guard gameModeEnabled != oldValue else { return }
+            if options.warpEnabled { setWarp(enabled: true) }   // restart with the new setting
+        }
+    }
+
+    public var gameStatusText: String? {
+        gameModeEnabled
+            ? "Flows are retired before the network can drop them. New connections may pause briefly."
+            : nil
+    }
+
+    public func setWarp(enabled: Bool) {
+        systemProxyError = nil
+        var o = options
+        o.warpEnabled = enabled
+        options = o
+        guard enabled else { warp.stop(); return }
+        if warp.sni != options.warpSNI { warp = WarpController(sni: options.warpSNI) }
+        warp.flowTTLSeconds = gameModeEnabled ? 90 : 0   // see GameModeController.Disguise.flowTTL
+        warp.start { [weak self] st in Task { @MainActor in self?.warpState = st } }
+    }
+
+    /// The tunnel outlives the app; pick its state back up on launch.
+    public func attachWarp() {
+        warp.attach { [weak self] st in Task { @MainActor in self?.warpState = st } }
     }
     #endif
     /// No verified, unexpired signed bundle => the app has nothing it is allowed
@@ -398,6 +546,7 @@ public final class VPNViewModel: ObservableObject {
 
     private let configurator: VPNConfigurator
     private var catalog = ServerCatalog()
+    private var statusObserver: NSObjectProtocol?
     private var pollTask: Task<Void, Never>?
 
     /// App group shared with the extension. `AppConfig` owns the real value but
@@ -415,7 +564,9 @@ public final class VPNViewModel: ObservableObject {
         // keeps coming back until one exists, whatever was dismissed before.
         if !warpRegistered { activeSheet = .onboarding }
         #else
-        if !UserDefaults.standard.bool(forKey: "sweep.onboarded") { activeSheet = .onboarding }
+        if proxyOnly ? !warpRegistered : !UserDefaults.standard.bool(forKey: "sweep.onboarded") {
+            activeSheet = .onboarding
+        }
         #endif
     }
 
@@ -429,6 +580,22 @@ public final class VPNViewModel: ObservableObject {
     }
 
     public func onAppear() {
+        #if os(macOS)
+        // Quiet unless there is something to offer, and snoozed for a day by
+        // "Later". The repeat is for the Macs that stay logged in for weeks.
+        checkForUpdates()
+        if updateTimer == nil {
+            updateTimer = Timer.scheduledTimer(withTimeInterval: UpdateChecker.snoozeInterval,
+                                               repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.checkForUpdates() }
+            }
+        }
+        #endif
+        // Proxy-only builds ship no packet-tunnel extension, so every one of
+        // these IPC calls fails — forever, every 5 seconds, silently. The iOS
+        // app guards this already (Apps/iOS/SweepVPNApp.swift); the guard was
+        // simply missing here.
+        guard !proxyOnly else { return }
         // Status is event-driven off NEVPNStatusDidChange; the timer is only a
         // slow safety net so we never poll hard in the background.
         // Scope the observation to *our* connection. With `object: nil` every VPN
@@ -437,7 +604,9 @@ public final class VPNViewModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             _ = try? await self.configurator.loadManager()
-            NotificationCenter.default.addObserver(forName: .NEVPNStatusDidChange,
+            // onAppear runs on every window reopen; one observer, not one each.
+            if let old = self.statusObserver { NotificationCenter.default.removeObserver(old) }
+            self.statusObserver = NotificationCenter.default.addObserver(forName: .NEVPNStatusDidChange,
                                                    object: self.configurator.ourConnection,
                                                    queue: .main) { [weak self] _ in
                 Task { @MainActor in await self?.refresh() }
@@ -452,18 +621,26 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
-    public func onDisappear() { pollTask?.cancel(); pollTask = nil; stopWatchingLog() }
+    public func onDisappear() {
+        pollTask?.cancel(); pollTask = nil
+        #if os(macOS)
+        updateTimer?.invalidate(); updateTimer = nil   // it repeated for the life of the process
+        #endif
+        stopWatchingLog()
+    }
 
     /// Follows the journal while the log screen is open. One second, because the
     /// thing being watched is a connect that can stall for tens of seconds and
     /// the user needs to see which step it stopped on as it stops.
     public func startWatchingLog() {
         logTask?.cancel()
-        logTask = Task { [weak self] in
+        // Detached: reading and decoding the whole journal every second on the
+        // main actor stuttered the UI once the journal grew to a few MB.
+        let log = self.log
+        logTask = Task.detached { [weak self] in
             while !Task.isCancelled {
-                guard let self else { return }
-                let entries = self.log.entries()
-                await MainActor.run { self.logEntries = entries }
+                let entries = log.entries()
+                await MainActor.run { self?.logEntries = entries }
                 try? await Task.sleep(for: .seconds(1))
             }
         }
