@@ -39,24 +39,56 @@ func TestArgsBindLoopbackOnly(t *testing.T) {
 	}
 }
 
+// A fault only arms a deadline; a reconnect disarms it (the v1.3.0 regression
+// was restarting on the fault itself). Mirrors WarpControllerTests.
 func TestWedgeDetection(t *testing.T) {
 	w := &Warp{}
 	w.cmd = dummyCmd()
 	now := time.Now()
 	if !w.noteFailure("Error writing to IP connection: io: read/write on closed pipe", now) {
-		t.Fatal("closed pipe write must restart at once")
+		t.Fatal("a session fault must arm the deadline")
 	}
-	if w.noteFailure("Error writing to IP connection: closed pipe", now.Add(time.Second)) {
+	if w.noteFailure("Error writing to IP connection: closed pipe", now) {
+		t.Fatal("an armed deadline must not be re-armed")
+	}
+	w.noteRecovered()
+	if w.recovery != nil {
+		t.Fatal("a reconnect must disarm the deadline")
+	}
+	w.lastRestart = now
+	if w.noteFailure("Failed to connect tunnel", now.Add(time.Second)) {
 		t.Fatal("restart floor must stop a loop")
 	}
-	later := now.Add(restartFloor + time.Second)
-	for i := 0; i < wedgeBurst-1; i++ {
-		if w.noteFailure("Failed to dial", later.Add(time.Duration(i)*time.Second)) {
-			t.Fatal("fewer than a burst must not restart")
+}
+
+// 2026-09-20: a per-connection lookup failure armed the wedge deadline and
+// restarted a healthy tunnel 15s later.
+func TestAPerConnectionFailureIsNotAWedge(t *testing.T) {
+	for _, line := range []string{
+		"2026/09/20 HTTP proxy handle from 127.0.0.1:63517 failed: dial: lookup nope.invalid: no such host",
+		"2026/09/20 Failed to dial example.com:443: connection refused",
+	} {
+		if ev := classify(line); ev != evClientError {
+			t.Errorf("classify(%q) = %v, want evClientError", line, ev)
 		}
 	}
-	if !w.noteFailure("Failed to dial", later.Add(4*time.Second)) {
-		t.Fatal("a burst of dial failures is a wedge")
+}
+
+func TestExpiredDeadlineRestartsOnlyTheArmedChild(t *testing.T) {
+	old := recoveryGrace
+	recoveryGrace = 20 * time.Millisecond
+	defer func() { recoveryGrace = old }()
+	w := &Warp{}
+	c := dummyCmd()
+	w.cmd = c
+	w.mu.Lock()
+	w.noteFailure("Failed to connect tunnel", time.Now())
+	w.mu.Unlock()
+	time.Sleep(100 * time.Millisecond)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.streak != 1 || w.recovery != nil {
+		t.Fatalf("expired deadline: streak=%d recovery=%v", w.streak, w.recovery)
 	}
 }
 

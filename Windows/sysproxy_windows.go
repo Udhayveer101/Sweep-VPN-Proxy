@@ -128,6 +128,20 @@ func getBool(name string) bool {
 	return v == 1
 }
 
+// getBoolDefault is getBool for settings that default to on.
+func getBoolDefault(name string, def bool) bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, appKey, registry.QUERY_VALUE)
+	if err != nil {
+		return def
+	}
+	defer k.Close()
+	v, _, err := k.GetIntegerValue(name)
+	if err != nil {
+		return def
+	}
+	return v == 1
+}
+
 func setBool(name string, on bool) {
 	k, err := openKey(appKey)
 	if err != nil {
@@ -139,6 +153,25 @@ func setBool(name string, on bool) {
 		v = 1
 	}
 	_ = k.SetDWordValue(name, v)
+}
+
+func getString(name string) string {
+	k, err := registry.OpenKey(registry.CURRENT_USER, appKey, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+	v, _, _ := k.GetStringValue(name)
+	return v
+}
+
+func setString(name, v string) {
+	k, err := openKey(appKey)
+	if err != nil {
+		return
+	}
+	defer k.Close()
+	_ = k.SetStringValue(name, v)
 }
 
 const runKey = `Software\Microsoft\Windows\CurrentVersion\Run`
@@ -167,7 +200,7 @@ func setStartWithWindows(on bool, exe string) error {
 		}
 		return nil
 	}
-	return k.SetStringValue("SweepVPN", `"`+exe+`"`)
+	return k.SetStringValue("SweepVPN", `"`+exe+`" -background`)
 }
 
 // armRestoreAtSignIn: if Windows shuts down while routing is on (the app gets

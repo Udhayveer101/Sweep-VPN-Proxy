@@ -3,7 +3,6 @@
 package main
 
 import (
-	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -49,33 +48,72 @@ func snooze(now time.Time) {
 
 // checkForUpdate runs in the background at startup and once a day after that.
 // It is silent unless there is something to offer: offline, up to date and
-// snoozed all look the same to the user.
+// snoozed all look the same to the user. force is the window's "Check for
+// updates", which does report what it found.
 func (a *app) checkForUpdate(force bool) {
 	if !force && snoozed(time.Now()) {
 		return
 	}
-	client := &http.Client{Timeout: 20 * time.Second}
-	update, err := LatestUpdate(client, releasesFeed, version)
-	if err != nil || update == nil {
-		if err != nil {
-			fmt.Fprintf(a.log, "%s update check failed: %v\n",
-				time.Now().Format("2006-01-02 15:04:05"), err)
-		}
+	a.mu.Lock()
+	if a.installing || a.updateState == "checking" {
+		a.mu.Unlock()
 		return
 	}
-
-	a.mu.Lock()
-	a.update = update
-	a.mu.Unlock()
-	a.mUpdate.SetTitle("Update to " + update.Version + "…")
-	a.mUpdate.Show()
-
-	if msgBox("Sweep VPN "+update.Version+" is available. Update now?",
-		windows.MB_YESNO|windows.MB_ICONINFORMATION) == idYes {
-		a.installUpdate()
-	} else {
-		snooze(time.Now())
+	if force {
+		a.updateState, a.updateError = "checking", ""
 	}
+	a.mu.Unlock()
+	a.changed()
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	update, err := LatestUpdate(client, releasesFeed, version)
+	a.mu.Lock()
+	switch {
+	case err != nil:
+		if force {
+			a.updateState, a.updateError = "failed", "Could not check for updates: "+err.Error()
+		}
+	case update == nil:
+		if force {
+			a.updateState = "uptodate"
+		}
+	default:
+		a.update, a.updateState, a.updateError = update, "idle", ""
+	}
+	if !force && a.updateState == "checking" {
+		a.updateState = "idle"
+	}
+	a.mu.Unlock()
+	if err != nil {
+		a.logf("update check failed: %v", err)
+	}
+	a.changed()
+
+	// The window shows a banner, like the Mac. Someone working from the tray
+	// only would never see it, so they still get asked.
+	if update != nil && !force && !a.ui.visible() {
+		if msgBox("Sweep VPN "+update.Version+" is available. Update now?",
+			windows.MB_YESNO|windows.MB_ICONINFORMATION) == idYes {
+			a.installUpdate()
+		} else {
+			a.snoozeUpdate()
+		}
+	}
+}
+
+func (a *app) snoozeUpdate() {
+	snooze(time.Now())
+	a.mu.Lock()
+	a.update, a.updateState, a.updateError = nil, "idle", ""
+	a.mu.Unlock()
+	a.changed()
+}
+
+func (a *app) updateFailed(msg string) {
+	a.mu.Lock()
+	a.installing, a.updateState, a.updateError = false, "failed", msg
+	a.mu.Unlock()
+	a.alert(msg)
 }
 
 // installUpdate downloads the new exe, checks it against the published
@@ -88,45 +126,48 @@ func (a *app) checkForUpdate(force bool) {
 func (a *app) installUpdate() {
 	a.mu.Lock()
 	update := a.update
-	a.mu.Unlock()
-	if update == nil {
+	if update == nil || a.installing {
+		a.mu.Unlock() // nothing to install, or a click while one is running
 		return
 	}
+	a.installing, a.updateState, a.updateError = true, "downloading", ""
+	a.mu.Unlock()
+	a.changed()
 
 	client := &http.Client{Timeout: 10 * time.Minute}
 	payload, err := DownloadUpdate(client, update)
 	if err != nil {
-		msgBox("Could not install the update: "+err.Error(), windows.MB_ICONERROR)
+		a.updateFailed("Could not install the update: " + err.Error())
 		return
 	}
 
 	dir := filepath.Join(a.dataDir, "updates")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		msgBox("Could not install the update: "+err.Error(), windows.MB_ICONERROR)
+		a.updateFailed("Could not install the update: " + err.Error())
 		return
 	}
 	staged := filepath.Join(dir, "SweepVPN-"+update.Version+".exe")
 	if err := os.WriteFile(staged, payload, 0o755); err != nil {
-		msgBox("Could not install the update: "+err.Error(), windows.MB_ICONERROR)
+		a.updateFailed("Could not install the update: " + err.Error())
 		return
 	}
-
-	// Put the network back the way we found it before the swap: the new
-	// process starts clean, and a failure here cannot strand the PC on a
-	// tunnel owned by an exe that no longer exists.
-	a.onExit()
 
 	old := a.exe + ".old"
 	_ = os.Remove(old)
 	if err := os.Rename(a.exe, old); err != nil {
-		msgBox("Could not replace Sweep VPN: "+err.Error(), windows.MB_ICONERROR)
+		a.updateFailed("Could not replace Sweep VPN: " + err.Error())
 		return
 	}
 	if err := os.Rename(staged, a.exe); err != nil {
 		_ = os.Rename(old, a.exe) // put ourselves back rather than leave a hole
-		msgBox("Could not replace Sweep VPN: "+err.Error(), windows.MB_ICONERROR)
+		a.updateFailed("Could not replace Sweep VPN: " + err.Error())
 		return
 	}
+
+	// Only now, with the new build in place, put the network back the way we
+	// found it: the new process starts clean, and a failed swap above left
+	// this one still routing. The new process waits for our mutex.
+	a.onExit()
 	if err := exec.Command(a.exe).Start(); err != nil {
 		msgBox("Updated, but could not restart: start Sweep VPN again from the Start menu.",
 			windows.MB_ICONWARNING)

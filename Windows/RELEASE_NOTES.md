@@ -1,8 +1,16 @@
 Sweep VPN for Windows 10/11 (64-bit). One file, no installer, no account.
 
-**Install:** download `SweepVPN-…-windows-x64.exe` and run it. Windows SmartScreen will say it "protected your PC" because the app is not code-signed: click **More info → Run anyway**. The app lives in the tray (the ^ next to the clock).
+**Install:** download `SweepVPN-…-windows-x64.exe` and run it. Windows SmartScreen will say it "protected your PC" because the app is not code-signed: click **More info → Run anyway**.
 
-**First run:** right-click the tray icon → **Set up WARP…** → accept Cloudflare's terms. Then tick **Route this PC through WARP**. The icon turns green when connected.
+**New in 1.5: a real app window**, the same screens as the Mac app — the status card with one big Route button, Settings (WARP setup, gaming mode, proxy, SNI, start with Windows, updates), the step-by-step WARP setup guide and the connection log. Closing the window keeps Sweep running in the tray (click the icon to reopen it); turn that off in Settings ▸ This PC to make closing quit, like the Mac. Needs Microsoft Edge WebView2, which Windows 10 and 11 already have.
+
+**First run:** the setup guide opens by itself: tick Cloudflare's terms and press **Register**. Then press **Route this PC through WARP**. The tray icon turns green when connected.
+
+**Fixed in 1.5**
+- The tunnel is no longer restarted while WARP is already reconnecting by itself, or because one website failed to load (the same fix the Mac got in 1.4.1). This was the main cause of short drop-outs.
+- Gaming mode re-applies its routes when the tunnel reconnects, retries after a failure, works on non-English Windows, and turning it off then using the proxy mode now works in the same session.
+- Updating or relaunching no longer shows "already running" and exits; launching Sweep again brings its window forward.
+- The log rolls over at 5 MB instead of growing forever.
 
 - Cloudflare WARP over MASQUE with a disguised SNI (HTTP/2) — the same patched tunnel as the Mac app.
 - Routes Windows through WARP via the system proxy (Edge, Chrome, Firefox on default settings, most apps). No admin rights.

@@ -38,10 +38,13 @@ type Warp struct {
 	done        chan struct{}
 	state       State
 	stopped     bool
-	failures    []time.Time
 	exits       []time.Time
 	lastRestart time.Time
 	lastError   string
+	recovery    *time.Timer // armed by a session fault, disarmed by a reconnect
+	recoveryGen uint64      // which arming a firing timer belongs to
+	streak      int         // consecutive wedge restarts, for the backoff
+	streakAt    time.Time
 
 	seq     uint64 // orders state callbacks, which run off the lock
 	cbMu    sync.Mutex
@@ -62,9 +65,8 @@ func (s State) String() string {
 }
 
 var (
-	wedgeWindow  = 10 * time.Second
-	wedgeBurst   = 4
-	restartFloor = 20 * time.Second
+	recoveryGrace = 15 * time.Second
+	restartFloor  = 20 * time.Second
 	stallTimeout = 30 * time.Second
 	respawnDelay = 2 * time.Second
 	exitWindow   = 2 * time.Minute
@@ -112,8 +114,26 @@ const (
 	evListening
 	evConnected
 	evLost
-	evError
+	evError       // the MASQUE session is in trouble: usque owes a reconnect
+	evClientError // one client's dial or lookup failed: log it, leave the tunnel alone
 )
+
+// sessionFaultPhrases mirrors WarpController.sessionFaultPhrases: the only
+// failures usque prints about the session. Anything else containing "failed"
+// or "error" belongs to one client and is never followed by a reconnect, so
+// arming the wedge deadline on it restarts a healthy tunnel (2026-09-20).
+var sessionFaultPhrases = []string{
+	"Failed to connect tunnel",
+	"Error writing to IP connection",
+	"Error reading from IP connection",
+	"Failed to read from TUN device",
+}
+
+// backoffDelays mirrors StartBackoff.delays: a tunnel that keeps failing to
+// heal usually means the path is down, so restarts slow down instead of
+// respawning every 20s forever. A streak older than 10 minutes is forgotten.
+var backoffDelays = []time.Duration{0, 2 * time.Second, 5 * time.Second, 15 * time.Second,
+	30 * time.Second, time.Minute, 2 * time.Minute}
 
 func classify(line string) logEvent {
 	switch {
@@ -125,9 +145,14 @@ func classify(line string) logEvent {
 	case strings.Contains(line, "Tunnel connection lost"):
 		return evLost
 	}
+	for _, p := range sessionFaultPhrases {
+		if strings.Contains(line, p) {
+			return evError
+		}
+	}
 	l := strings.ToLower(line)
 	if strings.Contains(l, "failed") || strings.Contains(l, "error") {
-		return evError
+		return evClientError
 	}
 	return evNone
 }
@@ -177,9 +202,25 @@ func (w *Warp) Start() {
 	}
 }
 
+// SetMode switches between the loopback proxy and gaming mode's TUN device.
+// Takes effect at the next launch; Args reads these under mu from the respawn
+// timer, so they must not be written without it.
+func (w *Warp) SetMode(game bool, flowTTL, sni string) {
+	w.mu.Lock()
+	w.Game, w.FlowTTL = game, flowTTL
+	if sni != "" {
+		w.SNI = sni
+	}
+	w.mu.Unlock()
+}
+
 func (w *Warp) Stop() {
 	w.mu.Lock()
 	w.stopped = true
+	if w.recovery != nil {
+		w.recovery.Stop()
+		w.recovery = nil
+	}
 	c, done := w.cmd, w.done
 	w.cmd = nil
 	w.setState(Stopped, "")
@@ -188,7 +229,7 @@ func (w *Warp) Stop() {
 }
 
 func kill(c *exec.Cmd, done chan struct{}) {
-	if c == nil {
+	if c == nil || c.Process == nil {
 		return
 	}
 	_ = c.Process.Kill()
@@ -203,6 +244,10 @@ func (w *Warp) launch() {
 	if _, err := os.Stat(w.Config); err != nil {
 		w.setState(Failed, "WARP is not set up yet. Choose \"Set up WARP…\" first.")
 		return
+	}
+	if w.recovery != nil { // belonged to the previous child
+		w.recovery.Stop()
+		w.recovery = nil
 	}
 	c := exec.Command(w.Exe, w.Args()...)
 	pr, pw := io.Pipe()
@@ -285,43 +330,71 @@ func (w *Warp) ingest(c *exec.Cmd, line string) {
 	w.logf("usque: %s", line)
 	ev := classify(line)
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.cmd != c {
-		w.mu.Unlock()
 		return
 	}
 	switch ev {
 	case evListening:
 		w.setState(Running, "")
-	case evError, evLost:
-		l := strings.ToLower(line)
-		if ev == evLost && !strings.Contains(l, "failed") && !strings.Contains(l, "error") {
-			break
-		}
+	case evConnected:
+		// usque rebuilt the session by itself: the wedge deadline stands down.
+		w.noteRecovered()
+	case evLost, evError:
+		// A loss is usque saying it is already reconnecting. Both only start
+		// the clock; the wedge is the clock running out.
 		w.lastError = line
 		if w.noteFailure(line, time.Now()) {
-			w.mu.Unlock()
-			w.logf("warp restarting: tunnel wedged: %s", line)
-			w.restart(c, line)
-			return
+			w.logf("warp watching: no reconnect within %s is a wedge", recoveryGrace)
 		}
 	}
-	w.mu.Unlock()
 }
 
-// noteFailure (mu held) mirrors WarpController.noteFailure: a write onto a
-// closed HTTP/2 pipe, or a burst of failures, means usque is sitting on a dead
-// session it will never leave by itself.
+// noteFailure (mu held) mirrors WarpController.noteFailure. usque heals its
+// own session losses in about a second (masque-closed-pipe.patch +
+// --always-reconnect); relaunching the child on the first fault pre-empted
+// that and took the proxy port down with it, every sweep (the v1.3.0
+// regression). So a fault only arms a deadline, a "Connected to MASQUE
+// server" line disarms it, and only an expired deadline restarts usque.
+// Returns true if this call armed the deadline.
 func (w *Warp) noteFailure(line string, now time.Time) bool {
-	writeFailed := strings.Contains(line, "closed pipe") ||
-		strings.Contains(line, "Error writing to IP connection")
-	w.failures = append(prune(w.failures, now, wedgeWindow), now)
-	wedged := writeFailed || len(w.failures) >= wedgeBurst
-	if !wedged || w.cmd == nil || now.Sub(w.lastRestart) < restartFloor {
+	if w.cmd == nil || w.recovery != nil || now.Sub(w.lastRestart) < restartFloor {
 		return false
 	}
-	w.lastRestart = now
-	w.failures = nil
+	c, grace := w.cmd, recoveryGrace
+	w.recoveryGen++
+	gen := w.recoveryGen
+	w.recovery = time.AfterFunc(grace, func() { w.recoveryExpired(gen, c, line, grace) })
 	return true
+}
+
+// noteRecovered (mu held): usque reconnected on its own, the common case.
+func (w *Warp) noteRecovered() {
+	if w.recovery != nil {
+		w.recovery.Stop()
+		w.recovery = nil
+	}
+	w.streak = 0
+}
+
+func (w *Warp) recoveryExpired(gen uint64, c *exec.Cmd, line string, grace time.Duration) {
+	w.mu.Lock()
+	if w.recovery == nil || w.recoveryGen != gen || w.cmd != c || w.stopped {
+		w.mu.Unlock()
+		return // disarmed, replaced, or stopped since it was armed
+	}
+	w.recovery = nil
+	now := time.Now()
+	w.lastRestart = now
+	if now.Sub(w.streakAt) > 10*time.Minute {
+		w.streak = 0
+	}
+	w.streak++
+	w.streakAt = now
+	delay := backoffDelays[min(w.streak, len(backoffDelays)-1)]
+	w.mu.Unlock()
+	w.logf("warp restarting: no reconnect within %s after: %s (waiting %s)", grace, line, delay)
+	time.AfterFunc(delay, func() { w.restart(c, line) })
 }
 
 func (w *Warp) restart(c *exec.Cmd, why string) {

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -25,19 +24,42 @@ var version = "dev"
 
 const proxyPort = 1080
 
+const (
+	defaultSNI  = "example.com"
+	rotateTTL   = "90s" // GameModeController.Disguise.rotate.flowTTL
+	instanceKey = `Local\SweepVPN`
+	showKey     = `Local\SweepVPNShow`
+)
+
 type app struct {
 	exe, dataDir, config, usque string
-	log                         io.Writer
+	log                         *rotatingLog
 	warp                        *Warp
+	ui                          *window
 
 	mu      sync.Mutex
-	enabled bool
-	proxyOn bool
+	enabled bool // the user wants this PC routed through the proxy
+	proxyOn bool // the Windows proxy currently points at us
 
-	gameOn   bool
-	gameRoutes GameRoutes
+	warpState State
+	warpMsg   string
 
-	update *Update
+	gameOn    bool   // the user wants gaming mode
+	gameState string // stopped | starting | running | failed
+	gameMsg   string
+	gameBusy  bool
+	gameGW    string
+	routesMu  sync.Mutex // serialises route changes; they shell out
+	routes    GameRoutes
+
+	proxyError, lastError string
+	setupBusy             bool
+	setupError            string
+
+	update      *Update
+	updateState string // idle | checking | uptodate | downloading | failed
+	updateError string
+	installing  bool
 
 	mStatus, mRoute, mGame, mSetup, mStartup, mUpdate *systray.MenuItem
 }
@@ -45,20 +67,48 @@ type app struct {
 func main() {
 	restore := flag.Bool("restore-proxy", false, "put back the proxy settings Sweep changed, then exit")
 	game := flag.Bool("game", false, "start with gaming mode on (set by the elevated relaunch)")
+	background := flag.Bool("background", false, "start in the tray without opening the window (Start with Windows)")
 	flag.Parse()
 	startInGameMode = *game
+	enableDPIAwareness()
 
-	name, _ := windows.UTF16PtrFromString(`Local\SweepVPN`)
-	_, err := windows.CreateMutex(nil, false, name)
-	running := err == windows.ERROR_ALREADY_EXISTS
+	name, _ := windows.UTF16PtrFromString(instanceKey)
 	if *restore {
-		if !running {
+		// Only look: creating the mutex here would make a "Start with Windows"
+		// launch racing this one at sign-in believe Sweep was already running.
+		if h, err := windows.OpenMutex(windows.SYNCHRONIZE, false, name); err == nil {
+			windows.CloseHandle(h)
+		} else if err != windows.ERROR_ACCESS_DENIED {
 			_ = RestoreSystemProxy()
 		}
 		return
 	}
-	if running {
-		msgBox("Sweep VPN is already running. Look for its icon in the taskbar tray (click ^ near the clock).", windows.MB_ICONINFORMATION)
+
+	// An update or the UAC relaunch starts us while the old process is still
+	// on its way out, so wait for it briefly before calling it a second copy.
+	var owned bool
+	for i := 0; i < 25 && !owned; i++ {
+		h, err := windows.CreateMutex(nil, false, name)
+		switch {
+		case err == nil:
+			owned = true
+		case h != 0:
+			windows.CloseHandle(h)
+		}
+		if !owned {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if !owned {
+		// Bring the running copy's window forward instead of a dead-end dialog.
+		// An elevated copy (gaming mode) is out of reach from here.
+		ev, _ := windows.UTF16PtrFromString(showKey)
+		if h, err := windows.OpenEvent(windows.EVENT_MODIFY_STATE, false, ev); err == nil {
+			_ = windows.SetEvent(h)
+			windows.CloseHandle(h)
+		} else {
+			msgBox("Sweep VPN is already running (as administrator, for gaming mode). Look for its icon near the clock.", windows.MB_ICONINFORMATION)
+		}
 		return
 	}
 
@@ -67,8 +117,13 @@ func main() {
 		msgBox("Sweep VPN could not start: "+err.Error(), windows.MB_ICONERROR)
 		return
 	}
+	openAtStart = !*background || startInGameMode
 	systray.Run(a.onReady, a.onExit)
 }
+
+// openAtStart: a normal launch opens the window like the Mac app; Start with
+// Windows starts quietly in the tray.
+var openAtStart bool
 
 func newApp() (*app, error) {
 	exe, _ := os.Executable()
@@ -81,19 +136,14 @@ func newApp() (*app, error) {
 		return nil, err
 	}
 	a := &app{exe: exe, dataDir: filepath.Join(local, "SweepVPN"),
-		config: filepath.Join(roaming, "SweepVPN", "warp", "config.json")}
+		config:    filepath.Join(roaming, "SweepVPN", "warp", "config.json"),
+		gameState: "stopped", updateState: "idle"}
 	if err := os.MkdirAll(a.dataDir, 0o700); err != nil {
 		return nil, err
 	}
-	logPath := filepath.Join(a.dataDir, "sweep.log")
-	if fi, err := os.Stat(logPath); err == nil && fi.Size() > 5<<20 {
-		_ = os.Remove(logPath)
-	}
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
+	if a.log, err = openRotatingLog(filepath.Join(a.dataDir, "sweep.log")); err != nil {
 		return nil, err
 	}
-	a.log = f
 
 	// The previous version renamed itself aside so we could take its place.
 	clearOldExe(a.exe)
@@ -105,9 +155,13 @@ func newApp() (*app, error) {
 			return nil, fmt.Errorf("could not unpack WARP: %w", err)
 		}
 	}
-	a.warp = &Warp{Exe: a.usque, Config: a.config, SNI: "example.com", Port: proxyPort, Log: f, OnState: a.onWarpState}
-	fmt.Fprintf(f, "%s sweep %s started\n", time.Now().Format("2006-01-02 15:04:05"), version)
+	a.warp = &Warp{Exe: a.usque, Config: a.config, SNI: a.sni(), Port: proxyPort, Log: a.log, OnState: a.onWarpState}
+	a.logf("sweep %s started", version)
 	return a, nil
+}
+
+func (a *app) logf(format string, args ...any) {
+	fmt.Fprintf(a.log, time.Now().Format("2006-01-02 15:04:05 ")+format+"\n", args...)
 }
 
 func (a *app) registered() bool {
@@ -115,15 +169,37 @@ func (a *app) registered() bool {
 	return err == nil
 }
 
+func (a *app) sni() string {
+	if s := getString("SNI"); s != "" {
+		return s
+	}
+	return defaultSNI
+}
+
+func (a *app) flowTTL() string {
+	if getBool("GameRotate") {
+		return rotateTTL
+	}
+	return "0"
+}
+
 func (a *app) onReady() {
 	// A crash or shutdown while routing leaves the proxy pointing at a closed
 	// port; put the user's settings back before anything else.
 	_ = RestoreSystemProxy()
 	armRestoreAtSignIn(false, a.exe)
+	// 1.4 wrote the Run entry without -background; rewrite it so signing in
+	// does not throw the window in the user's face.
+	if startsWithWindows() {
+		_ = setStartWithWindows(true, a.exe)
+	}
 
 	systray.SetIcon(icon(140, 140, 140))
 	systray.SetTitle("Sweep VPN")
 	systray.SetTooltip("Sweep VPN")
+	systray.SetOnTapped(func() { a.ui.show() })
+	mOpen := systray.AddMenuItem("Open Sweep VPN", "Show the Sweep VPN window")
+	systray.AddSeparator()
 	a.mStatus = systray.AddMenuItem("Off", "")
 	a.mStatus.Disable()
 	systray.AddSeparator()
@@ -139,15 +215,22 @@ func (a *app) onReady() {
 	mLog := systray.AddMenuItem("Open log", "")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit Sweep VPN", "")
-	a.refreshSetup()
+
+	a.ui = newWindow(a)
+	a.changed()
 
 	if startInGameMode && a.registered() {
 		go a.setGameMode(true)
 	} else if getBool("Enabled") && a.registered() {
-		a.setEnabled(true)
-	} else if !a.registered() {
-		a.mStatus.SetTitle("WARP is not set up — choose Set up WARP…")
+		go a.setEnabled(true)
 	}
+	if openAtStart {
+		if !a.registered() {
+			a.ui.openSheet("setup") // picked up when the page loads
+		}
+		go a.ui.show() // off the tray's thread: WebView2 takes a moment
+	}
+	go a.watchShowRequests()
 
 	// Quiet unless there is something to offer; the ticker is for the PCs
 	// that stay signed in for weeks.
@@ -161,25 +244,21 @@ func (a *app) onReady() {
 	go func() {
 		for {
 			select {
+			case <-mOpen.ClickedCh:
+				a.ui.show()
 			case <-a.mRoute.ClickedCh:
-				a.setEnabled(!a.mRoute.Checked())
+				go a.setEnabled(!a.mRoute.Checked())
 			case <-a.mGame.ClickedCh:
 				go a.setGameMode(!a.mGame.Checked())
 			case <-a.mUpdate.ClickedCh:
 				go a.installUpdate()
 			case <-a.mSetup.ClickedCh:
-				go a.setup()
+				a.ui.show()
+				a.ui.openSheet("setup")
 			case <-a.mStartup.ClickedCh:
-				on := !a.mStartup.Checked()
-				if err := setStartWithWindows(on, a.exe); err != nil {
-					msgBox("Could not change Start with Windows: "+err.Error(), windows.MB_ICONERROR)
-				} else if on {
-					a.mStartup.Check()
-				} else {
-					a.mStartup.Uncheck()
-				}
+				a.setStartup(!a.mStartup.Checked())
 			case <-mLog.ClickedCh:
-				open(filepath.Join(a.dataDir, "sweep.log"))
+				open(a.log.path)
 			case <-mQuit.ClickedCh:
 				systray.Quit()
 				return
@@ -188,23 +267,43 @@ func (a *app) onReady() {
 	}()
 }
 
+// watchShowRequests brings the window forward when Sweep is launched again.
+func (a *app) watchShowRequests() {
+	name, _ := windows.UTF16PtrFromString(showKey)
+	ev, err := windows.CreateEvent(nil, 0, 0, name)
+	if err != nil {
+		return
+	}
+	for {
+		if s, err := windows.WaitForSingleObject(ev, windows.INFINITE); err != nil || s != windows.WAIT_OBJECT_0 {
+			return
+		}
+		a.ui.show()
+	}
+}
+
+var exitOnce sync.Once
+
+// onExit puts the network back the way the user had it. Safe to call twice:
+// the updater calls it before the swap and systray calls it again on Quit.
 func (a *app) onExit() {
-	a.mu.Lock()
-	a.enabled = false // no late Running re-arms the proxy
-	if a.proxyOn {
-		a.proxyOn = false
-		_ = RestoreSystemProxy()
-	}
-	armRestoreAtSignIn(false, a.exe)
-	wasGame := a.gameOn
-	a.gameOn = false
-	a.mu.Unlock()
-	// Routes outlive the process unless we take them down, which would leave
-	// the PC pointed at a tunnel that no longer exists.
-	if wasGame {
-		_ = a.gameRoutes.Remove()
-	}
-	a.warp.Stop()
+	exitOnce.Do(func() {
+		a.mu.Lock()
+		a.enabled = false // no late Running re-arms the proxy
+		if a.proxyOn {
+			a.proxyOn = false
+			_ = RestoreSystemProxy()
+		}
+		armRestoreAtSignIn(false, a.exe)
+		a.gameOn = false
+		a.mu.Unlock()
+		a.warp.Stop()
+		// Routes outlive the process unless we take them down, which would
+		// leave the PC pointed at a tunnel that no longer exists.
+		a.routesMu.Lock()
+		_ = a.routes.Remove()
+		a.routesMu.Unlock()
+	})
 }
 
 // startInGameMode is set by the elevated relaunch, which passes -game.
@@ -217,15 +316,29 @@ var startInGameMode bool
 // the routing table; without them the app relaunches itself through UAC.
 func (a *app) setGameMode(on bool) {
 	if on && !a.registered() {
-		a.mGame.Uncheck()
-		go a.setup()
+		a.changed()
+		a.ui.show()
+		a.ui.openSheet("setup")
 		return
 	}
+	a.mu.Lock()
+	if a.gameBusy {
+		a.mu.Unlock()
+		a.changed()
+		return
+	}
+	a.gameBusy = true
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.gameBusy = false
+		a.mu.Unlock()
+		a.changed()
+	}()
 
 	if on && !IsElevated() {
 		if err := RelaunchElevated(); err != nil {
-			a.mGame.Uncheck()
-			msgBox("Gaming mode needs administrator rights: "+err.Error(), windows.MB_ICONERROR)
+			a.alert("Gaming mode needs administrator rights: " + err.Error())
 			return
 		}
 		systray.Quit() // the elevated instance takes over
@@ -233,83 +346,107 @@ func (a *app) setGameMode(on bool) {
 	}
 
 	if !on {
-		a.mu.Lock()
-		a.gameOn = false
-		a.mu.Unlock()
-		a.warp.Stop()
-		if err := a.gameRoutes.Remove(); err != nil {
-			msgBox("Could not put the routing back: "+err.Error(), windows.MB_ICONERROR)
-		}
-		a.mGame.Uncheck()
-		a.mStatus.SetTitle("Off")
+		a.stopGame()
 		return
 	}
 
 	// The proxy mode must go first: two things claiming the same traffic is
 	// how a machine ends up routing in a circle.
-	a.setEnabled(false)
+	a.stopProxy()
 
 	gateway, err := DefaultGateway()
 	if err != nil {
-		msgBox("Gaming mode needs a network connection: "+err.Error(), windows.MB_ICONERROR)
-		a.mGame.Uncheck()
+		a.alert("Gaming mode needs a network connection: " + err.Error())
 		return
 	}
-
 	a.mu.Lock()
-	a.gameOn = true
+	a.gameOn, a.gameGW, a.gameState, a.gameMsg = true, gateway, "starting", ""
 	a.mu.Unlock()
-	a.mGame.Check()
-	a.mStatus.SetTitle("Gaming mode starting…")
+	a.changed()
+	a.warp.SetMode(true, a.flowTTL(), a.sni())
+	a.warp.Start() // onWarpState applies the routes once the device is up
+}
 
-	a.warp.Game = true
-	a.warp.Start()
-
-	if err := WaitForInterface(gameInterface, 30*time.Second); err != nil {
-		a.warp.Stop()
-		a.mGame.Uncheck()
-		a.mu.Lock(); a.gameOn = false; a.mu.Unlock()
-		msgBox("The tunnel interface never came up: "+err.Error(), windows.MB_ICONERROR)
+func (a *app) stopGame() {
+	a.mu.Lock()
+	was := a.gameOn
+	a.gameOn, a.gameState, a.gameMsg = false, "stopped", ""
+	a.mu.Unlock()
+	if !was {
 		return
 	}
-	if err := a.gameRoutes.Apply(gameInterface, gateway); err != nil {
-		a.warp.Stop()
-		a.mGame.Uncheck()
-		a.mu.Lock(); a.gameOn = false; a.mu.Unlock()
-		msgBox("Could not route through the tunnel: "+err.Error(), windows.MB_ICONERROR)
+	a.warp.Stop()
+	a.warp.SetMode(false, "0", a.sni())
+	a.routesMu.Lock()
+	err := a.routes.Remove()
+	a.routesMu.Unlock()
+	if err != nil {
+		a.alert("Could not put the routing back: " + err.Error())
+	}
+}
+
+// applyGameRoutes points the PC at the tunnel. It runs on every Running, not
+// just the first: a respawned or restarted usque builds a new wintun adapter,
+// and Windows drops the routes that pointed at the old one.
+func (a *app) applyGameRoutes() {
+	a.routesMu.Lock()
+	defer a.routesMu.Unlock()
+	a.mu.Lock()
+	on, gw := a.gameOn, a.gameGW
+	a.mu.Unlock()
+	if !on {
 		return
 	}
-	a.mStatus.SetTitle("Gaming mode on")
+	err := WaitForInterface(gameInterface, 30*time.Second)
+	if err == nil {
+		_ = a.routes.Remove()
+		err = a.routes.Apply(gameInterface, gw, MasqueEndpoint(a.config))
+	}
+	a.mu.Lock()
+	still := a.gameOn
+	if still && err == nil {
+		a.gameState, a.gameMsg = "running", ""
+	} else if still {
+		a.gameState, a.gameMsg = "failed", "Could not route through the tunnel: "+err.Error()
+	}
+	a.mu.Unlock()
+	if !still {
+		_ = a.routes.Remove() // turned off while we were applying
+	}
+	if err != nil {
+		a.logf("game routes: %v", err)
+	}
+	a.changed()
 }
 
 // gameInterface is the wintun device name usque creates for nativetun.
 const gameInterface = "usque"
 
-func (a *app) refreshSetup() {
-	if a.registered() {
-		a.mSetup.SetTitle("WARP is set up")
-		a.mSetup.Disable()
-	} else {
-		a.mSetup.SetTitle("Set up WARP…")
-		a.mSetup.Enable()
-	}
-}
-
 func (a *app) setEnabled(on bool) {
 	if on && !a.registered() {
-		a.mRoute.Uncheck()
-		go a.setup()
+		a.changed()
+		a.ui.show()
+		a.ui.openSheet("setup")
 		return
 	}
 	setBool("Enabled", on)
-	if on {
-		a.mu.Lock()
-		a.enabled = true
-		a.mu.Unlock()
-		a.mRoute.Check()
-		a.warp.Start()
+	if !on {
+		a.stopProxy()
+		a.warp.Stop()
+		a.changed()
 		return
 	}
+	a.stopGame()
+	a.mu.Lock()
+	a.enabled, a.proxyError = true, ""
+	a.mu.Unlock()
+	a.changed()
+	a.warp.SetMode(false, "0", a.sni())
+	a.warp.Start()
+}
+
+// stopProxy takes the Windows proxy down, leaving WARP to the caller.
+func (a *app) stopProxy() {
 	a.mu.Lock()
 	a.enabled = false
 	var err error
@@ -319,11 +456,9 @@ func (a *app) setEnabled(on bool) {
 		armRestoreAtSignIn(false, a.exe)
 	}
 	a.mu.Unlock()
-	a.mRoute.Uncheck()
 	if err != nil {
-		msgBox("Could not put the Windows proxy settings back: "+err.Error(), windows.MB_ICONERROR)
+		a.alert("Could not put the Windows proxy settings back: " + err.Error())
 	}
-	a.warp.Stop()
 }
 
 // onWarpState turns the Windows proxy on only once WARP is listening. After
@@ -331,43 +466,35 @@ func (a *app) setEnabled(on bool) {
 // back is better than traffic quietly leaving outside it (same as the Mac).
 func (a *app) onWarpState(s State, msg string) {
 	a.mu.Lock()
-	enabled := a.enabled
-	if enabled && s == Running && !a.proxyOn {
+	a.warpState, a.warpMsg = s, msg
+	enabled, game := a.enabled, a.gameOn
+	if enabled && !game && s == Running && !a.proxyOn {
 		if err := SetSystemProxy(proxyPort); err != nil {
-			msg = "could not set the Windows proxy: " + err.Error()
-			s = Failed
+			a.proxyError = "Could not set the Windows proxy: " + err.Error()
 		} else {
-			a.proxyOn = true
+			a.proxyOn, a.proxyError = true, ""
 			armRestoreAtSignIn(true, a.exe)
 		}
 	}
-	a.mu.Unlock()
-
-	title := s.String()
-	switch {
-	case s == Running && enabled:
-		title = "Connected — this PC goes through WARP"
-		systray.SetIcon(icon(52, 199, 89))
-	case s == Running:
-		title = "WARP ready"
-		systray.SetIcon(icon(52, 199, 89))
-	case s == Starting:
-		title = "Connecting…"
-		systray.SetIcon(icon(255, 159, 10))
-	case s == Failed:
-		title = "Problem: " + msg
-		systray.SetIcon(icon(255, 59, 48))
-	default:
-		systray.SetIcon(icon(140, 140, 140))
+	if game {
+		switch s {
+		case Starting:
+			a.gameState = "starting"
+		case Failed:
+			a.gameState, a.gameMsg = "failed", msg
+		}
 	}
-	a.mStatus.SetTitle(truncate(title, 90))
-	systray.SetTooltip(truncate("Sweep VPN — "+title, 120))
+	a.mu.Unlock()
+	a.changed()
 
+	if game && s == Running {
+		go a.applyGameRoutes()
+	}
 	// Never give up while the user wants to be connected.
-	if s == Failed && enabled {
+	if s == Failed && (enabled || game) {
 		time.AfterFunc(15*time.Second, func() {
 			a.mu.Lock()
-			still := a.enabled
+			still := a.enabled || a.gameOn
 			a.mu.Unlock()
 			if still && a.warp.State() == Failed && a.registered() {
 				a.warp.Start()
@@ -376,29 +503,116 @@ func (a *app) onWarpState(s State, msg string) {
 	}
 }
 
-func (a *app) setup() {
+// statusLine is the one-line summary the tray and the window share.
+func (a *app) statusLine() (title string, r, g, b byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.gameOn {
+		switch a.gameState {
+		case "running":
+			return "Gaming mode on: the whole PC goes through WARP", 52, 199, 89
+		case "failed":
+			return "Problem: " + a.gameMsg, 255, 59, 48
+		}
+		return "Gaming mode starting…", 255, 159, 10
+	}
+	if !a.registered() {
+		return "WARP is not set up", 140, 140, 140
+	}
+	switch a.warpState {
+	case Running:
+		if a.proxyOn {
+			return "Connected — this PC goes through WARP", 52, 199, 89
+		}
+		return fmt.Sprintf("WARP ready on 127.0.0.1:%d (SNI %s)", proxyPort, a.sni()), 52, 199, 89
+	case Starting:
+		return "Connecting to WARP… (SNI " + a.sni() + ")", 255, 159, 10
+	case Failed:
+		return "Problem: " + a.warpMsg, 255, 59, 48
+	}
+	return "Off", 140, 140, 140
+}
+
+// changed pushes the current state to the tray and the window. Cheap enough
+// to call after every transition.
+func (a *app) changed() {
+	title, r, g, b := a.statusLine()
+	systray.SetIcon(icon(r, g, b))
+	systray.SetTooltip(truncate("Sweep VPN — "+title, 120))
+	a.mStatus.SetTitle(truncate(title, 90))
+	a.mu.Lock()
+	enabled, game, update := a.enabled, a.gameOn, a.update
+	a.mu.Unlock()
+	check(a.mRoute, enabled)
+	check(a.mGame, game)
 	if a.registered() {
+		a.mSetup.SetTitle("WARP is set up")
+		a.mSetup.Disable()
+	} else {
+		a.mSetup.SetTitle("Set up WARP…")
+		a.mSetup.Enable()
+	}
+	if update != nil {
+		a.mUpdate.SetTitle("Update to " + update.Version + "…")
+		a.mUpdate.Show()
+	} else {
+		a.mUpdate.Hide()
+	}
+	a.ui.push()
+}
+
+func check(m *systray.MenuItem, on bool) {
+	if on {
+		m.Check()
+	} else {
+		m.Uncheck()
+	}
+}
+
+// alert shows an error in the window when it is open, where the Mac app shows
+// it, and falls back to a dialog for someone working from the tray.
+func (a *app) alert(msg string) {
+	a.logf("alert: %s", msg)
+	if a.ui.visible() {
+		a.mu.Lock()
+		a.lastError = msg
+		a.mu.Unlock()
+		a.changed()
 		return
 	}
-	ok := msgBox("Sweep VPN uses Cloudflare WARP. It is free and needs no account: this PC gets its own anonymous WARP identity.\n\n"+
-		"By continuing you accept Cloudflare's terms:\nhttps://www.cloudflare.com/application/terms/\n\nRegister this PC now?",
-		windows.MB_YESNO|windows.MB_ICONQUESTION) == 6 // IDYES
-	if !ok {
+	msgBox(msg, windows.MB_ICONERROR)
+}
+
+// register runs the one-time WARP setup (WarpSetupGuide on the Mac). The
+// window only calls it after the user ticked Cloudflare's terms.
+func (a *app) register(license, team string) {
+	a.mu.Lock()
+	if a.setupBusy {
+		a.mu.Unlock()
 		return
 	}
-	a.mSetup.SetTitle("Registering…")
-	a.mSetup.Disable()
-	err := Register(a.usque, a.config, "", "")
-	a.refreshSetup()
+	a.setupBusy, a.setupError = true, ""
+	a.mu.Unlock()
+	a.changed()
+	err := Register(a.usque, a.config, license, team)
+	a.mu.Lock()
+	a.setupBusy = false
 	if err != nil {
-		fmt.Fprintf(a.log, "%s register failed: %v\n", time.Now().Format("2006-01-02 15:04:05"), err)
-		msgBox(err.Error(), windows.MB_ICONERROR)
-		return
+		a.setupError = err.Error()
 	}
-	a.mStatus.SetTitle("WARP is set up")
-	if msgBox("WARP is set up. Route this PC through WARP now?", windows.MB_YESNO|windows.MB_ICONINFORMATION) == 6 {
-		a.setEnabled(true)
+	a.mu.Unlock()
+	if err != nil {
+		a.logf("register failed: %v", err)
 	}
+	a.changed()
+}
+
+func (a *app) setStartup(on bool) {
+	if err := setStartWithWindows(on, a.exe); err != nil {
+		a.alert("Could not change Start with Windows: " + err.Error())
+	}
+	check(a.mStartup, startsWithWindows())
+	a.changed()
 }
 
 func truncate(s string, n int) string {

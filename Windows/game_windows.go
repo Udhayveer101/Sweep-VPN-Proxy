@@ -3,7 +3,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -24,14 +26,32 @@ import (
 // Needs administrator rights (wintun and the routing table), so the tray app
 // re-launches itself elevated when the user turns this on.
 
-const masqueEndpoint = "162.159.198.2"
+// defaultMasqueEndpoint is usque's DefaultEndpointH2V4, dialled with --http2
+// when the registration carries no endpoint_h2_v4.
+const defaultMasqueEndpoint = "162.159.198.2"
+
+// MasqueEndpoint is the address usque will dial for this registration. The
+// pin must match it exactly, or the tunnel's own packets route into the
+// tunnel they carry.
+func MasqueEndpoint(config string) string {
+	var c struct {
+		EndpointH2V4 string `json:"endpoint_h2_v4"`
+	}
+	if b, err := os.ReadFile(config); err == nil && json.Unmarshal(b, &c) == nil {
+		if ip := net.ParseIP(c.EndpointH2V4); ip != nil && ip.To4() != nil {
+			return ip.String()
+		}
+	}
+	return defaultMasqueEndpoint
+}
 
 // GameRoutes owns every routing-table change gaming mode makes, so teardown is
 // exactly the inverse of setup and a crash cannot strand the PC on a dead
 // tunnel.
 type GameRoutes struct {
-	iface   string // wintun interface name, e.g. "usque"
-	gateway string // the physical default gateway, restored on the way out
+	iface    string // wintun interface name, e.g. "usque"
+	gateway  string // the physical default gateway, restored on the way out
+	endpoint string // the MASQUE server, pinned to the physical link
 	applied bool
 }
 
@@ -72,7 +92,9 @@ func RelaunchElevated(extraArgs ...string) error {
 // DefaultGateway returns the current IPv4 default gateway and its interface
 // index, before any tunnel route exists.
 func DefaultGateway() (gateway string, err error) {
-	out, err := exec.Command("route", "print", "-4", "0.0.0.0").Output()
+	cmd := exec.Command("route", "print", "-4", "0.0.0.0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true} // no console flash from a GUI app
+	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("route print: %w", err)
 	}
@@ -91,12 +113,12 @@ func DefaultGateway() (gateway string, err error) {
 // Two halves rather than replacing the default route: they win on
 // longest-prefix match, so the original default stays untouched and teardown
 // is a delete instead of a restore.
-func (g *GameRoutes) Apply(iface, gateway string) error {
-	g.iface, g.gateway = iface, gateway
+func (g *GameRoutes) Apply(iface, gateway, endpoint string) error {
+	g.iface, g.gateway, g.endpoint = iface, gateway, endpoint
 
 	// The tunnel's own packets must keep using the physical link, or they
 	// would route into the tunnel they carry.
-	if err := run("route", "add", masqueEndpoint, "mask", "255.255.255.255", gateway); err != nil {
+	if err := run("route", "add", endpoint, "mask", "255.255.255.255", gateway); err != nil {
 		return fmt.Errorf("pin MASQUE endpoint: %w", err)
 	}
 	g.applied = true
@@ -136,7 +158,7 @@ func (g *GameRoutes) Remove() error {
 	for _, half := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
 		note(run("netsh", "interface", "ipv4", "delete", "route", half, g.iface, "store=active"))
 	}
-	note(run("route", "delete", masqueEndpoint))
+	note(run("route", "delete", g.endpoint))
 	g.applied = false
 	return firstErr
 }
@@ -152,15 +174,21 @@ func run(name string, args ...string) error {
 	return nil
 }
 
-// WaitForInterface blocks until the wintun device exists and has an address,
-// or the deadline passes. usque creates it asynchronously after launch.
+// WaitForInterface blocks until the wintun device exists and has an IPv4
+// address, or the deadline passes. usque creates it asynchronously after
+// launch. Asks the OS directly: netsh's output is localized, so matching its
+// text failed every time on non-English Windows.
 func WaitForInterface(name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		out, err := exec.Command("netsh", "interface", "ipv4", "show", "addresses",
-			"name="+name).Output()
-		if err == nil && strings.Contains(string(out), "IP Address") {
-			return nil
+		if ifc, err := net.InterfaceByName(name); err == nil {
+			if addrs, err := ifc.Addrs(); err == nil {
+				for _, ad := range addrs {
+					if ip, ok := ad.(*net.IPNet); ok && ip.IP.To4() != nil {
+						return nil
+					}
+				}
+			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
