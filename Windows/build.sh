@@ -19,6 +19,12 @@ git -C "$WORK" -c user.name=ci -c user.email=ci@localhost am -q \
   "$PATCHES/standby-backoff.patch" "$PATCHES/standby-age-log.patch"
 (cd "$WORK" && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o "$HERE/usque.exe" .)
 
+# usque's TUN (gaming mode) loads wintun.dll from beside its own exe.
+curl -fsSLo "$WORK/wintun.zip" https://www.wintun.net/builds/wintun-0.14.1.zip
+echo "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51  $WORK/wintun.zip" | \
+  (shasum -a 256 -c - 2>/dev/null || sha256sum -c -)
+unzip -p "$WORK/wintun.zip" wintun/bin/amd64/wintun.dll > "$HERE/wintun.dll"
+
 mkdir -p "$HERE/dist"
 OUT="$HERE/dist/SweepVPN-$VERSION-windows-x64.exe"
 (cd "$HERE" && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath \
