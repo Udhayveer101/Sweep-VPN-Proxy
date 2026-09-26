@@ -20,7 +20,6 @@ CONFIG="${2:?config.json path required}"
 CONTROL="${3:?control file path required}"
 LOG="${4:?log path required}"
 SNI="${5:-example.com}"
-ROTATE="${6:-0}"        # flow-ttl; "0" disables rotation
 
 # usque --http2 dials endpoint_h2_v4 from the registration, or this default
 # (config/endpoints.go). Pinning a different address than the one it dials
@@ -32,6 +31,7 @@ ORIG_GW=""
 ORIG_SVC=""
 ORIG_DNS=""
 USQUE_PID=""
+MCAST_ADDED=""
 
 # We run as root and the log sits in the user's Library: never follow a link
 # someone swapped in, or root would append to whatever it points at.
@@ -49,6 +49,9 @@ cleanup() {
     route -n delete -net 0.0.0.0/1 >/dev/null 2>&1
     route -n delete -net 128.0.0.0/1 >/dev/null 2>&1
     [ -n "$ORIG_GW" ] && route -n delete -host "$ENDPOINT_IP" "$ORIG_GW" >/dev/null 2>&1
+    [ -n "$MCAST_ADDED" ] && route -n delete -net 224.0.0.0/4 -interface "$ORIG_IF" >/dev/null 2>&1
+    route -n delete -net 10.0.0.0/8 >/dev/null 2>&1
+    route -n delete -net 192.168.0.0/16 >/dev/null 2>&1
     if [ -n "$ORIG_SVC" ]; then
         # networksetup's "none set" answer is a sentence, not an address list.
         if [ -z "${ORIG_DNS// /}" ] || [[ "$ORIG_DNS" == *"aren't any DNS Servers"* ]]; then
@@ -93,39 +96,55 @@ log "pinned $ENDPOINT_IP via $ORIG_GW"
 # No --dns-timeout or -d here: nativetun moves packets and has no in-process
 # resolver, unlike socks/http-proxy, and usque exits on an unknown flag. DNS is
 # the system's job, which is why we point it at 1.1.1.1 below.
-# --hot-standby only with rotation. A parked standby is swept in the same sweep
-# as the live flow whatever age it has reached, so as kill recovery it delivers a
-# corpse and costs ~2s before the dial that works (measured 2026-09-20: 11 of 26
-# promotions were already dead — docs/measurements-2026-09-20.md). Rotation is
-# the one case that needs it, because there the promotion is planned.
+# Never --hot-standby or --flow-ttl. Every MASQUE session is a new connection
+# at Cloudflare and does not carry the inner TCP connections across, so each
+# rotation resets every open game connection. Measured 2026-09-27 through the
+# shipped 1.5.0 usque: with --flow-ttl 15s/20s, 4 of 7 long TCP transfers were
+# cut ("transfer closed"); without rotation 0 of 7 over the same 5.5 minutes.
+# A parked standby is also swept with the live flow, so it buys nothing here
+# (docs/measurements-2026-09-20.md).
 ARGS=(-c "$CONFIG" nativetun -s "$SNI" --http2 --always-reconnect -k 5s -S)
-if [ "$ROTATE" != "0" ]; then
-    ARGS+=(--hot-standby --flow-ttl "$ROTATE")
-    log "flow rotation every $ROTATE"
-fi
 
-"$USQUE" "${ARGS[@]}" >> "$LOG" 2>&1 &
-USQUE_PID=$!
-log "usque pid $USQUE_PID"
-
-# Wait for the utun to appear and carry our address.
-for _ in $(seq 1 40); do
-    kill -0 "$USQUE_PID" 2>/dev/null || { log "FATAL usque exited during setup"; exit 1; }
-    # Only usque's own announcement names our device. Guessing from ifconfig
-    # picked up whatever other VPN's utun happened to be last (Tailscale, the
-    # Sweep packet tunnel) and routed the whole Mac into it.
-    IFACE=$(grep -oE 'Created TUN device: utun[0-9]+' "$LOG" | tail -1 | awk '{print $4}')
-    if [ -n "$IFACE" ] && ifconfig "$IFACE" 2>/dev/null | grep -q 'inet '; then
-        break
-    fi
+# Start usque and wait for its utun to appear and carry our address. Only
+# usque's own announcement names our device: guessing from ifconfig picked up
+# whatever other VPN's utun happened to be last. The log is appended across
+# runs, so only lines written after this launch count.
+# Returns 0 with IFACE set, 1 if usque exited, 2 if the device never came up.
+launch_usque() {
+    local from
+    from=$(stat -f %z "$LOG" 2>/dev/null || echo 0)
+    "$USQUE" "${ARGS[@]}" >> "$LOG" 2>&1 &
+    USQUE_PID=$!
+    log "usque pid $USQUE_PID"
     IFACE=""
-    sleep 0.5
-done
+    for _ in $(seq 1 40); do
+        kill -0 "$USQUE_PID" 2>/dev/null || return 1
+        IFACE=$(tail -c +$((from + 1)) "$LOG" | grep -oE 'Created TUN device: utun[0-9]+' | tail -1 | awk '{print $4}')
+        if [ -n "$IFACE" ] && ifconfig "$IFACE" 2>/dev/null | grep -q 'inet '; then
+            return 0
+        fi
+        IFACE=""
+        sleep 0.5
+    done
+    kill "$USQUE_PID" 2>/dev/null
+    return 2
+}
 
-if [ -z "$IFACE" ]; then
-    log "FATAL tunnel interface never came up"
-    exit 1
-fi
+# Point both halves of the default route somewhere without a gap: "change"
+# when the route exists, "add" when the kernel already dropped it (it removes
+# routes to a utun that has gone away).
+point_default() {
+    for HALF in 0.0.0.0/1 128.0.0.0/1; do
+        route -n change -net "$HALF" "$@" >/dev/null 2>&1 ||
+            route -n add -net "$HALF" "$@" >/dev/null 2>&1
+    done
+}
+
+launch_usque
+case $? in
+    1) log "FATAL usque exited during setup"; exit 1 ;;
+    2) log "FATAL tunnel interface never came up"; exit 1 ;;
+esac
 
 TUN_ADDR=$(ifconfig "$IFACE" | awk '/inet /{print $2; exit}')
 log "tunnel $IFACE addr $TUN_ADDR"
@@ -133,27 +152,66 @@ log "tunnel $IFACE addr $TUN_ADDR"
 # Two halves instead of replacing the default route: they beat the existing
 # default on longest-prefix match, so the original stays intact and teardown is
 # a delete rather than a restore.
-route -n add -net 0.0.0.0/1 -interface "$IFACE" >/dev/null 2>&1
-route -n add -net 128.0.0.0/1 -interface "$IFACE" >/dev/null 2>&1
+point_default -interface "$IFACE"
 log "default routed through $IFACE"
+
+# Multicast and discovery (TTL 1) stay on the physical link. Sent into the
+# tunnel they are dropped anyway ("connect-ip: datagram TTL too small: 1").
+# Only delete what we added: macOS may already hold its own 224/4 route.
+route -n add -net 224.0.0.0/4 -interface "$ORIG_IF" >/dev/null 2>&1 && MCAST_ADDED=1
+
+# Private ranges stay on the physical link, as WARP's own client does. WARP
+# cannot reach them, and a network whose DHCP resolvers are private (measured
+# 2026-09-24: 10.1.2.10/.16 behind 192.168.3.5) otherwise loses every lookup the
+# moment the DNS pin below does not take. 172.16/12 is left out: it holds the
+# tunnel's own address.
+for NET in 10.0.0.0/8 192.168.0.0/16; do
+    route -n add -net "$NET" "$ORIG_GW" >/dev/null 2>&1
+done
 
 ORIG_SVC=$(networksetup -listnetworkserviceorder | awk -v dev="$ORIG_IF" '
     /^\([0-9]+\)/ { svc=substr($0, index($0,$2)) }
     $0 ~ "Device: "dev"\\)" { print svc; exit }')
 if [ -n "$ORIG_SVC" ]; then
     ORIG_DNS=$(networksetup -getdnsservers "$ORIG_SVC" 2>/dev/null | tr '\n' ' ')
-    networksetup -setdnsservers "$ORIG_SVC" 1.1.1.1 1.0.0.1 >/dev/null 2>&1
-    log "dns pinned on '$ORIG_SVC' (was: $ORIG_DNS)"
+    ERR=$(networksetup -setdnsservers "$ORIG_SVC" 1.1.1.1 1.0.0.1 2>&1)
+    log "dns pinned on '$ORIG_SVC' (was: $ORIG_DNS)${ERR:+ networksetup: $ERR}"
 fi
+# networksetup can succeed and still not change the resolver in use, so check
+# what the system will actually ask.
+sleep 1
+log "resolvers now: $(scutil --dns | awk '/nameserver\[/{print $3}' | sort -u | tr '\n' ' ')"
 
 log "ready"
 
-# Hold until the app withdraws the control file, or usque dies.
+# Hold until the app withdraws the control file. If usque dies, restart it and
+# keep the default route away from the physical link meanwhile (kill switch):
+# falling back to direct mid-game is another reset, and may be blocked anyway.
+# Open game connections do not survive a restart either - it is a new session -
+# but the tunnel comes back without the player toggling anything.
+# Five failed restarts in a row end it; a restart only counts as a success once
+# usque has stayed up for a minute, so a crash loop cannot hold the Mac forever.
+FAILS=0
+UP_SINCE=$SECONDS
 while [ -f "$CONTROL" ]; do
     if ! kill -0 "$USQUE_PID" 2>/dev/null; then
-        log "usque exited; shutting down"
-        exit 1
+        point_default 127.0.0.1 -blackhole
+        FAILS=$((FAILS + 1))
+        if [ "$FAILS" -gt 5 ]; then
+            log "FATAL usque would not restart; shutting down"
+            exit 1
+        fi
+        log "usque exited; restarting (attempt $FAILS), traffic held"
+        sleep $((1 << (FAILS - 1)))
+        [ -f "$CONTROL" ] || break
+        if launch_usque; then
+            point_default -interface "$IFACE"
+            log "restarted; default routed through $IFACE"
+            UP_SINCE=$SECONDS
+        fi
+        continue
     fi
+    [ $((SECONDS - UP_SINCE)) -ge 60 ] && FAILS=0
     sleep 1
 done
 

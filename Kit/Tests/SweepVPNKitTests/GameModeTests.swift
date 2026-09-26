@@ -16,12 +16,14 @@ final class GameModeTests: XCTestCase {
         XCTAssertNil(GameModeController.classify("2026/09/18 00:14:01 IST Connected to MASQUE server"))
     }
 
-    /// After "ready", usque dying ends the script and restores direct routing.
-    /// The app used to miss it and keep claiming the Mac went through WARP.
-    func testUsqueDyingAfterReadyIsNoticed() {
-        let line = "00:31:40 gamemode: usque exited; shutting down"
-        XCTAssertEqual(GameModeController.classify(line), .fatal)
-        XCTAssertTrue(GameModeController.reason(for: line).contains("normal routing back"))
+    /// After "ready", usque dying is restarted with the routes held in the
+    /// tunnel; only a restart that keeps failing turns gaming mode off.
+    func testUsqueDyingIsRestartedAndOnlyARestartLoopIsFatal() {
+        let restart = "00:31:40 gamemode: usque exited; restarting (attempt 1), traffic held"
+        XCTAssertEqual(GameModeController.classify(restart), .restarting)
+        let gaveUp = "00:32:11 gamemode: FATAL usque would not restart; shutting down"
+        XCTAssertEqual(GameModeController.classify(gaveUp), .fatal)
+        XCTAssertTrue(GameModeController.reason(for: gaveUp).contains("normal routing back"))
     }
 
     /// A control file left by a crashed run keeps its root script alive; it
@@ -39,9 +41,29 @@ final class GameModeTests: XCTestCase {
         XCTAssertFalse(c.withdrawStaleRuns())
     }
 
-    func testRotationIsReportedButIsNotAFailure() {
-        let line = "2026/09/18 00:05:14 IST Retiring MASQUE flow before it ages out; promoting standby"
-        XCTAssertEqual(GameModeController.classify(line), .rotated)
+    /// The app writes its own events into the same log; they must never be
+    /// mistaken for the script's.
+    func testAppLinesAreNotScriptEvents() {
+        XCTAssertNil(GameModeController.classify("00:31:40 app: starting sni=example.com"))
+        XCTAssertNil(GameModeController.classify("00:31:40 app: usqueExited 00:31:40 gamemode: usque exited; restarting"))
+    }
+
+    /// The log is kept across runs, rolled once to .1 when it gets big.
+    func testLogHistoryIsKeptAndRolled() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let c = GameModeController(script: dir, usque: dir, directory: dir, workDir: dir)
+        let log = dir.appendingPathComponent("gamemode.log")
+        c.rollLog()
+        try Data("earlier session\n".utf8).write(to: log)
+        c.rollLog()
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "earlier session\n")
+
+        try Data(count: Int(GameModeController.logLimit) + 1).write(to: log)
+        c.rollLog()
+        XCTAssertEqual(try Data(contentsOf: log).count, 0)
+        XCTAssertEqual(try Data(contentsOf: dir.appendingPathComponent("gamemode.log.1")).count,
+                       Int(GameModeController.logLimit) + 1)
     }
 
     /// A raw script line is not something to show a player.
@@ -56,11 +78,20 @@ final class GameModeTests: XCTestCase {
             .contains("Try again"))
     }
 
-    /// Rotation is opt-in: the default must not pass a TTL, because rotation
-    /// stalls roughly one new connection in twenty (measured 2026-09-18).
-    func testStandbyIsTheDefaultAndDoesNotRotate() {
-        XCTAssertEqual(GameModeController.Disguise.standby.flowTTL, "0")
-        XCTAssertNotEqual(GameModeController.Disguise.rotate.flowTTL, "0")
+    /// Each rotation is a new MASQUE session, which resets every open game
+    /// connection (measured 2026-09-27). The script must never ask for one.
+    func testGamingModeNeverRotates() throws {
+        let script = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Tools/gamemode.sh")
+        let args = try String(contentsOf: script, encoding: .utf8)
+            .split(separator: "\n").filter { $0.contains("ARGS") && !$0.hasPrefix("#") }
+        XCTAssertFalse(args.isEmpty)
+        for line in args {
+            XCTAssertFalse(line.contains("--flow-ttl"), String(line))
+            XCTAssertFalse(line.contains("--hot-standby"), String(line))
+        }
     }
 
     /// Gaming mode is useless without the registration the proxy mode uses,

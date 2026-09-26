@@ -24,47 +24,13 @@ public final class GameModeController: @unchecked Sendable {
         public var isFailed: Bool { if case .failed = self { return true }; return false }
     }
 
-    /// How aggressively to hide the ISP's flow kills.
-    ///
-    /// The network sweeps established TCP flows and tears down every long-lived
-    /// one at once. `standby` used to mean "keep a warm session so a kill is a
-    /// promotion instead of a rebuild", and it turned out to mean nothing: the
-    /// standby is swept in the same sweep as the live flow, at whatever age it
-    /// has reached, so promoting it hands the tunnel a dead session (measured
-    /// 2026-09-20, 11 of 26 promotions already dead — see
-    /// docs/measurements-2026-09-20.md). So `standby` now keeps no standby; it
-    /// is the plain tunnel, reconnecting after each kill, which is what the
-    /// numbers favour. The case name is kept because it is a stored setting.
-    /// `rotate` retires each flow before it is old enough to be swept, and is
-    /// the one mode that does park a warm session, because it has to rotate
-    /// *into* one. It stays opt-in: ~1 in 20 new connections stalls in the swap
-    /// window.
-    public enum Disguise: String, Sendable, CaseIterable {
-        case standby
-        case rotate
-
-        /// The ISP's sweep lands every 1-4 minutes, so 45s retired a healthy
-        /// flow about twice as often as the threat needed. 90s (±20% jitter,
-        /// applied in usque) still rotates well inside the sweep.
-        ///
-        /// Rotation stays opt-in, and `.standby` stays the default, because the
-        /// swap window is expensive in a way the median hides. Measured
-        /// 2026-09-20 over 18 minutes and 16 rotations (see
-        /// docs/measurements-2026-09-20.md): median throughput was unchanged at
-        /// 23 Mbit/s, but the tenth-percentile transfer fell from 19.95 Mbit/s
-        /// to 1.76 Mbit/s. For a download that averages out. For a game it does
-        /// not — a periodic collapse to 1.76 Mbit/s is exactly the interruption
-        /// this mode exists to avoid. Do not reach for rotation when someone
-        /// reports stutter; it is the cause, not the cure.
-        var flowTTL: String { self == .rotate ? "90s" : "0" }
-
-        public var title: String {
-            switch self {
-            case .standby: return "Reconnect on drops (recommended)"
-            case .rotate:  return "Rotate flows early"
-            }
-        }
-    }
+    /// Gaming mode never rotates flows. Every MASQUE session is a new
+    /// connection at Cloudflare and does not carry the inner TCP connections
+    /// across, so each rotation reset every open game connection ("Connection
+    /// reset" in Minecraft). Measured 2026-09-27 with the shipped usque: 4 of 7
+    /// long TCP transfers cut with rotation on, 0 of 7 with it off. There used
+    /// to be a "Rotate flows early" option here; it is gone so nobody can land
+    /// on it by accident.
 
     private let script: URL
     private let usque: URL
@@ -80,6 +46,9 @@ public final class GameModeController: @unchecked Sendable {
     private var controlFile: URL
     private static let controlPrefix = "gamemode-"
     private var logFile: URL { workDir.appendingPathComponent("gamemode.log") }
+    /// The log is kept across runs so earlier sessions can be checked, and
+    /// rolled to gamemode.log.1 once it passes this size.
+    static let logLimit: UInt64 = 1 << 20
     public let sni: String
 
     private let lock = NSLock()
@@ -164,8 +133,7 @@ public final class GameModeController: @unchecked Sendable {
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configFile.path)
     }
 
-    public func start(disguise: Disguise = .standby,
-                      onState: @escaping @Sendable (State) -> Void) {
+    public func start(onState: @escaping @Sendable (State) -> Void) {
         lock.lock()
         self.onState = onState
         stopped = false
@@ -188,30 +156,30 @@ public final class GameModeController: @unchecked Sendable {
             return
         }
 
-        // Fresh log per run, and the control file must exist before the script
-        // does: it polls for the file and exits the moment it is gone.
-        try? FileManager.default.removeItem(at: logFile)
-        FileManager.default.createFile(atPath: logFile.path, contents: nil)
+        // The control file must exist before the script does: it polls for
+        // the file and exits the moment it is gone. The log is appended, not
+        // replaced; the monitor reads only what this run adds.
+        rollLog()
         lock.lock()
         controlFile = workDir.appendingPathComponent(Self.controlPrefix + UUID().uuidString + ".control")
         let control = controlFile
         lock.unlock()
         FileManager.default.createFile(atPath: control.path, contents: nil)
-        logOffset = 0
+        logOffset = (try? FileManager.default.attributesOfItem(atPath: logFile.path)[.size] as? UInt64) ?? 0
         state = .starting
-        record(.info, "starting", "disguise=\(disguise.rawValue) sni=\(sni)")
+        record(.info, "starting", "sni=\(sni)")
 
         // The routing table and utun need root. A Developer ID app cannot
         // install a privileged helper without a paid Network Extension
         // entitlement, so the admin prompt is the honest path: one password,
         // and the script owns its own teardown.
         let command = [script.path, usque.path, configFile.path,
-                       control.path, logFile.path, sni, disguise.flowTTL]
+                       control.path, logFile.path, sni]
             .map { "'" + $0.replacingOccurrences(of: "'", with: "'\\''") + "'" }
             .joined(separator: " ")
 
         let scriptArgs = [usque.path, configFile.path, control.path,
-                          logFile.path, sni, disguise.flowTTL]
+                          logFile.path, sni]
 
         DispatchQueue.global().asyncAfter(deadline: .now() + settle) { [self] in
             lock.lock()
@@ -342,23 +310,25 @@ public final class GameModeController: @unchecked Sendable {
                 record(.info, "ready", line)
             case .fatal:
                 teardown(reason: Self.reason(for: line))
-            case .rotated:
-                record(.info, "rotated", line)
+            case .restarting:
+                record(.error, "usqueExited", line)
             case nil:
                 break
             }
         }
     }
 
-    enum LogEvent: Equatable { case ready, rotated, fatal }
+    enum LogEvent: Equatable { case ready, restarting, fatal }
 
     static func classify(_ line: String) -> LogEvent? {
+        // "HH:mm:ss app: ..." is our own echo of an event; re-reading it
+        // would record it again, forever.
+        if line.split(separator: " ", maxSplits: 2).dropFirst().first == "app:" { return nil }
         if line.contains("gamemode: ready") { return .ready }
         if line.contains("gamemode: FATAL") { return .fatal }
-        // After "ready", usque dying ends the script and restores direct
-        // routing; without this the app kept saying the Mac went through WARP.
-        if line.contains("gamemode: usque exited") { return .fatal }
-        if line.contains("Retiring MASQUE flow") { return .rotated }
+        // After "ready", usque dying is restarted with traffic held in the
+        // tunnel; only a restart that keeps failing is FATAL.
+        if line.contains("gamemode: usque exited; restarting") { return .restarting }
         return nil
     }
 
@@ -372,8 +342,8 @@ public final class GameModeController: @unchecked Sendable {
         if line.contains("usque exited during setup") {
             return "The WARP tunnel would not start. Check Settings ▸ WARP setup."
         }
-        if line.contains("usque exited; shutting down") {
-            return "The WARP tunnel stopped, so gaming mode turned itself off and put your normal routing back. Turn it on again to reconnect."
+        if line.contains("usque would not restart") {
+            return "The WARP tunnel kept stopping, so gaming mode turned itself off and put your normal routing back. Turn it on again to reconnect."
         }
         if line.contains("interface never came up") {
             return "The tunnel interface never appeared. Try again, or reconnect to the network."
@@ -383,6 +353,38 @@ public final class GameModeController: @unchecked Sendable {
 
     private func record(_ level: LogEntry.Level, _ kind: String, _ detail: String) {
         EventLog.shared.record(phase: "gamemode", level: level, kind: kind, detail: detail)
+        appendToLog("app: \(kind) \(detail)")
+    }
+
+    /// App-side events go into gamemode.log too, so one file tells the whole
+    /// story of a session. The root script appends to the same file.
+    private func appendToLog(_ text: String) {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        guard let data = "\(f.string(from: Date())) \(text)\n".data(using: .utf8) else { return }
+        if !FileManager.default.fileExists(atPath: logFile.path) {
+            try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: logFile.path, contents: nil)
+        }
+        guard let h = try? FileHandle(forWritingTo: logFile) else { return }
+        defer { try? h.close() }
+        _ = try? h.seekToEnd()
+        try? h.write(contentsOf: data)
+    }
+
+    /// Keep one previous generation once the log passes `logLimit`.
+    func rollLog() {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: workDir, withIntermediateDirectories: true)
+        let size = (try? fm.attributesOfItem(atPath: logFile.path)[.size] as? UInt64) ?? 0
+        if size > Self.logLimit {
+            let old = workDir.appendingPathComponent("gamemode.log.1")
+            try? fm.removeItem(at: old)
+            try? fm.moveItem(at: logFile, to: old)
+        }
+        if !fm.fileExists(atPath: logFile.path) {
+            fm.createFile(atPath: logFile.path, contents: nil)
+        }
     }
 }
 #endif

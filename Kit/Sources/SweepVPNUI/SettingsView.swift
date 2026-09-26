@@ -125,15 +125,7 @@ public struct SettingsView: View {
                             .foregroundStyle(model.gameState.isFailed ? .red : .secondary)
                             .textSelection(.enabled)
                     }
-                    Picker("Disguise", selection: Binding(
-                        get: { model.gameDisguise },
-                        set: { model.gameDisguise = $0 })) {
-                            ForEach(GameModeController.Disguise.allCases, id: \.self) {
-                                Text($0.title).tag($0)
-                            }
-                        }
-                        .disabled(model.gameState != .stopped)
-                    Text("Routes the whole Mac, games included, through WARP at the packet level, so traffic games send over UDP is carried too — the proxy modes above cannot do that. Needs your admin password, and turns the proxy modes off while it runs. Reconnecting on drops rebuilds the tunnel each time the network drops it, in about a second, and is the right choice for games. Rotating flows retires each tunnel before the network can drop it, but measured cost is a stall every minute or two — fine for downloads, bad for a game. Change the disguise with gaming mode off.")
+                    Text("Routes the whole Mac, games included, through WARP at the packet level, so traffic games send over UDP is carried too — the proxy modes above cannot do that. Needs your admin password, and turns the proxy modes off while it runs. If the network drops the tunnel it reconnects in about a second; games that use TCP (Minecraft Java, for one) lose their connection at that moment and need to rejoin.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
 
