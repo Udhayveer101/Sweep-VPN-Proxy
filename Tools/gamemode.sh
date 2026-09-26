@@ -75,6 +75,15 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     log "FATAL not running as root"
     exit 1
 fi
+# The authorization trampoline gives us euid 0 but leaves the real uid at the
+# user's. networksetup checks the real uid ("Command requires admin
+# privileges"), so the DNS pin and its restore failed. With euid 0 we may set
+# the real uid too; re-exec once as full root before touching anything.
+if [ "$(id -ru)" -ne 0 ] && [ -z "${GAMEMODE_REEXEC:-}" ]; then
+    trap - EXIT INT TERM
+    export GAMEMODE_REEXEC=1
+    exec /usr/bin/perl -e '$< = 0; $( = 0; exec @ARGV or die' /bin/bash -p "$0" "$@"
+fi
 
 ORIG_GW=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
 ORIG_IF=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
@@ -134,9 +143,21 @@ launch_usque() {
 # when the route exists, "add" when the kernel already dropped it (it removes
 # routes to a utun that has gone away).
 point_default() {
+    local err
     for HALF in 0.0.0.0/1 128.0.0.0/1; do
-        route -n change -net "$HALF" "$@" >/dev/null 2>&1 ||
-            route -n add -net "$HALF" "$@" >/dev/null 2>&1
+        route -n change -net "$HALF" "$@" >/dev/null 2>&1 && continue
+        err=$(route -n add -net "$HALF" "$@" 2>&1 >/dev/null) ||
+            log "WARN route $HALF $*: $err"
+    done
+}
+
+# usque's in-process reconnect resets the utun, and macOS drops routes bound to
+# it; nothing re-added them, so the Mac fell back to en0 silently (2026-09-27).
+# Probe one address per half and repair whatever no longer goes via $IFACE.
+routes_ok() {
+    local ip
+    for ip in 1.1.1.1 200.1.1.1; do
+        route -n get "$ip" 2>/dev/null | grep -q "interface: $IFACE\$" || return 1
     done
 }
 
@@ -210,6 +231,12 @@ while [ -f "$CONTROL" ]; do
             UP_SINCE=$SECONDS
         fi
         continue
+    fi
+    if ! routes_ok; then
+        log "split default lost (now via $(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2}')); restoring"
+        route -n add -host "$ENDPOINT_IP" "$ORIG_GW" >/dev/null 2>&1
+        point_default -interface "$IFACE"
+        routes_ok || { point_default 127.0.0.1 -blackhole; log "WARN could not restore; traffic held"; }
     fi
     [ $((SECONDS - UP_SINCE)) -ge 60 ] && FAILS=0
     sleep 1
