@@ -40,6 +40,10 @@ if [ -x "$USQUE" ]; then
   # paid NE entitlement.
   cp -f "$HERE/gamemode.sh" "$DEST/gamemode.sh"
   chmod 755 "$DEST/gamemode.sh"
+  # Signed on its own (the signature lives in extended attributes) so the
+  # root bootstrap in GameModeController can check its private copy against
+  # our team before running it as root. The bundle itself is user-writable.
+  sign --force "$TS" --sign "$IDENTITY" "$DEST/gamemode.sh"
 else
   echo "warning: usque not found at $USQUE; WARP mode is unavailable" >&2
   echo "         build it with: Tools/usque/build.sh $USQUE" >&2

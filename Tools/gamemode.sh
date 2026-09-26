@@ -62,6 +62,10 @@ cleanup() {
         fi
     fi
     rm -f "$CONTROL"
+    # The app's bootstrap runs us from a root-owned copy; remove it with us.
+    case "$(dirname "$0")" in
+        /private/var/run/sweep-gamemode.*) rm -rf "$(dirname "$0")" ;;
+    esac
     log "stopped"
 }
 trap cleanup EXIT INT TERM
@@ -79,10 +83,28 @@ fi
 # user's. networksetup checks the real uid ("Command requires admin
 # privileges"), so the DNS pin and its restore failed. With euid 0 we may set
 # the real uid too; re-exec once as full root before touching anything.
+#
+# Perl turns on taint mode by itself whenever the real and effective uid differ
+# (perlsec), which is exactly our case. Tainted, it refuses the inherited PATH
+# and refuses to exec @ARGV, so 1.5.2's bare `exec @ARGV` died silently and
+# gaming mode never started. So: PATH is set inside perl (and must carry /sbin
+# for route, ifconfig and networksetup), the arguments are untainted, exec is
+# list form, and any failure lands in the log. Tools/test-gamemode.sh runs
+# this line under perl -T.
+REEXEC_PERL='$ENV{PATH}="/usr/bin:/bin:/usr/sbin:/sbin"; delete @ENV{qw(IFS CDPATH ENV BASH_ENV)}; my @a = map { /\A(.*)\z/s; $1 } @ARGV; $< = 0; $( = 0; exec { $a[0] } @a or die "gamemode: re-exec failed: $!\n"'
 if [ "$(id -ru)" -ne 0 ] && [ -z "${GAMEMODE_REEXEC:-}" ]; then
     trap - EXIT INT TERM
     export GAMEMODE_REEXEC=1
-    exec /usr/bin/perl -e '$< = 0; $( = 0; exec @ARGV or die' /bin/bash -p "$0" "$@"
+    shopt -s execfail
+    log "re-exec as full root"
+    exec /usr/bin/perl -e "$REEXEC_PERL" /bin/bash -p "$0" "$@" 2>>"$LOG"
+    # exec only returns if perl itself could not be started.
+    log "FATAL re-exec as full root failed"
+    rm -f "$CONTROL"
+    exit 1
+fi
+if [ -n "${GAMEMODE_REEXEC:-}" ] && [ "$(id -ru)" -ne 0 ]; then
+    log "WARN real uid still $(id -ru); networksetup may refuse the DNS pin"
 fi
 
 ORIG_GW=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
