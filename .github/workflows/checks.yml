@@ -1,0 +1,18 @@
+name: Checks
+
+# Cheap checks that need no signing secrets. Gaming mode's root script cannot
+# be run for real in CI, so this covers what can: syntax, and the perl re-exec
+# line under taint mode (the 1.5.2 regression).
+on:
+  push:
+    branches: [vpn-overhaul, main]
+  pull_request:
+
+jobs:
+  gamemode:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n Tools/gamemode.sh
+      - run: Tools/test-gamemode.sh

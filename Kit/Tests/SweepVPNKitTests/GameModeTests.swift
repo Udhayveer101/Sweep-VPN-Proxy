@@ -113,5 +113,53 @@ final class GameModeTests: XCTestCase {
         }
         wait(for: [done], timeout: 2)
     }
+
+    /// The re-exec line in gamemode.sh must survive perl's taint mode, which
+    /// perl turns on itself when the real and effective uid differ. 1.5.2
+    /// shipped a line that died there silently and gaming mode never started.
+    func testReExecSurvivesTaintMode() throws {
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let p = Process()
+        p.executableURL = repo.appendingPathComponent("Tools/test-gamemode.sh")
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        try p.run()
+        p.waitUntilExit()
+        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(p.terminationStatus, 0, text)
+    }
+
+    /// The root bootstrap must parse, must check the team when there is one,
+    /// and must log a FATAL line (which the monitor turns into a message)
+    /// rather than die silently when it cannot set up.
+    func testRootBootstrapFailsLoudly() throws {
+        let signed = GameModeController.rootBootstrap(team: "P66SB4MX92")
+        XCTAssertTrue(signed.contains(#"certificate leaf[subject.OU] = "P66SB4MX92""#))
+        XCTAssertFalse(GameModeController.rootBootstrap(team: nil).contains("codesign"))
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let log = dir.appendingPathComponent("gamemode.log")
+        let control = dir.appendingPathComponent("gamemode-x.control")
+        FileManager.default.createFile(atPath: control.path, contents: nil)
+
+        // Not root: the private directory cannot be secured, so it must stop.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-p", "-c", signed, "gamemode-bootstrap",
+                       "/nonexistent/gamemode.sh", "/nonexistent/usque",
+                       dir.appendingPathComponent("config.json").path,
+                       control.path, log.path, "example.com"]
+        try p.run()
+        p.waitUntilExit()
+        XCTAssertNotEqual(p.terminationStatus, 0)
+        let line = try String(contentsOf: log, encoding: .utf8)
+        XCTAssertEqual(GameModeController.classify(line.trimmingCharacters(in: .newlines)), .fatal, line)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: control.path))
+    }
 }
 #endif

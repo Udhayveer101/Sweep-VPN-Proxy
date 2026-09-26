@@ -1,5 +1,6 @@
 #if os(macOS)
 import Foundation
+import Security
 import SweepVPNCore
 
 /// Routes the whole Mac through WARP so games work — the proxy modes cannot.
@@ -173,13 +174,16 @@ public final class GameModeController: @unchecked Sendable {
         // install a privileged helper without a paid Network Extension
         // entitlement, so the admin prompt is the honest path: one password,
         // and the script owns its own teardown.
-        let command = [script.path, usque.path, configFile.path,
-                       control.path, logFile.path, sni]
+        // Both launch paths run the same root bootstrap (see rootBootstrap):
+        // the bundle is user-writable, so root runs verified copies, never
+        // the files in the bundle.
+        let bootstrap = Self.rootBootstrap(team: Self.signingTeam())
+        let bootstrapArgs = [script.path, usque.path, configFile.path,
+                             control.path, logFile.path, sni]
+        let command = (["/bin/bash", "-p", "-c", bootstrap, "gamemode-bootstrap"] + bootstrapArgs)
             .map { "'" + $0.replacingOccurrences(of: "'", with: "'\\''") + "'" }
             .joined(separator: " ")
 
-        let scriptArgs = [usque.path, configFile.path, control.path,
-                          logFile.path, sni]
 
         DispatchQueue.global().asyncAfter(deadline: .now() + settle) { [self] in
             lock.lock()
@@ -197,7 +201,7 @@ public final class GameModeController: @unchecked Sendable {
             // ran the whole of gaming mode as the logged-in user, where every
             // route change silently no-ops and usque cannot create a utun.
             switch Elevator.run(tool: "/bin/bash",
-                                arguments: ["-p", script.path] + scriptArgs) {
+                                arguments: ["-p", "-c", bootstrap, "gamemode-bootstrap"] + bootstrapArgs) {
             case .launched:
                 record(.info, "elevated", "system authorization")
                 self.armMonitor(control)
@@ -285,6 +289,58 @@ public final class GameModeController: @unchecked Sendable {
     }
 
     static let startTimeout: TimeInterval = 60
+
+    /// The first thing that runs as root. gamemode.sh and usque sit in an app
+    /// bundle the user can write to, so running them in place would hand root
+    /// to anything that can write there. Instead: copy both into a fresh
+    /// root-owned directory, check the copies carry our Developer ID
+    /// signature, and run only the copies. Once copied, nothing unprivileged
+    /// can change them, so the check cannot be raced.
+    ///
+    /// This text is compiled into the signed app, which is what makes it
+    /// trustworthy where the script is not. `team` is nil for ad-hoc builds,
+    /// which have no signature to check against.
+    /// Arguments: script usque config control log sni.
+    static func rootBootstrap(team: String?) -> String {
+        let verify = team.map { team in
+            """
+            REQ='anchor apple generic and certificate leaf[subject.OU] = "\(team)"'
+            for f in usque gamemode.sh; do
+                /usr/bin/codesign --verify --strict -R="$REQ" "$D/$f" 2>/dev/null ||
+                    fail "$f is not signed by team \(team); refusing to run it as root"
+            done
+            """
+        } ?? ""
+        return """
+        set -u
+        S="$1"; U="$2"; shift 2
+        CONTROL="$2"; LOG="$3"
+        fail() {
+            [ -L "$LOG" ] || echo "$(date '+%H:%M:%S') gamemode: FATAL $*" >> "$LOG"
+            rm -rf "${D:-}"; rm -f "$CONTROL"
+            exit 1
+        }
+        D=$(/usr/bin/mktemp -d /private/var/run/sweep-gamemode.XXXXXX) || fail "no private directory"
+        /usr/sbin/chown root:wheel "$D" && /bin/chmod 700 "$D" || fail "could not secure $D"
+        /usr/bin/ditto "$S" "$D/gamemode.sh" && /usr/bin/ditto "$U" "$D/usque" || fail "could not copy the gaming mode payload"
+        /usr/sbin/chown root:wheel "$D/gamemode.sh" "$D/usque" && /bin/chmod 500 "$D/gamemode.sh" "$D/usque" || fail "could not secure the payload"
+        \(verify)
+        exec /bin/bash -p "$D/gamemode.sh" "$D/usque" "$@"
+        """
+    }
+
+    /// Our own Developer ID team, read from the running (already verified)
+    /// code rather than from anything on disk.
+    static func signingTeam() -> String? {
+        var code: SecCode?
+        var staticCode: SecStaticCode?
+        var info: CFDictionary?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
+              SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode,
+              SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess
+        else { return nil }
+        return (info as? [String: Any])?[kSecCodeInfoTeamIdentifier as String] as? String
+    }
 
     private func pollLog() {
         lock.lock()
