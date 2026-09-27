@@ -32,6 +32,7 @@ ORIG_SVC=""
 ORIG_DNS=""
 USQUE_PID=""
 MCAST_ADDED=""
+DIRECT_IPS=""
 
 # We run as root and the log sits in the user's Library: never follow a link
 # someone swapped in, or root would append to whatever it points at.
@@ -49,6 +50,7 @@ cleanup() {
     route -n delete -net 0.0.0.0/1 >/dev/null 2>&1
     route -n delete -net 128.0.0.0/1 >/dev/null 2>&1
     [ -n "$ORIG_GW" ] && route -n delete -host "$ENDPOINT_IP" "$ORIG_GW" >/dev/null 2>&1
+    for ip in $DIRECT_IPS; do route -n delete -host "$ip" "$ORIG_GW" >/dev/null 2>&1; done
     [ -n "$MCAST_ADDED" ] && route -n delete -net 224.0.0.0/4 -interface "$ORIG_IF" >/dev/null 2>&1
     route -n delete -net 10.0.0.0/8 >/dev/null 2>&1
     route -n delete -net 192.168.0.0/16 >/dev/null 2>&1
@@ -119,6 +121,35 @@ log "gateway $ORIG_GW via $ORIG_IF"
 # tunnel's own packets would route into the tunnel.
 route -n add -host "$ENDPOINT_IP" "$ORIG_GW" >/dev/null 2>&1
 log "pinned $ENDPOINT_IP via $ORIG_GW"
+
+# Game servers the network already lets through stay off the tunnel. This
+# school's Sophos gateway lets mc.hypixel.net:25565 through directly on both
+# of its uplinks (IAXN and NEXTRA, measured 2026-09-27), but sweeps the
+# long-lived MASQUE flow every 12-180s, and each sweep resets every game
+# connection inside it. Only a host that answers a direct TCP connect *now*,
+# before the tunnel takes the default route, is excluded; blocked games still
+# go through WARP. Extra hosts: one per line in direct-hosts next to config.json.
+DIRECT_HOSTS="mc.hypixel.net:25565"
+DIRECT_FILE="$(dirname "$CONFIG")/direct-hosts"
+if [ -f "$DIRECT_FILE" ] && [ ! -L "$DIRECT_FILE" ]; then
+    DIRECT_HOSTS="$DIRECT_HOSTS $(grep -E '^[A-Za-z0-9.-]+(:[0-9]{1,5})?$' "$DIRECT_FILE" | head -32 | tr '\n' ' ')"
+fi
+for ENTRY in $DIRECT_HOSTS; do
+    HOST=${ENTRY%%:*}; PORT=${ENTRY#*:}; [ "$PORT" = "$ENTRY" ] && PORT=25565
+    # Both the school resolver and 1.1.1.1 (what the game will ask once DNS is
+    # pinned below) - they can disagree for anycast hosts.
+    IPS=$( { dscacheutil -q host -a name "$HOST" | awk '/^ip_address:/{print $2}'
+             dig +short +time=2 +tries=1 A "$HOST" @1.1.1.1; } 2>/dev/null |
+           grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
+    for ip in $IPS; do
+        if nc -z -G 3 "$ip" "$PORT" >/dev/null 2>&1; then
+            route -n add -host "$ip" "$ORIG_GW" >/dev/null 2>&1 && DIRECT_IPS="$DIRECT_IPS $ip"
+            log "direct: $HOST $ip:$PORT reachable, kept off the tunnel"
+        else
+            log "direct: $HOST $ip:$PORT not reachable, stays in the tunnel"
+        fi
+    done
+done
 
 # IPv4 only, deliberately: with IPv6 inside the tunnel every new MASQUE session
 # hands out a different public address, so a rotation or reconnect changes the
