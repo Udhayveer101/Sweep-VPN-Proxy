@@ -165,7 +165,8 @@ done
 # cut ("transfer closed"); without rotation 0 of 7 over the same 5.5 minutes.
 # A parked standby is also swept with the live flow, so it buys nothing here
 # (docs/measurements-2026-09-20.md).
-ARGS=(-c "$CONFIG" nativetun -s "$SNI" --http2 --always-reconnect -k 5s -S)
+# -P 8443: the firewall proxies every tcp/443 flow, see WarpController.masquePort.
+ARGS=(-c "$CONFIG" nativetun -s "$SNI" --http2 -P 8443 --always-reconnect -k 5s -S)
 
 # Start usque and wait for its utun to appear and carry our address. Only
 # usque's own announcement names our device: guessing from ifconfig picked up
