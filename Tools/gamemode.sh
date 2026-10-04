@@ -193,24 +193,28 @@ launch_usque() {
     return 2
 }
 
-# Point both halves of the default route somewhere without a gap: "change"
-# when the route exists, "add" when the kernel already dropped it (it removes
-# routes to a utun that has gone away).
+# Point both halves of the default route somewhere without a gap. Both
+# commands always run: add creates the route when it is missing (and is a
+# no-op when it exists), change repoints it when it exists. Never branch on
+# route's exit status - macOS route(8) exits 0 when change finds no route
+# ("not in table"), so 1.5.1-2.0's "change || add" never added anything and
+# gaming mode ran with no tunnel routes at all (measured 2026-10-05).
 point_default() {
-    local err
     for HALF in 0.0.0.0/1 128.0.0.0/1; do
-        route -n change -net "$HALF" "$@" >/dev/null 2>&1 && continue
-        err=$(route -n add -net "$HALF" "$@" 2>&1 >/dev/null) ||
-            log "WARN route $HALF $*: $err"
+        route -n add -net "$HALF" "$@" >/dev/null 2>&1
+        route -n change -net "$HALF" "$@" >/dev/null 2>&1
     done
 }
 
 # usque's in-process reconnect resets the utun, and macOS drops routes bound to
 # it; nothing re-added them, so the Mac fell back to en0 silently (2026-09-27).
 # Probe one address per half and repair whatever no longer goes via $IFACE.
+# The probes are addresses nothing talks to: a host the Mac has contacted
+# (1.1.1.1 is its resolver) can hold a cloned host route via the physical
+# link, which would fail this check on a healthy tunnel.
 routes_ok() {
     local ip
-    for ip in 1.1.1.1 200.1.1.1; do
+    for ip in 44.255.255.1 200.1.1.1; do
         route -n get "$ip" 2>/dev/null | grep -q "interface: $IFACE\$" || return 1
     done
 }
@@ -228,7 +232,12 @@ log "tunnel $IFACE addr $TUN_ADDR"
 # default on longest-prefix match, so the original stays intact and teardown is
 # a delete rather than a restore.
 point_default -interface "$IFACE"
-log "default routed through $IFACE"
+if routes_ok; then
+    log "default routed through $IFACE"
+else
+    log "FATAL could not route through $IFACE (probe goes via $(route -n get 200.1.1.1 2>/dev/null | awk '/interface:/{print $2}'))"
+    exit 1
+fi
 
 # Multicast and discovery (TTL 1) stay on the physical link. Sent into the
 # tunnel they are dropped anyway ("connect-ip: datagram TTL too small: 1").
@@ -287,7 +296,7 @@ while [ -f "$CONTROL" ]; do
         continue
     fi
     if ! routes_ok; then
-        log "split default lost (now via $(route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{print $2}')); restoring"
+        log "split default lost (now via $(route -n get 200.1.1.1 2>/dev/null | awk '/interface:/{print $2}')); restoring"
         route -n add -host "$ENDPOINT_IP" "$ORIG_GW" >/dev/null 2>&1
         point_default -interface "$IFACE"
         routes_ok || { point_default 127.0.0.1 -blackhole; log "WARN could not restore; traffic held"; }
