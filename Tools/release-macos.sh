@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the Developer ID release: archive the proxy-only app, bundle tor and the
-# patched usque (Apple Silicon only: the OpenVPN slice is arm64), sign everything with a secure timestamp, notarize, staple, and
+# patched usque (universal: Apple Silicon and Intel), sign everything with a secure timestamp, notarize, staple, and
 # wrap it in a DMG. The same script runs locally and in .github/workflows.
 #
 # Env:
@@ -40,7 +40,7 @@ xcodegen generate
 xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-macOS-Direct -configuration Release \
   -destination 'generic/platform=macOS' -archivePath "$ARCHIVE" archive \
   CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$IDENTITY" DEVELOPMENT_TEAM="$TEAM_ID" \
-  OTHER_CODE_SIGN_FLAGS=--timestamp ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+  OTHER_CODE_SIGN_FLAGS=--timestamp ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
   MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" | tail -5
 
 APP="$ARCHIVE/Products/Applications/Sweep VPN.app"

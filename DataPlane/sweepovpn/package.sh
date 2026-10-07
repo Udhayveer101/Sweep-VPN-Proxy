@@ -8,7 +8,7 @@
 # run on iOS at all. `libtool -static` folds OpenSSL, lz4 and fmt in so the
 # framework carries its own dependencies.
 #
-# macOS arm64 only for now. The iOS slices need OpenSSL, lz4 and fmt
+# macOS only for now (universal when build/deps-x86_64 exists). The iOS slices need OpenSSL, lz4 and fmt
 # cross-compiled for ios-arm64 and the simulator, which Homebrew does not
 # provide — see the note at the bottom of this file.
 set -euo pipefail
@@ -33,25 +33,35 @@ if [ ! -d ../openvpn/openvpn3 ]; then
   exit 1
 fi
 
-echo "==> configuring"
-cmake -S . -B "$BUILD" -GNinja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
-  -DCMAKE_PREFIX_PATH="$PREFIXES" \
-  -DOPENSSL_ROOT_DIR="$SSL" >/dev/null
-
-echo "==> building"
-cmake --build "$BUILD" --target sweepovpn >/dev/null
-
-echo "==> merging static dependencies"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/mac"
-libtool -static -o "$STAGE/mac/libsweepovpn.a" \
-  "$BUILD/libsweepovpn.a" \
-  "$SSL/lib/libssl.a" \
-  "$SSL/lib/libcrypto.a" \
-  "$LZ4/lib/liblz4.a" \
-  "$FMT/lib/libfmt.a" 2>/dev/null
+SLICES=()
+build_slice() { # arch, deps prefix (ssl/lz4/fmt), cmake prefix path
+  local arch="$1" ssl="$2" lz4="$3" fmt="$4" prefixes="$5"
+  echo "==> building $arch"
+  cmake -S . -B "$BUILD-$arch" -GNinja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_OSX_ARCHITECTURES="$arch" \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+    -DCMAKE_PREFIX_PATH="$prefixes" \
+    -DOPENSSL_ROOT_DIR="$ssl" >/dev/null
+  cmake --build "$BUILD-$arch" --target sweepovpn >/dev/null
+  libtool -static -o "$STAGE/mac/libsweepovpn-$arch.a" \
+    "$BUILD-$arch/libsweepovpn.a" \
+    "$ssl/lib/libssl.a" \
+    "$ssl/lib/libcrypto.a" \
+    "$lz4/lib/liblz4.a" \
+    "$fmt/lib/libfmt.a" 2>/dev/null
+  SLICES+=("$STAGE/mac/libsweepovpn-$arch.a")
+}
+build_slice arm64 "$SSL" "$LZ4" "$FMT" "$PREFIXES"
+# Intel slice: needs `ARCH=x86_64 Tools/build-deps-mac.sh` (Homebrew on Apple
+# Silicon has no x86_64 libs). asio and xxhash are headers, so brew's serve both.
+if [ -d "$DEPS-x86_64/lib" ]; then
+  build_slice x86_64 "$DEPS-x86_64" "$DEPS-x86_64" "$DEPS-x86_64" "$DEPS-x86_64;$BREW"
+fi
+lipo -create "${SLICES[@]}" -output "$STAGE/mac/libsweepovpn.a"
+rm -f "${SLICES[@]}"
 
 # The headers directory name ends up in the framework's search paths, and
 # SweepWireGuard.xcframework already ships one called "include". Two of those
