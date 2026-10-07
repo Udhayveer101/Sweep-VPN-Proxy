@@ -52,7 +52,7 @@ public struct MacSettingsSection: View {
                     }
                 }))
             if let loginItemError {
-                Text(loginItemError).font(.footnote).foregroundStyle(.red)
+                Text(loginItemError).font(.footnote).foregroundStyle(Midnight.danger)
             }
 
             HStack {
@@ -67,7 +67,7 @@ public struct MacSettingsSection: View {
             }
             if case .needsUserApproval = extensionStatus {
                 Text("Approve Sweep in System Settings ▸ General ▸ Login Items & Extensions ▸ Network Extensions. Until you do, the second layer is inactive and only the routing-based kill switch is protecting you.")
-                    .font(.footnote).foregroundStyle(.orange)
+                    .font(.footnote).foregroundStyle(Midnight.warning)
             }
         }
     }

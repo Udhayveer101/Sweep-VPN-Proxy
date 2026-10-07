@@ -73,7 +73,7 @@ public struct PublicRelayPickerView: View {
     private var trustBanner: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "exclamationmark.shield")
-                .foregroundStyle(.orange)
+                .foregroundStyle(Midnight.warning)
             VStack(alignment: .leading, spacing: 3) {
                 Text("Run by volunteers, not by you")
                     .font(.caption.weight(.semibold))
@@ -85,7 +85,7 @@ public struct PublicRelayPickerView: View {
             }
         }
         .padding(.horizontal, 16).padding(.vertical, 10)
-        .background(Color.orange.opacity(0.08))
+        .background(Midnight.warning.opacity(0.08))
     }
 
     private var controls: some View {
@@ -171,7 +171,7 @@ public struct PublicRelayPickerView: View {
                         // The operator's own claim, shown as a claim.
                         if let log = server.logPolicy, !log.isEmpty {
                             Text("· logs: \(log)")
-                                .foregroundStyle(log.lowercased() == "no" ? Color.secondary : Color.orange)
+                                .foregroundStyle(log.lowercased() == "no" ? Color.secondary : Midnight.warning)
                         }
                     }
                     .font(.caption).foregroundStyle(.secondary)
@@ -191,7 +191,7 @@ public struct PublicRelayPickerView: View {
         if let probe, probe.lossFraction < 1, probe.rttMs.isFinite {
             Text("\(Int(probe.rttMs)) ms")
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(probe.rttMs < 120 ? .green : (probe.rttMs < 300 ? .primary : .secondary))
+                .foregroundStyle(probe.rttMs < 120 ? Midnight.good : (probe.rttMs < 300 ? .primary : .secondary))
         } else if probe != nil {
             // Measured and did not answer — say so rather than leaving it blank,
             // which reads as "not measured yet".

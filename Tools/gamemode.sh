@@ -176,7 +176,7 @@ ARGS=(-c "$CONFIG" nativetun -s "$SNI" --http2 -P 8443 --always-reconnect -k 5s 
 launch_usque() {
     local from
     from=$(stat -f %z "$LOG" 2>/dev/null || echo 0)
-    "$USQUE" "${ARGS[@]}" >> "$LOG" 2>&1 3<&- &
+    "$USQUE" "${ARGS[@]}" >> "$LOG" 2>&1 3<&- 4<&- &
     USQUE_PID=$!
     log "usque pid $USQUE_PID"
     IFACE=""
@@ -293,6 +293,17 @@ RECHECK=$RECHECK_PASSES
 PASS=0
 exec 3<"$LOG"
 while IFS= read -r -u 3 _LINE; do :; done    # only lines written from here on count
+# Waiting is a builtin too: a timed read on a FIFO nobody writes to. `sleep`
+# is a fork every second (measured: 2.9ms of CPU a pass against 0.4ms). The
+# FIFO is only made in the root-owned directory the app runs us from; anywhere
+# else, and if it cannot be made, this is plain sleep.
+NAP_FIFO=""
+case "$(dirname "$0")" in
+    /private/var/run/sweep-gamemode.*)
+        NAP_FIFO="$(dirname "$0")/.nap"
+        { mkfifo -m 600 "$NAP_FIFO" && exec 4<>"$NAP_FIFO"; } 2>/dev/null || NAP_FIFO="" ;;
+esac
+nap() { if [ -n "$NAP_FIFO" ]; then read -r -t 1 -u 4 _NAP; else sleep 1; fi; return 0; }
 while [ -f "$CONTROL" ]; do
     if ! kill -0 "$USQUE_PID" 2>/dev/null; then
         point_default 127.0.0.1 -blackhole
@@ -324,7 +335,7 @@ while [ -f "$CONTROL" ]; do
         fi
     fi
     [ $((SECONDS - UP_SINCE)) -ge 60 ] && FAILS=0
-    sleep 1
+    nap
 done
 # --- end hold loop ---
 

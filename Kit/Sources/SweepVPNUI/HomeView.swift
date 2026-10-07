@@ -37,7 +37,9 @@ public struct HomeView: View {
             }
             .padding(24)
         }
+        .midnightPage()
         .sheet(item: $model.activeSheet) { sheet in
+            Group {
             switch sheet {
             case .settings:     SettingsView(model: model)
             case .serverPicker: ServerPickerView(model: model)
@@ -46,6 +48,8 @@ public struct HomeView: View {
             case .onboarding:   OnboardingView(model: model).interactiveDismissDisabled()
             case .connectionLog: ConnectionLogView(model: model)
             }
+            }
+            .midnightPage()
         }
     }
 
@@ -82,7 +86,7 @@ public struct HomeView: View {
     /// the button looked inert. Show it, and let the user dismiss it.
     private func errorRow(_ error: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Midnight.warning)
             VStack(alignment: .leading, spacing: 2) {
                 Text(error).font(.caption).multilineTextAlignment(.leading)
                 // Which attempt produced this, so a stale reason is obvious and
@@ -109,7 +113,7 @@ public struct HomeView: View {
         }
         .padding(12)
         .frame(maxWidth: 420)
-        .background(.thinMaterial, in: .rect(cornerRadius: 12, style: .continuous))
+        .background(Midnight.surface, in: .rect(cornerRadius: 12, style: .continuous))
         .accessibilityElement(children: .combine)
     }
 
@@ -123,7 +127,7 @@ public struct HomeView: View {
         }
         .padding(12)
         .frame(maxWidth: 420)
-        .background(.thinMaterial, in: .rect(cornerRadius: 12, style: .continuous))
+        .background(Midnight.surface, in: .rect(cornerRadius: 12, style: .continuous))
         .transition(.opacity)
         .accessibilityElement(children: .combine)
     }
@@ -153,7 +157,7 @@ public struct HomeView: View {
         }
         .padding(24)
         .frame(maxWidth: 420)
-        .background(.ultraThinMaterial, in: .rect(cornerRadius: 24, style: .continuous))
+        .background(Midnight.panel, in: .rect(cornerRadius: 24, style: .continuous))
         .shadow(color: .black.opacity(0.12), radius: 18, y: 8)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(model.presentation.voiceOver)
@@ -180,7 +184,7 @@ public struct HomeView: View {
                 Image(systemName: "chevron.right").font(.caption)
             }
             .padding(.horizontal, 16).padding(.vertical, 10)
-            .background(.thinMaterial, in: Capsule())
+            .background(Midnight.surface, in: Capsule())
         }
         .buttonStyle(.plain)
         .opacity(model.servers.isEmpty ? 0.7 : 1)
@@ -194,7 +198,7 @@ public struct HomeView: View {
                 .frame(maxWidth: .infinity, minHeight: 50)
         }
         .buttonStyle(.borderedProminent)
-        .tint(model.presentation.tint == .good ? .green : .accentColor)
+        .tint(model.presentation.tint == .good ? Midnight.good : .accentColor)
         .controlSize(.large)
         .frame(maxWidth: 420)
         // `isBusy` covers the whole connect, including a relay probe that can
@@ -230,8 +234,7 @@ struct ProxyHomePanel: View {
 
     private var macHeadline: String {
         if !model.warpRegistered { return "WARP is not set up" }
-        if model.gameState == .running { return "Connected in gaming mode" }
-        if model.systemProxyEnabled { return "Connected" }
+                if up { return "Connected" }
         if model.connectionActive { return "Connecting…" }
         if model.gameState.isFailed || model.warpState.isFailed || model.systemProxyError != nil {
             return "Could not connect"
@@ -254,69 +257,81 @@ struct ProxyHomePanel: View {
                 : "Routes apps that use the system proxy.", false)
     }
 
-    var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: up ? "lock.shield.fill" : "shield")
-                .font(.system(size: 44, weight: .medium))
-                .foregroundStyle(up ? .green : .secondary)
-                .accessibilityHidden(true)
-            Text(macHeadline).font(.title2.weight(.semibold))
-            Text(macDetail.text).font(.caption)
-                .foregroundStyle(macDetail.isError ? .red : .secondary)
-                .multilineTextAlignment(.center).textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-            if model.warpRegistered {
-                HStack(spacing: 10) {
-                    Button { model.toggleConnection() } label: {
-                        Text(model.connectionActive ? "Disconnect" : "Connect")
-                            .font(.headline).frame(maxWidth: .infinity, minHeight: 44)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(model.connectionActive ? .red : .accentColor)
-                    .keyboardShortcut(.defaultAction)
+    private var orbPhase: PowerOrb.Phase {
+        up ? .on : (model.connectionActive ? .starting : .off)
+    }
 
-                    Toggle(isOn: $model.gamingPreferred) {
-                        Label("Gaming", systemImage: "gamecontroller.fill")
-                    }
-                    .toggleStyle(.switch)
-                    .padding(.horizontal, 12)
-                    .frame(minHeight: 44)
-                    .background(.thinMaterial, in: .rect(cornerRadius: 10, style: .continuous))
-                    .disabled(model.connectionActive)
-                    .help(model.connectionActive
-                          ? "Disconnect to change mode"
-                          : "On: Connect routes the whole Mac so games work. Off: Connect uses the system proxy.")
-                    .accessibilityHint("Chooses how the next Connect routes traffic")
+    /// The mode switch, as a tile the same height as the orb so the two read
+    /// as one control: what to do, and how.
+    private var gamingTile: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "gamecontroller.fill")
+                .font(.title2)
+                .foregroundStyle(model.gamingPreferred ? Midnight.accent : .secondary)
+                .accessibilityHidden(true)
+            Text("Gaming").font(.callout.weight(.medium))
+            Toggle("Gaming mode", isOn: $model.gamingPreferred)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .tint(Midnight.accent)
+        }
+        .frame(width: 104, height: 136)
+        .midnightCard(radius: 26)
+        .opacity(model.connectionActive ? 0.55 : 1)
+        .disabled(model.connectionActive)
+        .help(model.connectionActive
+              ? "Disconnect to change mode"
+              : "On: the whole Mac is routed, so games work. Off: apps that use the system proxy.")
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Chooses how the next connection routes traffic")
+    }
+
+    var body: some View {
+        VStack(spacing: 30) {
+            VStack(spacing: 8) {
+                Text(macHeadline)
+                    .font(.system(size: 30, weight: .semibold))
+                    .multilineTextAlignment(.center)
+                Text(macDetail.text).font(.callout)
+                    .foregroundStyle(macDetail.isError ? Midnight.danger : .secondary)
+                    .multilineTextAlignment(.center).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(minHeight: 40, alignment: .top)
+            }
+            if model.warpRegistered {
+                HStack(spacing: 16) {
+                    PowerOrb(phase: orbPhase) { model.toggleConnection() }
+                        .keyboardShortcut(.defaultAction)
+                        .help(model.connectionActive ? "Disconnect" : "Connect")
+                        .accessibilityLabel(model.connectionActive ? "Disconnect" : "Connect")
+                    gamingTile
                 }
-                .padding(.top, 4)
-                if model.connectionActive {
-                    Text("Disconnect to change mode.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
+                Text(model.connectionActive ? "Disconnect to change mode."
+                                            : "Press the button to connect.")
+                    .font(.caption).foregroundStyle(.tertiary)
             } else {
-                Button("Set up WARP") { model.activeSheet = .onboarding }
-                    .buttonStyle(.borderedProminent).controlSize(.large)
+                Button { model.activeSheet = .onboarding } label: {
+                    Text("Set up WARP").font(.headline).frame(maxWidth: 220, minHeight: 44)
+                }
+                .buttonStyle(.borderedProminent)
             }
         }
-        .padding(24)
         .frame(maxWidth: 420)
-        .background(.ultraThinMaterial, in: .rect(cornerRadius: 24, style: .continuous))
-        .animation(.easeOut(duration: 0.2), value: model.connectionActive)
     }
     #else
     var body: some View {
         VStack(spacing: 14) {
             Image(systemName: model.systemProxyEnabled ? "lock.shield.fill" : "shield")
                 .font(.system(size: 44, weight: .medium))
-                .foregroundStyle(model.systemProxyEnabled ? .green : .secondary)
+                .foregroundStyle(model.systemProxyEnabled ? Midnight.good : .secondary)
             Text(headline).font(.title2.weight(.semibold))
             if let status = model.warpStatusText {
                 Text(status).font(.caption)
-                    .foregroundStyle(model.warpState.isFailed ? .red : .secondary)
+                    .foregroundStyle(model.warpState.isFailed ? Midnight.danger : .secondary)
                     .multilineTextAlignment(.center).textSelection(.enabled)
             }
             if let why = model.systemProxyError {
-                Text(why).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center)
+                Text(why).font(.caption).foregroundStyle(Midnight.danger).multilineTextAlignment(.center)
             }
             if model.warpRegistered {
                 Button {
@@ -327,7 +342,7 @@ struct ProxyHomePanel: View {
                         .font(.headline).frame(maxWidth: .infinity, minHeight: 44)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(model.systemProxyEnabled ? .red : .accentColor)
+                .tint(model.systemProxyEnabled ? Midnight.danger : .accentColor)
                 #if os(macOS)
                 Text("macOS asks for your password each way. For a single app, use Settings ▸ Tor and proxy.")
                     .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
@@ -342,7 +357,7 @@ struct ProxyHomePanel: View {
         }
         .padding(24)
         .frame(maxWidth: 420)
-        .background(.ultraThinMaterial, in: .rect(cornerRadius: 24, style: .continuous))
+        .background(Midnight.panel, in: .rect(cornerRadius: 24, style: .continuous))
     }
     #endif
 }
@@ -391,7 +406,7 @@ struct Backdrop: View {
 
     private var nsColorOrSystemBackground: Color {
         #if os(macOS)
-        Color(nsColor: .windowBackgroundColor)
+        Midnight.background
         #else
         Color(uiColor: .systemBackground)
         #endif
@@ -455,7 +470,7 @@ struct UpdateBanner: View {
                 if case .downloading = model.updateState {
                     Text("Downloading and verifying…").font(.caption).foregroundStyle(.secondary)
                 } else if case .failed(let why) = model.updateState {
-                    Text(why).font(.caption).foregroundStyle(.red)
+                    Text(why).font(.caption).foregroundStyle(Midnight.danger)
                 }
             }
             Spacer(minLength: 0)
@@ -465,7 +480,7 @@ struct UpdateBanner: View {
                 .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary)
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(Midnight.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 #endif

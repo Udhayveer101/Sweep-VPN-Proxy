@@ -179,11 +179,19 @@ final class MacUISnapshotTests: XCTestCase {
     func testProxyHomePanelRendersBothModes() throws {
         let model = makeModel(state: .disconnected, servers: servers())
         model.warpRegistered = true
-        let idle = try render(ProxyHomePanel(model: model),
-                              size: CGSize(width: 420, height: 320), name: "proxy-home-idle")
+        func shot(_ name: String) throws -> NSImage {
+            try render(ProxyHomePanel(model: model).padding(24)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.black).environment(\.colorScheme, .dark),
+                       size: CGSize(width: 460, height: 420), name: name)
+        }
+        let idle = try shot("proxy-home-idle")
+        model.gameState = .starting
+        _ = try shot("proxy-home-starting")
         model.gameState = .running
-        let gaming = try render(ProxyHomePanel(model: model),
-                                size: CGSize(width: 420, height: 320), name: "proxy-home-gaming")
+        let gaming = try shot("proxy-home-gaming")
+        model.gameState = .failed("The WARP tunnel would not start. Check Settings ▸ WARP setup.")
+        _ = try shot("proxy-home-failed")
         XCTAssertNotEqual(try pixels(of: idle), try pixels(of: gaming),
                           "the panel does not follow the connection state")
     }

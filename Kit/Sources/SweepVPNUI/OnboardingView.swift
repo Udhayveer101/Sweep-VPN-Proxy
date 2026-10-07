@@ -108,11 +108,12 @@ struct WarpSetupGuide: View {
                         }
                     }
                     #else
-                    step(3, "Turn the proxy on", done: false) {
+                    step(3, "Connect", done: false) {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("**Whole Mac:** click the gear ⚙︎ on the main screen ▸ **Tor and proxy** ▸ turn on **Route this whole Mac through WARP**. macOS asks for your password once to change the proxy setting.")
-                            Text("**One app only:** in the same place turn on **WARP** and **Local proxy**, then set that app's SOCKS5 proxy to `127.0.0.1` port `\(String(model.options.localProxyPort))`.")
-                            Text("Turn it off before you quit. Sweep also undoes it when it quits.")
+                            Text("**Whole Mac:** press the power button on the main screen. macOS asks for your password to change the network setting.")
+                            Text("**Games:** turn on **Gaming** next to the button first. It routes everything, including the traffic games send outside the proxy.")
+                            Text("**One app only:** Settings ▸ **Advanced proxy** ▸ turn on **WARP** and **Local proxy**, then set that app's SOCKS5 proxy to `127.0.0.1` port `\(String(model.options.localProxyPort))`.")
+                            Text("Sweep undoes the network change when it quits.")
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -145,7 +146,7 @@ struct WarpSetupGuide: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
             Image(systemName: "lock.shield.fill")
-                .font(.system(size: 36, weight: .medium)).foregroundStyle(.green)
+                .font(.system(size: 36, weight: .medium)).foregroundStyle(Midnight.good)
             Text("Set up Sweep VPN").font(.title2.weight(.semibold))
             Text("About a minute, and only once. Follow the steps in order.")
                 .font(.subheadline).foregroundStyle(.secondary)
@@ -157,7 +158,7 @@ struct WarpSetupGuide: View {
         VStack(alignment: .leading, spacing: 10) {
             if model.warpRegistered {
                 Label("Registered. The proxy is ready to use.", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
+                    .foregroundStyle(Midnight.good)
                 // A key that failed on the first try can still be added later.
                 DisclosureGroup("Add a WARP+ license key (optional)", isExpanded: $showExtras) {
                     VStack(alignment: .leading, spacing: 8) {
@@ -213,7 +214,7 @@ struct WarpSetupGuide: View {
             }
             if let error = model.warpSetupError {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Midnight.danger)
                     .textSelection(.enabled)
             }
         }
@@ -241,11 +242,11 @@ struct WarpSetupGuide: View {
                                      @ViewBuilder content: () -> Content) -> some View {
         HStack(alignment: .top, spacing: 12) {
             ZStack {
-                Circle().fill(done ? Color.green : Color.accentColor.opacity(0.15))
+                Circle().fill(done ? Midnight.good : Midnight.accent.opacity(0.18))
                 if done {
                     Image(systemName: "checkmark").font(.caption.weight(.bold)).foregroundStyle(.white)
                 } else {
-                    Text("\(number)").font(.caption.weight(.bold)).foregroundStyle(Color.accentColor)
+                    Text("\(number)").font(.caption.weight(.bold)).foregroundStyle(Midnight.accent)
                 }
             }
             .frame(width: 24, height: 24)
@@ -257,6 +258,6 @@ struct WarpSetupGuide: View {
             Spacer(minLength: 0)
         }
         .padding(14)
-        .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 12, style: .continuous))
+        .midnightCard(radius: 14)
     }
 }

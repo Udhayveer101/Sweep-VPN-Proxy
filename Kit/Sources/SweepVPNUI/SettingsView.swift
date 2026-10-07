@@ -33,7 +33,7 @@ public struct SettingsView: View {
                         .disabled(!model.warpRegistered)
                     if let status = model.warpStatusText {
                         Text(status).font(.footnote)
-                            .foregroundStyle(model.warpState.isFailed ? .red : .secondary)
+                            .foregroundStyle(model.warpState.isFailed ? Midnight.danger : .secondary)
                             .textSelection(.enabled)
                     }
                     TextField("WARP SNI", text: Binding(
@@ -125,7 +125,7 @@ public struct SettingsView: View {
                             set: { model.setWarp(enabled: $0) }))
                         if let status = model.warpStatusText {
                             Text(status).font(.footnote)
-                                .foregroundStyle(model.warpState.isFailed ? .red : .secondary)
+                                .foregroundStyle(model.warpState.isFailed ? Midnight.danger : .secondary)
                                 .textSelection(.enabled)
                         }
                         TextField("WARP SNI", text: Binding(
@@ -151,7 +151,7 @@ public struct SettingsView: View {
                                 .font(.footnote).foregroundStyle(.secondary)
                                 .textSelection(.enabled)
                         } else if case .failed(let why) = model.proxyState {
-                            Text(why).font(.footnote).foregroundStyle(.red)
+                            Text(why).font(.footnote).foregroundStyle(Midnight.danger)
                         }
                         Toggle("Route proxy through Worker", isOn: Binding(
                             get: { model.options.proxyThroughWorker },
@@ -211,7 +211,7 @@ public struct SettingsView: View {
                         // release publishes before the disk image is opened.
                         Text("Downloading and verifying…").font(.footnote).foregroundStyle(.secondary)
                     case .failed(let why):
-                        Text(why).font(.footnote).foregroundStyle(.red)
+                        Text(why).font(.footnote).foregroundStyle(Midnight.danger)
                     case .idle:
                         EmptyView()
                     }
@@ -231,6 +231,7 @@ public struct SettingsView: View {
                 }
             }
             .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
             #if os(macOS)
             // A grouped form on macOS lays labels out in a leading column; the
             // extra width keeps the longer ones from clipping in the settings
