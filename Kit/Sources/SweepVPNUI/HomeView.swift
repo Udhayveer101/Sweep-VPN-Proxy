@@ -9,12 +9,19 @@ import SweepVPNCore
 public struct HomeView: View {
     @ObservedObject public var model: VPNViewModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    #if os(macOS)
+    @Environment(\.controlActiveState) private var controlActive
+    private var windowInFront: Bool { controlActive != .inactive }
+    #else
+    private let windowInFront = true
+    #endif
 
     public init(model: VPNViewModel) { self.model = model }
 
     public var body: some View {
         ZStack {
-            Backdrop(tint: model.presentation.tint, animate: !reduceMotion && model.animateBackdrop)
+            Backdrop(tint: model.presentation.tint,
+                     animate: !reduceMotion && model.animateBackdrop && windowInFront)
             VStack(spacing: 20) {
                 header
                 #if os(macOS)
@@ -58,20 +65,15 @@ public struct HomeView: View {
         HStack {
             Text("Sweep VPN").font(.headline)
             Spacer()
-            // Permanent, not conditional on an error. A connect that hangs in
-            // "Connecting…" never raises an error banner, so hanging the only
-            // route to the log off that banner made it unreachable in exactly
-            // the case it was needed for.
-            Button { model.activeSheet = .connectionLog } label: {
-                Image(systemName: "text.alignleft").font(.title3)
-            }
-            .buttonStyle(.plain)
-            .help("Connection log")
-            .accessibilityLabel("Connection log")
+            // The connection log is one step further in, under Settings ▸
+            // Diagnostics. It is always there, never hung off an error banner:
+            // a connect that hangs in "Connecting…" raises no banner at all.
             Button { model.activeSheet = .settings } label: {
                 Image(systemName: "gearshape").font(.title3)
+                    .frame(width: 32, height: 32).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .help("Settings")
             .accessibilityLabel("Settings")
         }
     }
@@ -223,6 +225,85 @@ struct ProxyHomePanel: View {
         return "Proxy is off"
     }
 
+    #if os(macOS)
+    private var up: Bool { model.connectionEstablished }
+
+    private var macHeadline: String {
+        if !model.warpRegistered { return "WARP is not set up" }
+        if model.gameState == .running { return "Connected in gaming mode" }
+        if model.systemProxyEnabled { return "Connected" }
+        if model.connectionActive { return "Connecting…" }
+        if model.gameState.isFailed || model.warpState.isFailed || model.systemProxyError != nil {
+            return "Could not connect"
+        }
+        return "Not connected"
+    }
+
+    /// One line under the headline: the failure if there is one, otherwise
+    /// what the current mode does.
+    private var macDetail: (text: String, isError: Bool) {
+        if case .failed(let why) = model.gameState { return (why, true) }
+        if let why = model.systemProxyError { return (why, true) }
+        if !model.connectionIsGaming, case .failed(let why) = model.warpState { return (why, true) }
+        if model.gameState == .starting { return ("macOS will ask for your admin password.", false) }
+        if model.gameState == .running { return ("Everything on this Mac goes through WARP, games included.", false) }
+        if model.systemProxyEnabled { return ("Apps that use the system proxy go through WARP.", false) }
+        if model.connectionActive { return ("Starting WARP…", false) }
+        return (model.gamingPreferred
+                ? "Gaming routes the whole Mac, so games work too."
+                : "Routes apps that use the system proxy.", false)
+    }
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: up ? "lock.shield.fill" : "shield")
+                .font(.system(size: 44, weight: .medium))
+                .foregroundStyle(up ? .green : .secondary)
+                .accessibilityHidden(true)
+            Text(macHeadline).font(.title2.weight(.semibold))
+            Text(macDetail.text).font(.caption)
+                .foregroundStyle(macDetail.isError ? .red : .secondary)
+                .multilineTextAlignment(.center).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            if model.warpRegistered {
+                HStack(spacing: 10) {
+                    Button { model.toggleConnection() } label: {
+                        Text(model.connectionActive ? "Disconnect" : "Connect")
+                            .font(.headline).frame(maxWidth: .infinity, minHeight: 44)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(model.connectionActive ? .red : .accentColor)
+                    .keyboardShortcut(.defaultAction)
+
+                    Toggle(isOn: $model.gamingPreferred) {
+                        Label("Gaming", systemImage: "gamecontroller.fill")
+                    }
+                    .toggleStyle(.switch)
+                    .padding(.horizontal, 12)
+                    .frame(minHeight: 44)
+                    .background(.thinMaterial, in: .rect(cornerRadius: 10, style: .continuous))
+                    .disabled(model.connectionActive)
+                    .help(model.connectionActive
+                          ? "Disconnect to change mode"
+                          : "On: Connect routes the whole Mac so games work. Off: Connect uses the system proxy.")
+                    .accessibilityHint("Chooses how the next Connect routes traffic")
+                }
+                .padding(.top, 4)
+                if model.connectionActive {
+                    Text("Disconnect to change mode.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            } else {
+                Button("Set up WARP") { model.activeSheet = .onboarding }
+                    .buttonStyle(.borderedProminent).controlSize(.large)
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: 420)
+        .background(.ultraThinMaterial, in: .rect(cornerRadius: 24, style: .continuous))
+        .animation(.easeOut(duration: 0.2), value: model.connectionActive)
+    }
+    #else
     var body: some View {
         VStack(spacing: 14) {
             Image(systemName: model.systemProxyEnabled ? "lock.shield.fill" : "shield")
@@ -263,6 +344,7 @@ struct ProxyHomePanel: View {
         .frame(maxWidth: 420)
         .background(.ultraThinMaterial, in: .rect(cornerRadius: 24, style: .continuous))
     }
+    #endif
 }
 
 /// "Mac", "iPhone" or "iPad", for copy that names the device being routed.
@@ -301,6 +383,10 @@ struct Backdrop: View {
         .animation(animate ? .easeInOut(duration: 14).repeatForever(autoreverses: true) : nil,
                    value: phase)
         .onAppear { if animate { phase.toggle() } }
+        // A repeatForever animation outlives the flag that started it, so a
+        // window sent to the background kept the GPU drawing a gradient nobody
+        // could see. Setting the phase without an animation is what stops it.
+        .onChange(of: animate) { phase = $0 }
     }
 
     private var nsColorOrSystemBackground: Color {

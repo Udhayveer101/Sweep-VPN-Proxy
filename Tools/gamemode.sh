@@ -176,7 +176,7 @@ ARGS=(-c "$CONFIG" nativetun -s "$SNI" --http2 -P 8443 --always-reconnect -k 5s 
 launch_usque() {
     local from
     from=$(stat -f %z "$LOG" 2>/dev/null || echo 0)
-    "$USQUE" "${ARGS[@]}" >> "$LOG" 2>&1 &
+    "$USQUE" "${ARGS[@]}" >> "$LOG" 2>&1 3<&- &
     USQUE_PID=$!
     log "usque pid $USQUE_PID"
     IFACE=""
@@ -275,8 +275,24 @@ log "ready"
 # but the tunnel comes back without the player toggling anything.
 # Five failed restarts in a row end it; a restart only counts as a success once
 # usque has stayed up for a minute, so a crash loop cannot hold the Mac forever.
+#
+# The route check costs four forks, and ran every second for as long as gaming
+# mode was up: over a day the watchdog burned more CPU than the tunnel it
+# watches (measured 2026-10-07: bash 3:43 against usque 2:47 in 26.5h). Routes
+# are only lost when usque resets the utun, and usque logs the loss first, so
+# the check now follows the log: it runs for RECHECK passes after any new log
+# line, and otherwise only every BACKSTOP passes. Reading the log is a builtin.
+# ponytail: a route lost with no log line is caught by the backstop, up to
+# BACKSTOP seconds late; shorten it if that is ever seen.
+# --- hold loop (Tools/test-gamemode.sh runs from here to the matching end) ---
 FAILS=0
 UP_SINCE=$SECONDS
+RECHECK_PASSES=5
+BACKSTOP=10
+RECHECK=$RECHECK_PASSES
+PASS=0
+exec 3<"$LOG"
+while IFS= read -r -u 3 _LINE; do :; done    # only lines written from here on count
 while [ -f "$CONTROL" ]; do
     if ! kill -0 "$USQUE_PID" 2>/dev/null; then
         point_default 127.0.0.1 -blackhole
@@ -293,17 +309,24 @@ while [ -f "$CONTROL" ]; do
             log "restarted; default routed through $IFACE"
             UP_SINCE=$SECONDS
         fi
+        RECHECK=$RECHECK_PASSES
         continue
     fi
-    if ! routes_ok; then
-        log "split default lost (now via $(route -n get 200.1.1.1 2>/dev/null | awk '/interface:/{print $2}')); restoring"
-        route -n add -host "$ENDPOINT_IP" "$ORIG_GW" >/dev/null 2>&1
-        point_default -interface "$IFACE"
-        routes_ok || { point_default 127.0.0.1 -blackhole; log "WARN could not restore; traffic held"; }
+    while IFS= read -r -u 3 _LINE; do RECHECK=$RECHECK_PASSES; done
+    PASS=$((PASS + 1))
+    if [ "$RECHECK" -gt 0 ] || [ $((PASS % BACKSTOP)) -eq 0 ]; then
+        [ "$RECHECK" -gt 0 ] && RECHECK=$((RECHECK - 1))
+        if ! routes_ok; then
+            log "split default lost (now via $(route -n get 200.1.1.1 2>/dev/null | awk '/interface:/{print $2}')); restoring"
+            route -n add -host "$ENDPOINT_IP" "$ORIG_GW" >/dev/null 2>&1
+            point_default -interface "$IFACE"
+            routes_ok || { point_default 127.0.0.1 -blackhole; log "WARN could not restore; traffic held"; }
+        fi
     fi
     [ $((SECONDS - UP_SINCE)) -ge 60 ] && FAILS=0
     sleep 1
 done
+# --- end hold loop ---
 
 log "control file withdrawn"
 exit 0

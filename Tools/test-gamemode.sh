@@ -36,4 +36,31 @@ expect "which networksetup=/usr/sbin/networksetup"
 if /usr/bin/perl -T -e '$< = $<; exec @ARGV or die' /bin/echo ok >/dev/null 2>&1; then
     echo "FAIL: old line passed under -T; taint is not being exercised" >&2; exit 1
 fi
+
+# The hold loop, run for 30 passes with the root-only commands stubbed. It must
+# check routes for 5 passes at the start and after a new log line, on every
+# 10th pass, and not otherwise: checking every second cost more CPU than usque.
+sed -n '/^# --- hold loop/,/^# --- end hold loop/p' "$SCRIPT" > "$TMP/loop.sh"
+[ -s "$TMP/loop.sh" ] || { echo "FAIL: hold loop markers not found in $SCRIPT" >&2; exit 1; }
+CHECKS=$(
+    set +e
+    LOG="$TMP/hold.log"; CONTROL="$TMP/hold.control"
+    echo "earlier run" > "$LOG"; : > "$CONTROL"
+    USQUE_PID=1 IFACE=utun9 ENDPOINT_IP=192.0.2.1 ORIG_GW=192.0.2.254
+    N=0 SEEN=""
+    kill() { return 0; }
+    log() { :; }
+    routes_ok() { SEEN="$SEEN $N"; }
+    sleep() {
+        N=$((N + 1))
+        [ "$N" -eq 12 ] && echo "Tunnel connection lost" >> "$LOG"
+        [ "$N" -ge 30 ] && rm -f "$CONTROL"
+        return 0
+    }
+    . "$TMP/loop.sh"
+    echo "$SEEN"
+)
+WANT=" 0 1 2 3 4 9 12 13 14 15 16 19 29"
+[ "$CHECKS" = "$WANT" ] || {
+    echo "FAIL: route checks ran on passes '$CHECKS', expected '$WANT'" >&2; exit 1; }
 echo "gamemode.sh checks passed"

@@ -290,6 +290,19 @@ public final class GameModeController: @unchecked Sendable {
 
     static let startTimeout: TimeInterval = 60
 
+    /// Once the tunnel is up the only lines that matter are a restart or a
+    /// FATAL, and both are rare. Polling twice a second was for the start,
+    /// where the user is watching a spinner; kept up for a whole session it is
+    /// 170,000 wakeups a day to read nothing.
+    static let runningPollInterval: DispatchTimeInterval = .seconds(2)
+
+    private func relaxMonitor() {
+        lock.lock()
+        monitor?.schedule(deadline: .now() + Self.runningPollInterval,
+                          repeating: Self.runningPollInterval, leeway: .milliseconds(500))
+        lock.unlock()
+    }
+
     /// The first thing that runs as root. gamemode.sh and usque sit in an app
     /// bundle the user can write to, so running them in place would hand root
     /// to anything that can write there. Instead: copy both into a fresh
@@ -363,6 +376,7 @@ public final class GameModeController: @unchecked Sendable {
             switch Self.classify(line) {
             case .ready:
                 state = .running
+                relaxMonitor()
                 record(.info, "ready", line)
             case .fatal:
                 teardown(reason: Self.reason(for: line))
@@ -415,9 +429,7 @@ public final class GameModeController: @unchecked Sendable {
     /// App-side events go into gamemode.log too, so one file tells the whole
     /// story of a session. The root script appends to the same file.
     private func appendToLog(_ text: String) {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        guard let data = "\(f.string(from: Date())) \(text)\n".data(using: .utf8) else { return }
+        guard let data = "\(Self.logStamp.string(from: Date())) \(text)\n".data(using: .utf8) else { return }
         if !FileManager.default.fileExists(atPath: logFile.path) {
             try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
             FileManager.default.createFile(atPath: logFile.path, contents: nil)
@@ -427,6 +439,12 @@ public final class GameModeController: @unchecked Sendable {
         _ = try? h.seekToEnd()
         try? h.write(contentsOf: data)
     }
+
+    private static let logStamp: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 
     /// Keep one previous generation once the log passes `logLimit`.
     func rollLog() {
