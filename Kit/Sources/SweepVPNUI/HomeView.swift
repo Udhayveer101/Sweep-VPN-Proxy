@@ -261,23 +261,23 @@ struct ProxyHomePanel: View {
         up ? .on : (model.connectionActive ? .starting : .off)
     }
 
-    /// The mode switch, as a tile the same height as the orb so the two read
-    /// as one control: what to do, and how.
-    private var gamingTile: some View {
-        VStack(spacing: 10) {
+    /// The mode switch, as a pill under the button: the logo, its name and
+    /// the switch. Dimmed and locked while a connection is up.
+    private var gamingPill: some View {
+        HStack(spacing: 10) {
             Image(systemName: "gamecontroller.fill")
-                .font(.title2)
-                .foregroundStyle(model.gamingPreferred ? Midnight.accent : .secondary)
+                .foregroundStyle(model.gamingPreferred ? Midnight.good : .secondary)
                 .accessibilityHidden(true)
-            Text("Gaming").font(.callout.weight(.medium))
+            Text("Gaming").foregroundStyle(.secondary)
             Toggle("Gaming mode", isOn: $model.gamingPreferred)
                 .labelsHidden()
                 .toggleStyle(.switch)
-                .tint(Midnight.accent)
+                .tint(Midnight.good)
         }
-        .frame(width: 104, height: 136)
-        .midnightCard(radius: 26)
-        .opacity(model.connectionActive ? 0.55 : 1)
+        .font(.callout.weight(.medium))
+        .padding(.leading, 16).padding(.trailing, 10).padding(.vertical, 9)
+        .background(Midnight.card, in: Capsule())
+        .opacity(model.connectionActive ? 0.6 : 1)
         .disabled(model.connectionActive)
         .help(model.connectionActive
               ? "Disconnect to change mode"
@@ -287,10 +287,16 @@ struct ProxyHomePanel: View {
     }
 
     var body: some View {
-        VStack(spacing: 30) {
-            VStack(spacing: 8) {
+        VStack(spacing: 22) {
+            if model.warpRegistered {
+                PowerOrb(phase: orbPhase) { model.toggleConnection() }
+                    .keyboardShortcut(.defaultAction)
+                    .help(model.connectionActive ? "Disconnect" : "Connect")
+                    .accessibilityLabel(model.connectionActive ? "Disconnect" : "Connect")
+            }
+            VStack(spacing: 6) {
                 Text(macHeadline)
-                    .font(.system(size: 30, weight: .semibold))
+                    .font(.system(size: 26, weight: .semibold))
                     .multilineTextAlignment(.center)
                 Text(macDetail.text).font(.callout)
                     .foregroundStyle(macDetail.isError ? Midnight.danger : .secondary)
@@ -299,16 +305,11 @@ struct ProxyHomePanel: View {
                     .frame(minHeight: 40, alignment: .top)
             }
             if model.warpRegistered {
-                HStack(spacing: 16) {
-                    PowerOrb(phase: orbPhase) { model.toggleConnection() }
-                        .keyboardShortcut(.defaultAction)
-                        .help(model.connectionActive ? "Disconnect" : "Connect")
-                        .accessibilityLabel(model.connectionActive ? "Disconnect" : "Connect")
-                    gamingTile
-                }
-                Text(model.connectionActive ? "Disconnect to change mode."
-                                            : "Press the button to connect.")
+                gamingPill
+                Text("Disconnect to change mode.")
                     .font(.caption).foregroundStyle(.tertiary)
+                    .opacity(model.connectionActive ? 1 : 0)
+                    .accessibilityHidden(!model.connectionActive)
             } else {
                 Button { model.activeSheet = .onboarding } label: {
                     Text("Set up WARP").font(.headline).frame(maxWidth: 220, minHeight: 44)

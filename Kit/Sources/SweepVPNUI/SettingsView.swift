@@ -231,7 +231,6 @@ public struct SettingsView: View {
                 }
             }
             .formStyle(.grouped)
-            .scrollContentBackground(.hidden)
             #if os(macOS)
             // A grouped form on macOS lays labels out in a leading column; the
             // extra width keeps the longer ones from clipping in the settings
