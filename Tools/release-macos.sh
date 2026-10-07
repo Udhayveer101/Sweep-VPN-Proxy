@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 : "${VERSION:?set VERSION}"
 : "${TEAM_ID:?set TEAM_ID}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
-OUT="build/release"
+OUT="${OUT:-build/release}"
 ARCHIVE="$OUT/Sweep.xcarchive"
 rm -rf "$OUT" && mkdir -p "$OUT"
 
@@ -65,14 +65,14 @@ notarize() {
   local sid="" status=""
   for i in 1 2 3; do
     sid=$(xcrun notarytool submit "$1" "${AUTH[@]}" --output-format json 2>/dev/null \
-      | sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' | head -1)
+      | sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' | head -1) || true
     [ -n "$sid" ] && break; sleep 15
   done
   [ -n "$sid" ] || { echo "notarization upload failed" >&2; exit 1; }
   echo "notary submission $sid"
   for _ in $(seq 1 60); do
     status=$(xcrun notarytool info "$sid" "${AUTH[@]}" --output-format json 2>/dev/null \
-      | sed -n 's/.*"status" *: *"\([^"]*\)".*/\1/p' | head -1)
+      | sed -n 's/.*"status" *: *"\([^"]*\)".*/\1/p' | head -1) || true
     case "$status" in Accepted|Invalid|Rejected) break;; esac
     sleep 30
   done
