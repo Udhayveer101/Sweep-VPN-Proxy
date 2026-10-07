@@ -63,4 +63,16 @@ CHECKS=$(
 WANT=" 0 1 2 3 4 9 12 13 14 15 16 19 29"
 [ "$CHECKS" = "$WANT" ] || {
     echo "FAIL: route checks ran on passes '$CHECKS', expected '$WANT'" >&2; exit 1; }
+# The loop must come back from its wait even with SIGALRM blocked, which is how
+# the authorization trampoline starts us. A `read -t` wait hangs there forever.
+perl -MPOSIX -e 'sigprocmask(SIG_BLOCK, POSIX::SigSet->new(SIGALRM)); exec @ARGV' /bin/bash -c '
+    LOG="$1/alrm.log"; CONTROL="$1/alrm.control"; : > "$LOG"; : > "$CONTROL"
+    USQUE_PID=$$ IFACE=utun9 ENDPOINT_IP=192.0.2.1 ORIG_GW=192.0.2.254
+    log() { :; }; routes_ok() { :; }
+    ( /bin/sleep 2; rm -f "$CONTROL" ) &
+    . "$1/loop.sh"' _ "$TMP" &
+LOOP=$!
+( sleep 8; kill -9 "$LOOP" 2>/dev/null ) & GUARD=$!
+if wait "$LOOP" 2>/dev/null; then { kill "$GUARD"; wait "$GUARD"; } 2>/dev/null || true
+else echo "FAIL: hold loop did not stop within 8s of the control file going away (SIGALRM blocked)" >&2; exit 1; fi
 echo "gamemode.sh checks passed"
