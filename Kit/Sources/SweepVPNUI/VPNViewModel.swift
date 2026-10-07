@@ -239,23 +239,34 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
-    /// Download, verify against the published SHA-256, and open the DMG. The
-    /// app does not replace itself: swapping a signed bundle out from under a
-    /// live tunnel is the one thing here that could leave the Mac unroutable.
+    /// Download, verify against the published SHA-256, then replace this app
+    /// and relaunch. The swap happens only after a normal quit, so the system
+    /// proxy and gaming-mode routes are already undone when the bundle moves.
+    /// Builds with network extensions, and copies that cannot write their own
+    /// folder, get the mounted DMG instead.
     public func installUpdate() {
         guard let update = availableUpdate, updateState != .downloading else { return }
         updateState = .downloading
         let checker = UpdateChecker()
+        let replaceInPlace = proxyOnly
         Task { @MainActor in
             do {
                 let dmg = try await checker.download(update)
                 // hdiutil and codesign take seconds; keep them off the main thread.
-                try await Task.detached { try checker.reveal(dmg) }.value
+                let staged = try await Task.detached { () -> URL? in
+                    if replaceInPlace, let staged = try checker.stage(dmg) { return staged }
+                    try checker.reveal(dmg)
+                    return nil
+                }.value
+                if let staged {
+                    try UpdateChecker.swapAfterExit(staged: staged)
+                    NSApp.terminate(nil)
+                }
                 self.updateState = .idle
             } catch UpdateChecker.UpdateError.digestMismatch {
                 self.updateState = .failed("The downloaded update did not match its published checksum, so it was discarded.")
             } catch UpdateChecker.UpdateError.untrustedSignature {
-                self.updateState = .failed("The downloaded app is not signed by Sweep's developer, so it was not opened.")
+                self.updateState = .failed("The downloaded app is not signed by Sweep's developer, so it was not installed.")
             } catch {
                 self.updateState = .failed("Could not download the update: \(error.localizedDescription)")
             }
