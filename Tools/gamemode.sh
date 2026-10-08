@@ -166,7 +166,13 @@ done
 # A parked standby is also swept with the live flow, so it buys nothing here
 # (docs/measurements-2026-09-20.md).
 # -P 8443: the firewall proxies every tcp/443 flow, see WarpController.masquePort.
-ARGS=(-c "$CONFIG" nativetun -s "$SNI" --http2 -P 8443 --always-reconnect -k 5s -S)
+# --hop-probe: the "sweep" is the LAN gateway moving traffic to another WAN
+# uplink (measured 2026-10-08: the second hop changes, the public address with
+# it, and the established flow dies with no RST). The PING timeout notices up to
+# 8s later and the blackout was 9-10s. Watching the second hop finds it within
+# a probe interval and redials at once. It shortens the blackout only: the new
+# session still resets inner connections, as above.
+ARGS=(-c "$CONFIG" nativetun -s "$SNI" --http2 -P 8443 --always-reconnect -k 5s -S --hop-probe 250ms)
 
 # Start usque and wait for its utun to appear and carry our address. Only
 # usque's own announcement names our device: guessing from ifconfig picked up
