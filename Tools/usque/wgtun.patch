@@ -1,0 +1,646 @@
+From bab60fa55a3b3fa6874c5740f31bfbddd4071337 Mon Sep 17 00:00:00 2001
+From: Udhayveer Singh <udhayveersingh@Udhayveer.local>
+Date: Sun, 11 Oct 2026 00:49:30 +0530
+Subject: [PATCH] Carry the tunnel over WireGuard so it survives a change of
+ public address
+
+The LAN gateway on the target network moves traffic between WAN uplinks. Every
+TCP flow dies at each move, the HTTP/2 MASQUE flow included, and a new MASQUE
+session resets every connection inside it. A WireGuard session is not tied to
+the client's address: the next packet from the new address carries it on.
+
+wgtun is nativetun over WireGuard, from a curve25519 registration. Two things
+make it work on that network. WARP's client id goes in the reserved bytes of
+every message. And a few packets the peer ignores go out ahead of the first
+packet of a socket and of every handshake, because the firewall there drops a
+UDP flow whose first packets are a bare WireGuard handshake.
+
+A watcher keeps the session on a live path. Traffic out and nothing back for
+3s moves it to a new socket, since WireGuard's own retry reuses the flow the
+network dropped. A handshake older than the peer keeps a session (after sleep,
+Go's clock having stopped) starts a new session at once instead of 15s later.
+With no handshake at start wgtun exits with status 3 so the caller can fall
+back to nativetun; after that it never closes the device, which would take the
+caller's routes with it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ api/wgbind.go       | 164 ++++++++++++++++++++++++++++
+ api/wgbind_test.go  | 167 ++++++++++++++++++++++++++++
+ cmd/wgtun_darwin.go | 259 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 590 insertions(+)
+ create mode 100644 api/wgbind.go
+ create mode 100644 api/wgbind_test.go
+ create mode 100644 cmd/wgtun_darwin.go
+
+diff --git a/api/wgbind.go b/api/wgbind.go
+new file mode 100644
+index 0000000..b73c3a4
+--- /dev/null
++++ b/api/wgbind.go
+@@ -0,0 +1,164 @@
++package api
++
++import (
++	"crypto/rand"
++	"sync/atomic"
++	"time"
++
++	"golang.zx2c4.com/wireguard/conn"
++)
++
++// A WireGuard handshake initiation: message type 1, 148 bytes.
++const (
++	wgTypeInitiation = 1
++	wgInitiationSize = 148
++)
++
++// WarpBind adapts a WireGuard bind to WARP on a network that inspects UDP.
++//
++// Reserved: WARP carries the device's client id in the three reserved bytes of
++// every WireGuard message, and uses it to keep a session on one machine as the
++// client's address changes. wireguard-go requires those bytes to be zero, so
++// they are stamped on the way out and cleared on the way in.
++//
++// Junk: the firewall this is built for classifies a UDP flow on its first few
++// packets and drops the flow once it has seen initiation, response and data
++// among them (measured 2026-10-11: fewer than 3 leading packets and the flow is
++// cut after one data exchange; 3 or more and it runs). So a few packets the
++// peer ignores go out before the first packet of every socket and before every
++// handshake initiation: a socket the firewall has forgotten then never starts
++// with a bare handshake.
++type WarpBind struct {
++	conn.Bind
++	Reserved [3]byte
++	Junk     int
++
++	fresh atomic.Bool
++}
++
++func (b *WarpBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
++	fns, actual, err := b.Bind.Open(port)
++	if err != nil {
++		return nil, 0, err
++	}
++	b.fresh.Store(true)
++	out := make([]conn.ReceiveFunc, len(fns))
++	for i, fn := range fns {
++		out[i] = func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
++			n, err := fn(packets, sizes, eps)
++			for j := 0; j < n; j++ {
++				if sizes[j] >= 4 {
++					packets[j][1], packets[j][2], packets[j][3] = 0, 0, 0
++				}
++			}
++			return n, err
++		}
++	}
++	return out, actual, nil
++}
++
++func (b *WarpBind) Send(bufs [][]byte, ep conn.Endpoint) error {
++	lead := b.fresh.Swap(false)
++	for _, buf := range bufs {
++		if len(buf) < 4 {
++			continue
++		}
++		if buf[0] == wgTypeInitiation && len(buf) == wgInitiationSize {
++			lead = true
++		}
++		copy(buf[1:4], b.Reserved[:])
++	}
++	if lead && b.Junk > 0 {
++		// Best effort: a lost junk packet only matters to the firewall.
++		_ = b.Bind.Send(junkPackets(b.Junk), ep)
++	}
++	return b.Bind.Send(bufs, ep)
++}
++
++// junkPackets returns n datagrams no WireGuard peer acts on: the first byte is
++// not a message type, so they fail the type check before any cryptography.
++func junkPackets(n int) [][]byte {
++	out := make([][]byte, n)
++	for i := range out {
++		var size [1]byte
++		_, _ = rand.Read(size[:])
++		p := make([]byte, 40+int(size[0])%64)
++		_, _ = rand.Read(p)
++		p[0] = 0
++		out[i] = p
++	}
++	return out
++}
++
++// WgCounters is one reading of the tunnel's peer. Handshake is the wall-clock
++// time of the last completed handshake in unix seconds, 0 for none.
++type WgCounters struct {
++	Tx, Rx    uint64
++	Handshake int64
++}
++
++// WgAction is what the watcher asks for.
++type WgAction int
++
++const (
++	WgKeep       WgAction = iota
++	WgNewSocket           // move the session to a new socket: a new flow, no new handshake
++	WgNewSession          // a new handshake, on a new socket
++)
++
++const (
++	wgStallWindow = 3 // readings: traffic out and nothing back for this long is a dead path
++	// Bytes that must have left in the window. Above what persistent keepalives
++	// alone send (32 bytes every few seconds, never answered), so an idle
++	// tunnel is not a stall.
++	wgStallMinTx = 2 * wgInitiationSize
++	// The peer discards a session 180s after its handshake. With a persistent
++	// keepalive a healthy tunnel renews at about 120s, so an older one has
++	// been failing to, or the Mac slept: Go's clock stops in sleep, so
++	// wireguard-go still thinks the keys are fresh and sends into the void
++	// until its own 15s timer notices.
++	wgSessionDead = 180 * time.Second
++	wgNoSession   = 10 * time.Second // retry interval while no handshake completes at all
++	wgActPause    = 5 * time.Second
++)
++
++// WgWatch decides, from one reading a second, whether the tunnel's path has
++// died. WireGuard's own answer to a dead path is to wait 15s and retry the
++// handshake from the same socket, which cannot work when it is that socket's
++// flow the network dropped.
++type WgWatch struct {
++	window [wgStallWindow + 1]WgCounters
++	n      int
++	last   time.Time
++}
++
++func (w *WgWatch) Step(now WgCounters, wall time.Time) WgAction {
++	old := w.window[(w.n+1)%len(w.window)]
++	if w.n == 0 || now.Tx < old.Tx || now.Rx < old.Rx {
++		// First reading, or the peer was replaced and its counters began again.
++		for i := range w.window {
++			w.window[i] = now
++		}
++		old = now
++		if w.last.IsZero() {
++			w.last = wall
++		}
++	}
++	w.window[w.n%len(w.window)] = now
++	w.n++
++	if wall.Sub(w.last) < wgActPause {
++		return WgKeep
++	}
++	act := WgKeep
++	switch {
++	case now.Handshake == 0 && wall.Sub(w.last) >= wgNoSession,
++		now.Handshake != 0 && wall.Sub(time.Unix(now.Handshake, 0)) > wgSessionDead:
++		act = WgNewSession
++	case now.Rx == old.Rx && now.Tx-old.Tx >= wgStallMinTx:
++		act = WgNewSocket
++	}
++	if act != WgKeep {
++		w.last = wall
++	}
++	return act
++}
+diff --git a/api/wgbind_test.go b/api/wgbind_test.go
+new file mode 100644
+index 0000000..c48fd0e
+--- /dev/null
++++ b/api/wgbind_test.go
+@@ -0,0 +1,167 @@
++package api
++
++import (
++	"bytes"
++	"testing"
++	"time"
++
++	"golang.zx2c4.com/wireguard/conn"
++)
++
++// fakeBind records what reaches the socket and replays canned datagrams.
++type fakeBind struct {
++	conn.Bind
++	sent  [][]byte
++	inbox [][]byte
++}
++
++func (f *fakeBind) Open(uint16) ([]conn.ReceiveFunc, uint16, error) {
++	return []conn.ReceiveFunc{func(packets [][]byte, sizes []int, _ []conn.Endpoint) (int, error) {
++		for i, p := range f.inbox {
++			sizes[i] = copy(packets[i], p)
++		}
++		return len(f.inbox), nil
++	}}, 4242, nil
++}
++
++func (f *fakeBind) Send(bufs [][]byte, _ conn.Endpoint) error {
++	for _, b := range bufs {
++		f.sent = append(f.sent, append([]byte(nil), b...))
++	}
++	return nil
++}
++
++func initiation() []byte { p := make([]byte, wgInitiationSize); p[0] = wgTypeInitiation; return p }
++func data() []byte       { p := make([]byte, 64); p[0] = 4; return p }
++
++func isJunk(p []byte) bool { return p[0] == 0 }
++
++func TestWarpBindLeadsEverySocketAndEveryInitiationWithJunk(t *testing.T) {
++	f := &fakeBind{}
++	b := &WarpBind{Bind: f, Reserved: [3]byte{0xaa, 0xbb, 0xcc}, Junk: 4}
++	if _, _, err := b.Open(0); err != nil {
++		t.Fatal(err)
++	}
++
++	// First packet of a socket: junk first, even when it is plain data (a rebind mid-session).
++	_ = b.Send([][]byte{data()}, nil)
++	if len(f.sent) != 5 || !isJunk(f.sent[0]) || !isJunk(f.sent[3]) || f.sent[4][0] != 4 {
++		t.Fatalf("fresh socket: want 4 junk then data, got %d packets", len(f.sent))
++	}
++
++	// Later data: no junk.
++	f.sent = nil
++	_ = b.Send([][]byte{data(), data()}, nil)
++	if len(f.sent) != 2 {
++		t.Fatalf("established flow: want 2 packets, got %d", len(f.sent))
++	}
++
++	// A rekey on the same socket: junk again, ahead of the initiation.
++	f.sent = nil
++	_ = b.Send([][]byte{initiation()}, nil)
++	if len(f.sent) != 5 || !isJunk(f.sent[0]) || f.sent[4][0] != wgTypeInitiation {
++		t.Fatalf("initiation: want 4 junk then the initiation, got %d packets", len(f.sent))
++	}
++
++	// A new socket starts over.
++	f.sent = nil
++	_, _, _ = b.Open(0)
++	_ = b.Send([][]byte{data()}, nil)
++	if len(f.sent) != 5 {
++		t.Fatalf("rebind: want junk again, got %d packets", len(f.sent))
++	}
++}
++
++func TestWarpBindStampsReservedOutAndClearsItIn(t *testing.T) {
++	f := &fakeBind{inbox: [][]byte{{2, 0x11, 0x22, 0x33, 9, 9}}}
++	b := &WarpBind{Bind: f, Reserved: [3]byte{0xaa, 0xbb, 0xcc}}
++	fns, _, _ := b.Open(0)
++
++	_ = b.Send([][]byte{data()}, nil)
++	if got := f.sent[0][:4]; !bytes.Equal(got, []byte{4, 0xaa, 0xbb, 0xcc}) {
++		t.Fatalf("outbound header %x, want type then the client id", got)
++	}
++
++	packets, sizes := [][]byte{make([]byte, 64)}, make([]int, 1)
++	if n, _ := fns[0](packets, sizes, make([]conn.Endpoint, 1)); n != 1 {
++		t.Fatalf("received %d packets", n)
++	}
++	if got := packets[0][:sizes[0]]; !bytes.Equal(got, []byte{2, 0, 0, 0, 9, 9}) {
++		t.Fatalf("inbound %x: reserved bytes must reach wireguard-go as zero", got)
++	}
++}
++
++// feed gives the watcher one reading a second and returns what it asked for.
++func feed(w *WgWatch, at *time.Time, c WgCounters) WgAction {
++	*at = at.Add(time.Second)
++	return w.Step(c, *at)
++}
++
++func TestWgWatchLeavesAnIdleAndABusyTunnelAlone(t *testing.T) {
++	w, at := &WgWatch{}, time.Unix(1_000_000, 0)
++	c := WgCounters{Handshake: at.Unix()}
++	for i := 0; i < 100; i++ {
++		c.Tx += 32 / 5 // keepalives, never answered
++		if i%2 == 0 {
++			c.Handshake = at.Unix() // renewed in time
++		}
++		if a := feed(w, &at, c); a != WgKeep {
++			t.Fatalf("idle tunnel, second %d: action %d", i, a)
++		}
++	}
++	for i := 0; i < 30; i++ {
++		c.Tx += 50_000
++		c.Rx += 92 // anything back means the path works
++		c.Handshake = at.Unix()
++		if a := feed(w, &at, c); a != WgKeep {
++			t.Fatalf("busy tunnel, second %d: action %d", i, a)
++		}
++	}
++}
++
++func TestWgWatchMovesToANewSocketWhenNothingComesBack(t *testing.T) {
++	w, at := &WgWatch{}, time.Unix(1_000_000, 0)
++	c := WgCounters{Handshake: at.Unix()}
++	var got []int
++	for i := 0; i < 20; i++ {
++		c.Tx += 1000 // traffic into a dead path
++		c.Handshake = at.Unix() - 30
++		if feed(w, &at, c) == WgNewSocket {
++			got = append(got, i)
++		}
++	}
++	// Not before the window can show it, then no more often than the pause.
++	if len(got) < 2 || got[0] > 6 || got[1]-got[0] < 5 {
++		t.Fatalf("new sockets at seconds %v", got)
++	}
++}
++
++func TestWgWatchStartsANewSessionAfterSleepAndWhileNoneCompletes(t *testing.T) {
++	w, at := &WgWatch{}, time.Unix(1_000_000, 0)
++	c := WgCounters{Tx: 500, Rx: 500, Handshake: at.Unix()}
++	for i := 0; i < 10; i++ {
++		feed(w, &at, c)
++	}
++	// The Mac slept for ten minutes: the wall clock moved, the counters did not.
++	at = at.Add(10 * time.Minute)
++	if a := feed(w, &at, c); a != WgNewSession {
++		t.Fatalf("after sleep: action %d, want a new session", a)
++	}
++	// The peer was replaced: counters start over and no handshake has completed.
++	c = WgCounters{}
++	var got []int
++	for i := 0; i < 25; i++ {
++		c.Tx += 148 / 5 // initiations, unanswered
++		if feed(w, &at, c) == WgNewSession {
++			got = append(got, i)
++		}
++	}
++	if len(got) != 2 || got[0] < 8 || got[0] > 10 {
++		t.Fatalf("with no handshake, new sessions at seconds %v, want one about every 10s", got)
++	}
++	// It completes: quiet again.
++	c.Handshake, c.Rx = at.Unix(), 92
++	if a := feed(w, &at, c); a != WgKeep {
++		t.Fatalf("after the handshake: action %d", a)
++	}
++}
+diff --git a/cmd/wgtun_darwin.go b/cmd/wgtun_darwin.go
+new file mode 100644
+index 0000000..0ea6f60
+--- /dev/null
++++ b/cmd/wgtun_darwin.go
+@@ -0,0 +1,259 @@
++//go:build darwin
++
++package cmd
++
++import (
++	"bufio"
++	"encoding/base64"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"log"
++	"net"
++	"os"
++	"strconv"
++	"strings"
++	"sync/atomic"
++	"time"
++
++	"github.com/Diniboy1123/usque/api"
++	"github.com/spf13/cobra"
++	"golang.zx2c4.com/wireguard/conn"
++	"golang.zx2c4.com/wireguard/device"
++	"golang.zx2c4.com/wireguard/tun"
++)
++
++// wgIdentity is a WARP registration made with a curve25519 key: the API's
++// answer as it came, plus the private key the registration was made with.
++type wgIdentity struct {
++	PrivateKey string `json:"private_key"`
++	Config     struct {
++		ClientID string `json:"client_id"`
++		Peers    []struct {
++			PublicKey string `json:"public_key"`
++			Endpoint  struct {
++				V4 string `json:"v4"`
++			} `json:"endpoint"`
++		} `json:"peers"`
++		Interface struct {
++			Addresses struct {
++				V4 string `json:"v4"`
++			} `json:"addresses"`
++		} `json:"interface"`
++	} `json:"config"`
++}
++
++// uapi returns the wireguard-go configuration, device and peer apart (the
++// watcher replaces the peer), and what the tunnel needs besides it: the inner
++// address and WARP's reserved bytes.
++func (id *wgIdentity) uapi(port int, keepalive time.Duration) (dev, peerConf, addr string, reserved [3]byte, err error) {
++	key := func(name, b64 string) (string, error) {
++		raw, err := base64.StdEncoding.DecodeString(b64)
++		if err != nil || len(raw) != 32 {
++			return "", fmt.Errorf("identity: %s is not a 32-byte base64 key", name)
++		}
++		return hex.EncodeToString(raw), nil
++	}
++	if len(id.Config.Peers) == 0 {
++		return "", "", "", reserved, fmt.Errorf("identity: no peer")
++	}
++	peer := id.Config.Peers[0]
++	priv, err := key("private_key", id.PrivateKey)
++	if err != nil {
++		return "", "", "", reserved, err
++	}
++	pub, err := key("peer public_key", peer.PublicKey)
++	if err != nil {
++		return "", "", "", reserved, err
++	}
++	// The API gives the address with a zero port ("162.159.192.3:0").
++	host, _, err := net.SplitHostPort(peer.Endpoint.V4)
++	if err != nil || net.ParseIP(host).To4() == nil {
++		return "", "", "", reserved, fmt.Errorf("identity: bad peer endpoint %q", peer.Endpoint.V4)
++	}
++	addr = id.Config.Interface.Addresses.V4
++	if net.ParseIP(addr).To4() == nil {
++		return "", "", "", reserved, fmt.Errorf("identity: bad interface address %q", addr)
++	}
++	if cid, err := base64.StdEncoding.DecodeString(id.Config.ClientID); err == nil && len(cid) == 3 {
++		copy(reserved[:], cid)
++	}
++	dev = fmt.Sprintf("private_key=%s\n", priv)
++	peerConf = fmt.Sprintf("public_key=%s\nendpoint=%s\npersistent_keepalive_interval=%d\nallowed_ip=0.0.0.0/0\n",
++		pub, net.JoinHostPort(host, strconv.Itoa(port)), int(keepalive.Seconds()))
++	return dev, peerConf, addr, reserved, nil
++}
++
++func wgStats(dev *device.Device) (c api.WgCounters) {
++	out, err := dev.IpcGet()
++	if err != nil {
++		return c
++	}
++	sc := bufio.NewScanner(strings.NewReader(out))
++	for sc.Scan() {
++		k, v, _ := strings.Cut(sc.Text(), "=")
++		switch k {
++		case "tx_bytes":
++			c.Tx, _ = strconv.ParseUint(v, 10, 64)
++		case "rx_bytes":
++			c.Rx, _ = strconv.ParseUint(v, 10, 64)
++		case "last_handshake_time_sec":
++			c.Handshake, _ = strconv.ParseInt(v, 10, 64)
++		}
++	}
++	return c
++}
++
++// wgLogger passes on one wireguard-go error every 30s. It reports each packet
++// it cannot send, several a second for as long as the network is away
++// (measured: 184 lines in a 26s Wi-Fi outage), and the supervising script
++// rechecks its routes on every line.
++func wgLogger() *device.Logger {
++	var last atomic.Int64
++	return &device.Logger{
++		Verbosef: func(string, ...any) {},
++		Errorf: func(format string, args ...any) {
++			now := time.Now().Unix()
++			if was := last.Load(); now-was >= 30 && last.CompareAndSwap(was, now) {
++				log.Printf("wireguard: "+format, args...)
++			}
++		},
++	}
++}
++
++// Exit status when WireGuard cannot get through at start; the caller may fall back.
++const wgExitNoTunnel = 3
++
++// wgWatch keeps the tunnel on a live path: a new socket when its flow has died,
++// a new session when the old one has expired. It never gives up. Closing the
++// device would take its routes with it and let traffic out on the physical
++// link, and a network that is simply down looks the same from here.
++// ponytail: a network that starts blocking WireGuard mid-session leaves the
++// tunnel held until gaming mode is restarted (which then falls back to MASQUE).
++// Hand over under the kill switch if that is ever seen.
++func wgWatch(wg *device.Device, peerConf string) {
++	var w api.WgWatch
++	pending := api.WgKeep
++	// One line when the path dies and one when it is back, however long that
++	// takes: the supervising script rechecks its routes on every line.
++	var downAt time.Time
++	var rxAtDown uint64
++	for {
++		time.Sleep(time.Second)
++		now := wgStats(wg)
++		if !downAt.IsZero() && now.Handshake != 0 && now.Rx > rxAtDown {
++			log.Printf("WireGuard path restored after %.0fs", time.Since(downAt).Seconds())
++			downAt = time.Time{}
++		}
++		if act := w.Step(now, time.Now()); act != api.WgKeep {
++			pending = act
++			if downAt.IsZero() {
++				downAt, rxAtDown = time.Now(), now.Rx
++				if act == api.WgNewSession {
++					log.Println("WireGuard session expired or never completed; starting a new one on a new socket")
++				} else {
++					log.Println("No reply for 3s; moving the WireGuard session to a new socket")
++				}
++			}
++			if act == api.WgNewSession {
++				rxAtDown = 0 // a replaced peer counts from zero
++			}
++		}
++		conf := "listen_port=0\n"
++		if pending == api.WgNewSession {
++			conf += "replace_peers=true\n" + peerConf
++		}
++		// Retried every second until it works: with no socket nothing is
++		// sent, and a tunnel that sends nothing never looks stalled again.
++		if pending != api.WgKeep {
++			if err := wg.IpcSet(conf); err != nil {
++				log.Printf("Failed to open a new socket: %v", err)
++				continue
++			}
++			pending = api.WgKeep
++		}
++	}
++}
++
++var wgTunCmd = &cobra.Command{
++	Use:   "wgtun",
++	Short: "Expose Warp as a native TUN device over WireGuard",
++	Long: "Expose Warp as a native TUN device that accepts any IP traffic, carried over WireGuard (UDP) instead of MASQUE." +
++		" A WireGuard session is not tied to the client's address, so it survives a change of the network's public" +
++		" address that ends every TCP connection, the HTTP/2 MASQUE flow included." +
++		" Requires root and a curve25519 registration (--identity). Routing is left to the caller." +
++		" Exits with status 3 when no handshake gets through at start, so the caller can fall back to nativetun.",
++	Run: func(cmd *cobra.Command, args []string) {
++		path, _ := cmd.Flags().GetString("identity")
++		port, _ := cmd.Flags().GetInt("connect-port")
++		junk, _ := cmd.Flags().GetInt("junk")
++		mtu, _ := cmd.Flags().GetInt("mtu")
++		keepalive, _ := cmd.Flags().GetDuration("keepalive-period")
++		handshakeTimeout, _ := cmd.Flags().GetDuration("handshake-timeout")
++
++		raw, err := os.ReadFile(path)
++		if err != nil {
++			log.Fatalf("Failed to read identity: %v", err)
++		}
++		var id wgIdentity
++		if err := json.Unmarshal(raw, &id); err != nil {
++			log.Fatalf("Failed to parse identity: %v", err)
++		}
++		devConf, peerConf, addr, reserved, err := id.uapi(port, keepalive)
++		if err != nil {
++			log.Fatalf("%v", err)
++		}
++
++		tunDev, err := tun.CreateTUN("utun", mtu)
++		if err != nil {
++			log.Println("Are you root/administrator? TUN device creation usually requires elevated privileges.")
++			log.Fatalf("Failed to create TUN device: %v", err)
++		}
++		name, err := tunDev.Name()
++		if err != nil {
++			log.Fatalf("Failed to name TUN device: %v", err)
++		}
++		// Same point-to-point addressing as nativetun; see tunDevice.create.
++		if err := ifconfig(name, "inet", addr, addr, "mtu", fmt.Sprint(mtu), "up"); err != nil {
++			log.Fatalf("Failed to set IPv4 address: %v", err)
++		}
++
++		wg := device.NewDevice(tunDev, &api.WarpBind{Bind: conn.NewStdNetBind(), Reserved: reserved, Junk: junk}, wgLogger())
++		if err := wg.IpcSet(devConf + peerConf); err != nil {
++			log.Fatalf("Failed to configure WireGuard: %v", err)
++		}
++		if err := wg.Up(); err != nil {
++			log.Fatalf("Failed to bring WireGuard up: %v", err)
++		}
++
++		// The persistent keepalive starts a handshake at once. Nothing is
++		// announced until it completes: the caller routes into the device
++		// as soon as it is, and must not route into a tunnel that cannot open.
++		log.Printf("Establishing WireGuard session on UDP %d", port)
++		deadline := time.Now().Add(handshakeTimeout)
++		for wgStats(wg).Handshake == 0 {
++			if time.Now().After(deadline) {
++				log.Printf("No WireGuard handshake within %s; WireGuard does not get through here", handshakeTimeout)
++				wg.Close()
++				os.Exit(wgExitNoTunnel)
++			}
++			time.Sleep(100 * time.Millisecond)
++		}
++		log.Printf("Created TUN device: %s", name)
++		log.Println("Tunnel established, you may now set up routing and DNS")
++		log.Println("Connected to WARP over WireGuard")
++
++		wgWatch(wg, peerConf)
++	},
++}
++
++func init() {
++	wgTunCmd.Flags().String("identity", "", "Path to the WireGuard registration (JSON: the registration response plus private_key)")
++	wgTunCmd.Flags().IntP("connect-port", "P", 2408, "UDP port of the WireGuard endpoint (2408, 1701 or 4500)")
++	wgTunCmd.Flags().Int("junk", 4, "Packets the peer ignores, sent ahead of the first packet of a socket and of every handshake. 0 disables")
++	wgTunCmd.Flags().DurationP("keepalive-period", "k", 5*time.Second, "WireGuard persistent keepalive")
++	wgTunCmd.Flags().IntP("mtu", "m", 1280, "MTU of the tunnel device")
++	wgTunCmd.Flags().Duration("handshake-timeout", 8*time.Second, "Exit with status 3 when the first handshake takes longer than this")
++	_ = wgTunCmd.MarkFlagRequired("identity")
++	rootCmd.AddCommand(wgTunCmd)
++}
+-- 
+2.54.0 (Apple Git-157)
+

@@ -17,7 +17,8 @@ git -C "$WORK" -c user.name=ci -c user.email=ci@localhost am -q \
   "$PATCHES/masque-keepalive.patch" "$PATCHES/masque-handshake-timeout.patch" "$PATCHES/masque-closed-pipe.patch" \
   "$PATCHES/flow-standby-rotation.patch" "$PATCHES/darwin-tun-framing.patch" \
   "$PATCHES/standby-backoff.patch" "$PATCHES/standby-age-log.patch" \
-    "$PATCHES/hop-probe.patch"
+    "$PATCHES/hop-probe.patch" \
+    "$PATCHES/wgtun.patch"
 (cd "$WORK" && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o "$HERE/usque.exe" .)
 
 # usque's TUN (gaming mode) loads wintun.dll from beside its own exe.

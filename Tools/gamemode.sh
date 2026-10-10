@@ -26,6 +26,16 @@ SNI="${5:-example.com}"
 # would route the tunnel's own packets into the tunnel.
 ENDPOINT_IP=$(/usr/bin/plutil -extract endpoint_h2_v4 raw -o - "$CONFIG" 2>/dev/null)
 [[ "$ENDPOINT_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || ENDPOINT_IP="162.159.198.2"
+# A curve25519 WARP registration next to config.json switches the transport to
+# WireGuard (see WG_ARGS below). Its endpoint needs the same pin as MASQUE's.
+WG_ID="$(dirname "$CONFIG")/wg-warp.json"
+WG_IP=""
+if [ -f "$WG_ID" ] && [ ! -L "$WG_ID" ]; then
+    WG_IP=$(/usr/bin/plutil -extract config.peers.0.endpoint.v4 raw -o - "$WG_ID" 2>/dev/null)
+    WG_IP=${WG_IP%%:*}
+    [[ "$WG_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || WG_IP=""
+fi
+MODE=masque
 IFACE=""
 ORIG_GW=""
 ORIG_SVC=""
@@ -50,6 +60,7 @@ cleanup() {
     route -n delete -net 0.0.0.0/1 >/dev/null 2>&1
     route -n delete -net 128.0.0.0/1 >/dev/null 2>&1
     [ -n "$ORIG_GW" ] && route -n delete -host "$ENDPOINT_IP" "$ORIG_GW" >/dev/null 2>&1
+    [ -n "$ORIG_GW" ] && [ -n "$WG_IP" ] && route -n delete -host "$WG_IP" "$ORIG_GW" >/dev/null 2>&1
     for ip in $DIRECT_IPS; do route -n delete -host "$ip" "$ORIG_GW" >/dev/null 2>&1; done
     [ -n "$MCAST_ADDED" ] && route -n delete -net 224.0.0.0/4 -interface "$ORIG_IF" >/dev/null 2>&1
     route -n delete -net 10.0.0.0/8 >/dev/null 2>&1
@@ -121,6 +132,10 @@ log "gateway $ORIG_GW via $ORIG_IF"
 # tunnel's own packets would route into the tunnel.
 route -n add -host "$ENDPOINT_IP" "$ORIG_GW" >/dev/null 2>&1
 log "pinned $ENDPOINT_IP via $ORIG_GW"
+if [ -n "$WG_IP" ]; then
+    route -n add -host "$WG_IP" "$ORIG_GW" >/dev/null 2>&1
+    log "pinned $WG_IP via $ORIG_GW"
+fi
 
 # Game servers the network already lets through stay off the tunnel. This
 # school's Sophos gateway lets mc.hypixel.net:25565 through directly on both
@@ -174,6 +189,21 @@ done
 # session still resets inner connections, as above.
 ARGS=(-c "$CONFIG" nativetun -s "$SNI" --http2 -P 8443 --always-reconnect -k 5s -S --hop-probe 250ms)
 
+# WireGuard instead, when this Mac is registered for it. The hop probe only
+# shortens the blackout: no TCP flow outlives an uplink switch, and each new
+# MASQUE session resets every connection inside it. A WireGuard session is not
+# tied to the client's address. Measured 2026-10-11 on the same gateway, 9
+# minutes, 5 switches: a plain TCP connection died at 5 of 5; one WireGuard
+# session lost 6 of 2554 pings, never went 1s without a reply, and kept the same
+# inner TCP connection and the same public UDP mapping throughout.
+# UDP is not blocked here, QUIC is: the gateway drops QUIC Initials on every
+# port and all of udp/443, and passes other UDP. It does cut a flow whose first
+# packets are a bare WireGuard handshake, which wgtun's junk packets avoid.
+# wgtun exits when no handshake gets through at start (another network, or the
+# firewall learning this), and MASQUE takes over for the session.
+WG_ARGS=(-c "$CONFIG" wgtun --identity "$WG_ID")
+MASQUE_ARGS=("${ARGS[@]}")
+
 # Start usque and wait for its utun to appear and carry our address. Only
 # usque's own announcement names our device: guessing from ifconfig picked up
 # whatever other VPN's utun happened to be last. The log is appended across
@@ -223,10 +253,31 @@ routes_ok() {
     for ip in 44.255.255.1 200.1.1.1; do
         route -n get "$ip" 2>/dev/null | grep -q "interface: $IFACE\$" || return 1
     done
+    # The endpoint pins go when the physical interface loses its address (Wi-Fi
+    # off and on, a new lease, another network). Without them the tunnel's own
+    # packets route into the tunnel. WireGuard never resets its utun, so the
+    # probes above would not notice.
+    for ip in $ENDPOINT_IP ${WG_IP:-}; do
+        route -n get "$ip" 2>/dev/null | grep -q "interface: $IFACE\$" && return 1
+    done
+    return 0
 }
 
+if [ -n "$WG_IP" ]; then
+    MODE=wireguard
+    ARGS=("${WG_ARGS[@]}")
+fi
 launch_usque
-case $? in
+RC=$?
+if [ "$RC" -ne 0 ] && [ "$MODE" = wireguard ]; then
+    log "WireGuard did not come up; using MASQUE"
+    MODE=masque
+    ARGS=("${MASQUE_ARGS[@]}")
+    launch_usque
+    RC=$?
+fi
+log "transport: $MODE"
+case $RC in
     1) log "FATAL usque exited during setup"; exit 1 ;;
     2) log "FATAL tunnel interface never came up"; exit 1 ;;
 esac
@@ -315,6 +366,13 @@ while [ -f "$CONTROL" ]; do
         log "usque exited; restarting (attempt $FAILS), traffic held"
         sleep $((1 << (FAILS - 1)))
         [ -f "$CONTROL" ] || break
+        # wgtun does not exit once it is up, so this was a crash. MASQUE is
+        # the transport that always starts.
+        if [ "${MODE:-}" = wireguard ]; then
+            MODE=masque
+            ARGS=("${MASQUE_ARGS[@]}")
+            log "WireGuard engine exited; continuing over MASQUE"
+        fi
         if launch_usque; then
             point_default -interface "$IFACE"
             log "restarted; default routed through $IFACE"
@@ -328,10 +386,26 @@ while [ -f "$CONTROL" ]; do
     if [ "$RECHECK" -gt 0 ] || [ $((PASS % BACKSTOP)) -eq 0 ]; then
         [ "$RECHECK" -gt 0 ] && RECHECK=$((RECHECK - 1))
         if ! routes_ok; then
-            log "split default lost (now via $(route -n get 200.1.1.1 2>/dev/null | awk '/interface:/{print $2}')); restoring"
-            route -n add -host "$ENDPOINT_IP" "$ORIG_GW" >/dev/null 2>&1
-            point_default -interface "$IFACE"
-            routes_ok || { point_default 127.0.0.1 -blackhole; log "WARN could not restore; traffic held"; }
+            # The physical gateway may be another network's by now. Not
+            # `route get default`: with the split default in place that
+            # answers with the tunnel.
+            GW=$(netstat -rn -f inet | awk '$1 == "default" && $2 ~ /^[0-9.]+$/ { print $2; exit }')
+            if [ -z "$GW" ]; then
+                # No physical link, so nothing to pin to; the split default
+                # keeps traffic in the tunnel meanwhile. One line, not one a pass.
+                [ -z "${NOLINK:-}" ] && log "no physical default route; traffic held until the network is back"
+                NOLINK=1
+            else
+                NOLINK=""
+                ORIG_GW=$GW
+                log "routes lost (probe via $(route -n get 200.1.1.1 2>/dev/null | awk '/interface:/{print $2}'), gateway $ORIG_GW); restoring"
+                for PIN in $ENDPOINT_IP ${WG_IP:-} ${DIRECT_IPS:-}; do
+                    route -n add -host "$PIN" "$ORIG_GW" >/dev/null 2>&1
+                    route -n change -host "$PIN" "$ORIG_GW" >/dev/null 2>&1
+                done
+                point_default -interface "$IFACE"
+                routes_ok || { point_default 127.0.0.1 -blackhole; log "WARN could not restore; traffic held"; }
+            fi
         fi
     fi
     [ $((SECONDS - UP_SINCE)) -ge 60 ] && FAILS=0
