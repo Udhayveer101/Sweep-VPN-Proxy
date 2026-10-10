@@ -227,6 +227,10 @@ func SweepWarpStartGaming(configPath, sni *C.char, tunFd C.int, flowTTLSeconds C
 // Windows.
 func hotStandby(flowTTLSeconds int) bool { return flowTTLSeconds > 0 }
 
+// masquePort is not 443 because this network's firewall proxies every tcp/443
+// flow. Keep in step with WarpController.masquePort on macOS.
+const masquePort = 8443
+
 func start(path, sni string, fd int, flowTTLSeconds int) error {
 	if fd < 0 {
 		return errors.New("no tunnel file descriptor")
@@ -251,7 +255,7 @@ func start(path, sni string, fd int, flowTTLSeconds int) error {
 	if err != nil {
 		return err
 	}
-	endpoint, err := config.SelectEndpointFromConfig(true, false, 443)
+	endpoint, err := config.SelectEndpointFromConfig(true, false, masquePort)
 	if err != nil {
 		return err
 	}

@@ -32,7 +32,7 @@ func TestClassify(t *testing.T) {
 func TestArgsBindLoopbackOnly(t *testing.T) {
 	w := &Warp{Config: "c.json", SNI: "example.com", Port: 1080}
 	a := strings.Join(w.Args(), " ")
-	for _, want := range []string{"http-proxy", "-b 127.0.0.1", "-p 1080", "--always-reconnect", "-k 5s", "--http2", "-s example.com", "-d 1.1.1.1 -d 1.0.0.1"} {
+	for _, want := range []string{"http-proxy", "-b 127.0.0.1", "-p 1080", "--always-reconnect", "-k 5s", "--http2", "-P 8443", "-s example.com", "-d 1.1.1.1 -d 1.0.0.1"} {
 		if !strings.Contains(a, want) {
 			t.Errorf("args %q missing %q", a, want)
 		}

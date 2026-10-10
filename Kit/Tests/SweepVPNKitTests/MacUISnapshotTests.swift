@@ -144,6 +144,58 @@ final class MacUISnapshotTests: XCTestCase {
                                filterExtensionID: model.filterExtensionID).body
     }
 
+    /// The home screen has one Connect button; the gaming switch only picks
+    /// which mode it starts. The test host has no bundled usque, so each mode
+    /// fails to start, and which one failed says which one was asked for.
+    func testConnectFollowsTheGamingSwitch() {
+        let model = makeModel(state: .disconnected, servers: servers())
+        defer { model.setEverythingThroughWarp(false); model.gamingPreferred = false }
+
+        model.gamingPreferred = true
+        model.toggleConnection()
+        XCTAssertTrue(model.gameState.isFailed, "gaming on: Connect must start gaming mode")
+        XCTAssertFalse(model.options.warpEnabled, "gaming mode must not start the proxy's WARP")
+        XCTAssertFalse(model.connectionActive, "a failed start leaves the button on Connect")
+
+        model.gamingPreferred = false
+        model.toggleConnection()
+        XCTAssertEqual(model.gameState, .stopped, "gaming off: Connect must not touch gaming mode")
+        XCTAssertTrue(model.options.warpEnabled, "gaming off: Connect must start WARP for the proxy")
+        XCTAssertTrue(model.options.localProxyEnabled)
+    }
+
+    func testConnectedStatesLockTheModeAndDisconnect() {
+        let model = makeModel(state: .disconnected, servers: servers())
+        model.gameState = .running
+        XCTAssertTrue(model.connectionActive)
+        XCTAssertTrue(model.connectionEstablished)
+        model.gameState = .starting
+        XCTAssertTrue(model.connectionActive)
+        XCTAssertFalse(model.connectionEstablished)
+        model.gameState = .failed("no")
+        XCTAssertFalse(model.connectionActive)
+    }
+
+    func testProxyHomePanelRendersBothModes() throws {
+        let model = makeModel(state: .disconnected, servers: servers())
+        model.warpRegistered = true
+        func shot(_ name: String) throws -> NSImage {
+            try render(ProxyHomePanel(model: model).padding(24)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.black).environment(\.colorScheme, .dark),
+                       size: CGSize(width: 460, height: 420), name: name)
+        }
+        let idle = try shot("proxy-home-idle")
+        model.gameState = .starting
+        _ = try shot("proxy-home-starting")
+        model.gameState = .running
+        let gaming = try shot("proxy-home-gaming")
+        model.gameState = .failed("The WARP tunnel would not start. Check Settings ▸ WARP setup.")
+        _ = try shot("proxy-home-failed")
+        XCTAssertNotEqual(try pixels(of: idle), try pixels(of: gaming),
+                          "the panel does not follow the connection state")
+    }
+
     func testOnboardingRenders() throws {
         let model = makeModel(state: .disconnected, servers: servers())
         try render(OnboardingView(model: model), size: CGSize(width: 460, height: 640), name: "onboarding")

@@ -116,9 +116,16 @@ public final class WarpController: @unchecked Sendable {
     /// is not a cost worth paying for an effect nobody can measure. Gaming mode
     /// keeps it because rotation needs a warm session to rotate *into*.
     /// Re-measure before changing this, don't reason about it.
+    /// The MASQUE endpoint answers on 443, 500, 1701, 4443, 4500, 8095 and
+    /// 8443. Since 2026-10-04 this network's firewall proxies every tcp/443
+    /// flow (routes by SNI, re-signs with its own CA), so 443 can never reach
+    /// the pinned endpoint key. Other ports pass untouched; 8443 measured
+    /// fastest. Keep in step with gamemode.sh, warpmobile/main.go, Windows/warp.go.
+    static let masquePort = "8443"
+
     var arguments: [String] {
         ["-c", configFile.path, "socks",
-         "-s", sni, "--http2",
+         "-s", sni, "--http2", "-P", Self.masquePort,
          "--always-reconnect", "-k", "5s", "--dns-timeout", "15s",
          "-d", "1.1.1.1", "-d", "1.0.0.1",
          "-b", "127.0.0.1", "-p", String(socksPort)]

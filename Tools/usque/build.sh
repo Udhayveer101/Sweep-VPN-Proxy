@@ -3,8 +3,8 @@
 # commit plus the patches in this directory: HTTP/2 PINGs + in-tunnel DNS retry,
 # a 10s bound on the MASQUE dial, ending a session whose HTTP/2 stream closed
 # under a write (see WarpController for why), bounded standby dialling, the
-# darwin TUN framing fix, and session-age logging. Universal so the release runs
-# on Intel too.
+# darwin TUN framing fix, session-age logging, the hop probe (--hop-probe), and the
+# WireGuard transport (wgtun). Universal so the release runs on Intel too.
 #
 # Usage: Tools/usque/build.sh <output-path>
 set -euo pipefail
@@ -21,7 +21,9 @@ git -C "$WORK" -c user.name=ci -c user.email=ci@localhost am -q \
   "$HERE/masque-keepalive.patch" "$HERE/masque-handshake-timeout.patch" "$HERE/masque-closed-pipe.patch" \
     "$HERE/flow-standby-rotation.patch" "$HERE/darwin-tun-framing.patch" \
     "$HERE/standby-backoff.patch" \
-    "$HERE/standby-age-log.patch"
+    "$HERE/standby-age-log.patch" \
+    "$HERE/hop-probe.patch" \
+    "$HERE/wgtun.patch"
 
 for ARCH in arm64 amd64; do
   (cd "$WORK" && CGO_ENABLED=0 GOOS=darwin GOARCH=$ARCH go build -trimpath -ldflags "-s -w" -o "usque-$ARCH" .)

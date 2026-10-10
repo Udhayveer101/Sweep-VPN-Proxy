@@ -76,7 +76,8 @@ var (
 // Args mirrors WarpController.arguments; the comments there record why each
 // flag exists (measured on this ISP, 2026-09-12..14).
 func (w *Warp) Args() []string {
-	common := []string{"-s", w.SNI, "--http2", "--always-reconnect", "-k", "5s"}
+	// -P 8443: the firewall proxies every tcp/443 flow (WarpController.masquePort).
+	common := []string{"-s", w.SNI, "--http2", "-P", "8443", "--always-reconnect", "-k", "5s"}
 
 	if !w.Game {
 		// socks/http-proxy resolve in-process, so they take the resolver flags.

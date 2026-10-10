@@ -132,5 +132,62 @@ final class UpdateCheckerTests: XCTestCase {
         XCTAssertFalse(UpdateChecker.isNewer("1.4.0", than: "1.4"))
         XCTAssertFalse(UpdateChecker.isNewer("1.3.0", than: "1.3.0"))
     }
+
+    // MARK: - Replacing the running app
+
+    private func fakeBundle(_ dir: URL, _ name: String, marker: String) throws -> URL {
+        let app = dir.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        try marker.write(to: app.appendingPathComponent("marker"), atomically: true, encoding: .utf8)
+        return app
+    }
+
+    /// The swap must wait for the old process, leave exactly one bundle at the
+    /// original path holding the new contents, and hand that path to the opener.
+    func testSwapReplacesTheBundleOnceTheAppExits() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let bundle = try fakeBundle(dir, "Sweep VPN.app", marker: "old")
+        let staged = try fakeBundle(dir, UpdateChecker.stagingURL(for: bundle).lastPathComponent, marker: "new")
+
+        let app = Process()
+        app.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        app.arguments = ["1"]
+        try app.run()
+        let swap = try UpdateChecker.swapAfterExit(staged: staged, bundle: bundle,
+                                                   pid: app.processIdentifier, opener: "/usr/bin/touch")
+        usleep(300_000)
+        XCTAssertEqual(try String(contentsOf: bundle.appendingPathComponent("marker")), "old",
+                       "swapped while the app was still running")
+        swap.waitUntilExit()
+
+        XCTAssertEqual(swap.terminationStatus, 0)
+        XCTAssertEqual(try String(contentsOf: bundle.appendingPathComponent("marker")), "new")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), ["Sweep VPN.app"])
+    }
+
+    /// A copy that cannot write its own folder falls back to the DMG rather
+    /// than failing: `stage` answers nil before it touches the image.
+    func testStageDeclinesWhereItCannotWrite() throws {
+        let checker = UpdateChecker(current: "1.0.0", session: session(), defaults: defaults())
+        let dmg = URL(fileURLWithPath: "/nonexistent.dmg")
+        XCTAssertNil(try checker.stage(dmg, replacing: URL(fileURLWithPath: "/System/Applications/Mail.app")))
+        XCTAssertNil(try checker.stage(dmg, replacing: URL(fileURLWithPath:
+            "/private/var/folders/x/AppTranslocation/y/d/Sweep VPN.app")))
+    }
+
+    /// Against a real release image: `SWEEP_DMG=build/release/SweepVPN-X.dmg`.
+    func testStagesARealRelease() throws {
+        guard let path = ProcessInfo.processInfo.environment["SWEEP_DMG"] else {
+            throw XCTSkip("set SWEEP_DMG to a notarised release image")
+        }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let bundle = try fakeBundle(dir, "Sweep VPN.app", marker: "old")
+        let checker = UpdateChecker(current: "1.0.0", session: session(), defaults: defaults())
+        let staged = try XCTUnwrap(try checker.stage(URL(fileURLWithPath: path), replacing: bundle))
+        XCTAssertTrue(UpdateChecker.signedByUs(staged))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: staged.appendingPathComponent("Contents/MacOS").path))
+    }
 }
 #endif

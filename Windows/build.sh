@@ -16,8 +16,16 @@ git -C "$WORK" checkout -q FETCH_HEAD
 git -C "$WORK" -c user.name=ci -c user.email=ci@localhost am -q \
   "$PATCHES/masque-keepalive.patch" "$PATCHES/masque-handshake-timeout.patch" "$PATCHES/masque-closed-pipe.patch" \
   "$PATCHES/flow-standby-rotation.patch" "$PATCHES/darwin-tun-framing.patch" \
-  "$PATCHES/standby-backoff.patch" "$PATCHES/standby-age-log.patch"
+  "$PATCHES/standby-backoff.patch" "$PATCHES/standby-age-log.patch" \
+    "$PATCHES/hop-probe.patch" \
+    "$PATCHES/wgtun.patch"
 (cd "$WORK" && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o "$HERE/usque.exe" .)
+
+# usque's TUN (gaming mode) loads wintun.dll from beside its own exe.
+curl -fsSLo "$WORK/wintun.zip" https://www.wintun.net/builds/wintun-0.14.1.zip
+echo "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51  $WORK/wintun.zip" | \
+  (shasum -a 256 -c - 2>/dev/null || sha256sum -c -)
+unzip -p "$WORK/wintun.zip" wintun/bin/amd64/wintun.dll > "$HERE/wintun.dll"
 
 mkdir -p "$HERE/dist"
 OUT="$HERE/dist/SweepVPN-$VERSION-windows-x64.exe"

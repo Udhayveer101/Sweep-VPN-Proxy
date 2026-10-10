@@ -20,6 +20,12 @@ import (
 //go:embed usque.exe
 var usqueBinary []byte
 
+// wintun.dll (fetched by build.sh) must sit beside usque.exe: gaming mode's
+// TUN device cannot be created without it.
+//
+//go:embed wintun.dll
+var wintunDLL []byte
+
 var version = "dev"
 
 const proxyPort = 1080
@@ -153,6 +159,12 @@ func newApp() (*app, error) {
 	if fi, err := os.Stat(a.usque); err != nil || fi.Size() != int64(len(usqueBinary)) {
 		if err := os.WriteFile(a.usque, usqueBinary, 0o700); err != nil {
 			return nil, fmt.Errorf("could not unpack WARP: %w", err)
+		}
+	}
+	dll := filepath.Join(a.dataDir, "wintun.dll")
+	if fi, err := os.Stat(dll); err != nil || fi.Size() != int64(len(wintunDLL)) {
+		if err := os.WriteFile(dll, wintunDLL, 0o600); err != nil {
+			return nil, fmt.Errorf("could not unpack wintun: %w", err)
 		}
 	}
 	a.warp = &Warp{Exe: a.usque, Config: a.config, SNI: a.sni(), Port: proxyPort, Log: a.log, OnState: a.onWarpState}

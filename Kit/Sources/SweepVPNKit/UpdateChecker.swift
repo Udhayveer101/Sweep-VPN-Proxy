@@ -9,7 +9,7 @@ import CoreServices
 /// Deliberately small: there is no appcast to host, no signing key to manage
 /// beyond the Developer ID the DMG already carries, and no background daemon.
 /// The releases API is the feed, the published `.sha256` is the integrity
-/// check, and the notarised DMG is the installer.
+/// check, and the app inside the notarised DMG replaces the running one.
 public struct UpdateChecker: @unchecked Sendable {
 
     public struct Update: Sendable, Equatable {
@@ -187,10 +187,6 @@ public struct UpdateChecker: @unchecked Sendable {
         return hex
     }
 
-    /// Mount the DMG and put it in front of the user. Replacing a running,
-    /// signed app bundle from inside itself - while a tunnel may be up - buys
-    /// one less drag at the cost of the riskiest code in the app, so we stop
-    /// here.
     static func signedByUs(_ app: URL) -> Bool {
         let check = Process()
         check.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
@@ -204,7 +200,21 @@ public struct UpdateChecker: @unchecked Sendable {
         return check.terminationStatus == 0
     }
 
-    public func reveal(_ dmg: URL) throws {
+    @discardableResult
+    private static func run(_ tool: String, _ arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return -1 }
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    /// Attaches the DMG and returns its mount point and the app inside,
+    /// detaching again if anything on it is not signed by us.
+    private func mountVerified(_ dmg: URL) throws -> (mount: String, app: URL) {
         let attach = Process()
         attach.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
         attach.arguments = ["attach", "-nobrowse", "-noverify", dmg.path]
@@ -224,20 +234,95 @@ public struct UpdateChecker: @unchecked Sendable {
             }.last
 
         guard let mount else { throw UpdateError.transport }
-        let apps = (try? FileManager.default.contentsOfDirectory(atPath: mount))?
-            .filter { $0.hasSuffix(".app") } ?? []
-        guard !apps.isEmpty, apps.allSatisfy({ Self.signedByUs(URL(fileURLWithPath: mount).appendingPathComponent($0)) }) else {
-            let detach = Process()
-            detach.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-            detach.arguments = ["detach", "-quiet", mount]
-            try? detach.run()
+        let apps = ((try? FileManager.default.contentsOfDirectory(atPath: mount)) ?? [])
+            .filter { $0.hasSuffix(".app") }
+            .map { URL(fileURLWithPath: mount).appendingPathComponent($0) }
+        guard let app = apps.first, apps.allSatisfy(Self.signedByUs) else {
+            Self.run("/usr/bin/hdiutil", ["detach", "-quiet", mount])
             throw UpdateError.untrustedSignature
         }
+        return (mount, app)
+    }
 
+    /// The fallback installer: mount the DMG and put it in front of the user.
+    public func reveal(_ dmg: URL) throws {
+        let (mount, _) = try mountVerified(dmg)
         let open = Process()
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         open.arguments = [mount]
         try open.run()
+    }
+
+    // MARK: - Replacing the running app
+
+    /// Where the verified copy waits for the running app to quit. A sibling of
+    /// the bundle, so the swap is a rename within one volume.
+    static func stagingURL(for bundle: URL) -> URL {
+        let name = bundle.deletingPathExtension().lastPathComponent
+        return bundle.deletingLastPathComponent().appendingPathComponent(".\(name).update.app")
+    }
+
+    /// Copies the app out of the DMG to sit beside the running bundle, ready
+    /// for `swapAfterExit`. `nil` means this copy cannot replace itself - it is
+    /// running translocated or from a folder the user cannot write - and the
+    /// caller should fall back to `reveal`.
+    ///
+    /// The copy is checked twice: our team signed it, and Gatekeeper accepts
+    /// it (notarised). Only then is the quarantine flag removed, which is what
+    /// lets it relaunch without a "downloaded from the internet" prompt.
+    public func stage(_ dmg: URL, replacing bundle: URL = Bundle.main.bundleURL) throws -> URL? {
+        let fm = FileManager.default
+        guard bundle.pathExtension == "app", !bundle.path.contains("/AppTranslocation/"),
+              fm.isWritableFile(atPath: bundle.deletingLastPathComponent().path) else { return nil }
+        let (mount, app) = try mountVerified(dmg)
+        defer { Self.run("/usr/bin/hdiutil", ["detach", "-quiet", mount]) }
+
+        let staged = Self.stagingURL(for: bundle)
+        try? fm.removeItem(at: staged)
+        guard Self.run("/usr/bin/ditto", [app.path, staged.path]) == 0,
+              Self.signedByUs(staged),
+              Self.run("/usr/sbin/spctl", ["--assess", "--type", "execute", staged.path]) == 0
+        else {
+            try? fm.removeItem(at: staged)
+            throw UpdateError.untrustedSignature
+        }
+        Self.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", staged.path])
+        return staged
+    }
+
+    /// Waits for the app to exit, renames the old bundle aside, renames the
+    /// staged one into place and relaunches. A failed second rename puts the
+    /// old bundle back, so there is always an app at the path. Gives up after
+    /// a minute if the app never quits.
+    static let swapScript = #"""
+        pid=$1 cur=$2 new=$3 old="$2.old" n=0
+        while kill -0 "$pid" 2>/dev/null; do
+          n=$((n+1)); [ $n -gt 300 ] && { rm -rf "$new"; exit 1; }
+          sleep 0.2
+        done
+        rm -rf "$old"
+        if mv "$cur" "$old"; then
+          if mv "$new" "$cur"; then rm -rf "$old"; else mv "$old" "$cur"; fi
+        fi
+        rm -rf "$new"
+        exec "$4" "$cur"
+        """#
+
+    /// Starts the shell that performs the swap once `pid` is gone. The caller
+    /// then quits normally, so the usual quit-time cleanup (system proxy,
+    /// gaming-mode routes) runs before the bundle is touched.
+    @discardableResult
+    public static func swapAfterExit(staged: URL, bundle: URL = Bundle.main.bundleURL,
+                                     pid: Int32 = ProcessInfo.processInfo.processIdentifier,
+                                     opener: String = "/usr/bin/open") throws -> Process {
+        let swap = Process()
+        swap.executableURL = URL(fileURLWithPath: "/bin/sh")
+        swap.arguments = ["-c", swapScript, "sh", String(pid), bundle.path, staged.path, opener]
+        swap.standardInput = FileHandle.nullDevice
+        swap.standardOutput = FileHandle.nullDevice
+        swap.standardError = FileHandle.nullDevice
+        try swap.run()
+        return swap
     }
 }
 

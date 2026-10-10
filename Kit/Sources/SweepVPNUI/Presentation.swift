@@ -114,9 +114,9 @@ public extension Presentation.Quality {
     /// Colour used for latency figures in the server list.
     var tint: Color {
         switch self {
-        case .good: return .green
-        case .fair: return .orange
-        case .weak: return .red
+        case .good: return Midnight.good
+        case .fair: return Midnight.warning
+        case .weak: return Midnight.danger
         }
     }
 }
@@ -125,9 +125,9 @@ public extension Presentation.Tint {
     var color: Color {
         switch self {
         case .neutral: return Color.secondary
-        case .good: return Color.green
-        case .warning: return Color.orange
-        case .danger: return Color.red
+        case .good: return Midnight.good
+        case .warning: return Midnight.warning
+        case .danger: return Midnight.danger
         }
     }
 }

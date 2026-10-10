@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the Developer ID release: archive the proxy-only app, bundle tor and the
-# patched usque (Apple Silicon only: the OpenVPN slice is arm64), sign everything with a secure timestamp, notarize, staple, and
+# patched usque (universal: Apple Silicon and Intel), sign everything with a secure timestamp, notarize, staple, and
 # wrap it in a DMG. The same script runs locally and in .github/workflows.
 #
 # Env:
@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 : "${VERSION:?set VERSION}"
 : "${TEAM_ID:?set TEAM_ID}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
-OUT="build/release"
+OUT="${OUT:-build/release}"
 ARCHIVE="$OUT/Sweep.xcarchive"
 rm -rf "$OUT" && mkdir -p "$OUT"
 
@@ -40,7 +40,7 @@ xcodegen generate
 xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-macOS-Direct -configuration Release \
   -destination 'generic/platform=macOS' -archivePath "$ARCHIVE" archive \
   CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$IDENTITY" DEVELOPMENT_TEAM="$TEAM_ID" \
-  OTHER_CODE_SIGN_FLAGS=--timestamp ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+  OTHER_CODE_SIGN_FLAGS=--timestamp ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
   MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" | tail -5
 
 APP="$ARCHIVE/Products/Applications/Sweep VPN.app"
@@ -65,14 +65,14 @@ notarize() {
   local sid="" status=""
   for i in 1 2 3; do
     sid=$(xcrun notarytool submit "$1" "${AUTH[@]}" --output-format json 2>/dev/null \
-      | sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' | head -1)
+      | sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' | head -1) || true
     [ -n "$sid" ] && break; sleep 15
   done
   [ -n "$sid" ] || { echo "notarization upload failed" >&2; exit 1; }
   echo "notary submission $sid"
   for _ in $(seq 1 60); do
     status=$(xcrun notarytool info "$sid" "${AUTH[@]}" --output-format json 2>/dev/null \
-      | sed -n 's/.*"status" *: *"\([^"]*\)".*/\1/p' | head -1)
+      | sed -n 's/.*"status" *: *"\([^"]*\)".*/\1/p' | head -1) || true
     case "$status" in Accepted|Invalid|Rejected) break;; esac
     sleep 30
   done

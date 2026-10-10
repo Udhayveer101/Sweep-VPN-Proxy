@@ -7,6 +7,7 @@ public struct SettingsView: View {
     @ObservedObject var model: VPNViewModel
     @Environment(\.dismiss) private var dismiss
     @State private var diagnostics = ""
+    @State private var showsAdvancedProxy = false
 
     public init(model: VPNViewModel) { self.model = model }
 
@@ -32,7 +33,7 @@ public struct SettingsView: View {
                         .disabled(!model.warpRegistered)
                     if let status = model.warpStatusText {
                         Text(status).font(.footnote)
-                            .foregroundStyle(model.warpState.isFailed ? .red : .secondary)
+                            .foregroundStyle(model.warpState.isFailed ? Midnight.danger : .secondary)
                             .textSelection(.enabled)
                     }
                     TextField("WARP SNI", text: Binding(
@@ -115,96 +116,64 @@ public struct SettingsView: View {
                 }
                 #endif
                 #if os(macOS)
-                Section("Gaming") {
-                    Toggle("Gaming mode", isOn: Binding(
-                        get: { model.gameState != .stopped },
-                        set: { model.setGameMode(enabled: $0) }))
-                        .disabled(!model.warpRegistered)
-                    if let status = model.gameStatusText {
-                        Text(status).font(.footnote)
-                            .foregroundStyle(model.gameState.isFailed ? .red : .secondary)
-                            .textSelection(.enabled)
-                    }
-                    Picker("Disguise", selection: Binding(
-                        get: { model.gameDisguise },
-                        set: { model.gameDisguise = $0 })) {
-                            ForEach(GameModeController.Disguise.allCases, id: \.self) {
-                                Text($0.title).tag($0)
-                            }
+                // Connect and the gaming switch live on the home screen. What
+                // is left here is for pointing one app at the proxy by hand.
+                Section {
+                    DisclosureGroup("Advanced proxy", isExpanded: $showsAdvancedProxy) {
+                        Toggle("WARP", isOn: Binding(
+                            get: { model.options.warpEnabled },
+                            set: { model.setWarp(enabled: $0) }))
+                        if let status = model.warpStatusText {
+                            Text(status).font(.footnote)
+                                .foregroundStyle(model.warpState.isFailed ? Midnight.danger : .secondary)
+                                .textSelection(.enabled)
                         }
-                        .disabled(model.gameState != .stopped)
-                    Text("Routes the whole Mac, games included, through WARP at the packet level, so traffic games send over UDP is carried too — the proxy modes above cannot do that. Needs your admin password, and turns the proxy modes off while it runs. Reconnecting on drops rebuilds the tunnel each time the network drops it, in about a second, and is the right choice for games. Rotating flows retires each tunnel before the network can drop it, but measured cost is a stall every minute or two — fine for downloads, bad for a game. Change the disguise with gaming mode off.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-
-                Section("Proxy") {
-                    Toggle("Route this whole Mac through WARP", isOn: Binding(
-                        get: { model.systemProxyEnabled },
-                        set: { model.setEverythingThroughWarp($0) }))
-                    if let why = model.systemProxyError {
-                        Text(why).font(.footnote).foregroundStyle(.red).textSelection(.enabled)
-                    }
-                    Text("Starts WARP, starts the local proxy, and sets the Mac's system SOCKS proxy to it — macOS asks for your password each way. Turn it off before quitting Sweep; the app also undoes it on quit, because a system proxy with nothing behind it takes the Mac offline. Apps that ignore the system proxy setting are unaffected, and DNS lookups still go out normally.")
-                        .font(.footnote).foregroundStyle(.secondary)
-
-                    Toggle("WARP (Cloudflare, disguised)", isOn: Binding(
-                        get: { model.options.warpEnabled },
-                        set: { model.setWarp(enabled: $0) }))
-                    if let status = model.warpStatusText {
-                        Text(status).font(.footnote)
-                            .foregroundStyle(model.warpState.isFailed ? .red : .secondary)
-                            .textSelection(.enabled)
-                    }
-                    TextField("WARP SNI", text: Binding(
-                        get: { model.options.warpSNI },
-                        set: {
-                            var o = model.options
-                            o.warpSNI = $0.trimmingCharacters(in: .whitespaces)
-                            model.apply(options: o)
-                        }))
-                        .font(.system(.footnote, design: .monospaced))
-                        .disabled(model.options.warpEnabled)
-                    Text("Sends the local proxy's traffic to Cloudflare WARP inside HTTPS that names an ordinary site, which the network filter lets through. Turn on Local proxy and point a browser at it. Replaces Tor while on. Change the SNI with WARP off.")
-                        .font(.footnote).foregroundStyle(.secondary)
-
-                    Toggle("Local proxy", isOn: Binding(
-                        get: { model.options.localProxyEnabled },
-                        set: { model.setLocalProxy(enabled: $0) }))
-                    if case .listening(let port) = model.proxyState {
-                        // `\(port)` on its own renders as "1,080" — SwiftUI
-                        // gives an Int the locale's grouping separator, which
-                        // in a port number reads as a typo.
-                        Text("SOCKS5 and HTTP CONNECT on 127.0.0.1:\(String(port)) → \(model.proxyUpstreamLabel)")
+                        TextField("WARP SNI", text: Binding(
+                            get: { model.options.warpSNI },
+                            set: {
+                                var o = model.options
+                                o.warpSNI = $0.trimmingCharacters(in: .whitespaces)
+                                model.apply(options: o)
+                            }))
+                            .font(.system(.footnote, design: .monospaced))
+                            .disabled(model.options.warpEnabled)
+                        Text("The site name WARP's HTTPS shows the network. Change it with WARP off.")
                             .font(.footnote).foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                    } else if case .failed(let why) = model.proxyState {
-                        Text(why).font(.footnote).foregroundStyle(.red)
+
+                        Toggle("Local proxy", isOn: Binding(
+                            get: { model.options.localProxyEnabled },
+                            set: { model.setLocalProxy(enabled: $0) }))
+                        if case .listening(let port) = model.proxyState {
+                            // `\(port)` on its own renders as "1,080" — SwiftUI
+                            // gives an Int the locale's grouping separator, which
+                            // in a port number reads as a typo.
+                            Text("SOCKS5 and HTTP CONNECT on 127.0.0.1:\(String(port)) → \(model.proxyUpstreamLabel)")
+                                .font(.footnote).foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        } else if case .failed(let why) = model.proxyState {
+                            Text(why).font(.footnote).foregroundStyle(Midnight.danger)
+                        }
+                        Toggle("Route proxy through Worker", isOn: Binding(
+                            get: { model.options.proxyThroughWorker },
+                            set: { model.setProxyThroughWorker($0) }))
+                            .disabled(!model.options.localProxyEnabled)
+                        Text("Point one app at the local proxy to send only that app through WARP or your Cloudflare Worker. It listens on this Mac only.")
+                            .font(.footnote).foregroundStyle(.secondary)
+
+                        TextField("Tor bridge lines (one per line, optional)",
+                                  text: Binding(
+                                    get: { model.options.torBridges.joined(separator: "\n") },
+                                    set: {
+                                        var o = model.options
+                                        o.torBridges = $0.split(separator: "\n")
+                                            .map { String($0).trimmingCharacters(in: .whitespaces) }
+                                            .filter { !$0.isEmpty }
+                                        model.apply(options: o)
+                                    }),
+                                  axis: .vertical)
+                            .lineLimit(2...6)
+                            .font(.system(.footnote, design: .monospaced))
                     }
-                    Toggle("Route proxy through Worker", isOn: Binding(
-                        get: { model.options.proxyThroughWorker },
-                        set: { model.setProxyThroughWorker($0) }))
-                        .disabled(!model.options.localProxyEnabled)
-                    Text("Each connection travels inside HTTPS to your Cloudflare Worker, which dials the site for you. No VPN profile needed.")
-                        .font(.footnote).foregroundStyle(.secondary)
-
-                    Text("Point an individual app at this proxy to send only that app through the tunnel — or through Tor when Tor is on. It listens on this Mac only.")
-                        .font(.footnote).foregroundStyle(.secondary)
-
-                    TextField("Bridge lines (one per line, optional)",
-                              text: Binding(
-                                get: { model.options.torBridges.joined(separator: "\n") },
-                                set: {
-                                    var o = model.options
-                                    o.torBridges = $0.split(separator: "\n")
-                                        .map { String($0).trimmingCharacters(in: .whitespaces) }
-                                        .filter { !$0.isEmpty }
-                                    model.apply(options: o)
-                                }),
-                              axis: .vertical)
-                        .lineLimit(2...6)
-                        .font(.system(.footnote, design: .monospaced))
-                    Text("Only needed if Tor is blocked and the VPN is not carrying it. Get bridges from bridges.torproject.org — the bridges shipped with Tor Browser are public and widely blocked.")
-                        .font(.footnote).foregroundStyle(.secondary)
                 }
                 if showsVPNSettings {
                 MacSettingsSection(model: model,
@@ -242,13 +211,14 @@ public struct SettingsView: View {
                         // release publishes before the disk image is opened.
                         Text("Downloading and verifying…").font(.footnote).foregroundStyle(.secondary)
                     case .failed(let why):
-                        Text(why).font(.footnote).foregroundStyle(.red)
+                        Text(why).font(.footnote).foregroundStyle(Midnight.danger)
                     case .idle:
                         EmptyView()
                     }
                 }
                 #endif
                 Section("Diagnostics") {
+                    Button("View connection log") { model.activeSheet = .connectionLog }
                     Button("Export diagnostics") {
                         Task { diagnostics = await model.exportDiagnostics() }
                     }
