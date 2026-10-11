@@ -114,4 +114,31 @@ RESTART=$(
 WANT=$'default:127.0.0.1 -blackhole\nlaunch:nativetun:masque\ndefault:-interface utun9'
 [ "$RESTART" = "$WANT" ] || {
     echo "FAIL: after the WireGuard engine exits, expected a held MASQUE restart, got:"; echo "$RESTART"; exit 1; } >&2
+# The start must not wait on the system resolver, and must stop when the app
+# withdraws the control file before the tunnel is up. dscacheutil hung 30s on a
+# dead DNS-over-TLS connection, and a start cancelled during that wait carried
+# on and took down the routes of the one that replaced it.
+sed -n '/^# --- direct hosts/,/^# --- end direct hosts/p' "$SCRIPT" > "$TMP/direct.sh"
+[ -s "$TMP/direct.sh" ] || { echo "FAIL: direct hosts markers not found in $SCRIPT" >&2; exit 1; }
+BAIL=$(grep -E '^bail_if_stopped\(\) ' "$SCRIPT") || { echo "FAIL: bail_if_stopped not found in $SCRIPT" >&2; exit 1; }
+direct_run() {   # $1: 1 to leave the control file in place
+    (
+        set +e
+        CONFIG="$TMP/config.json"; CONTROL="$TMP/direct.control"; ORIG_GW=192.0.2.254; DIRECT_IPS=""
+        rm -f "$CONTROL"; [ "$1" = 1 ] && : > "$CONTROL"
+        log() { echo "log:$*"; }
+        eval "$BAIL"
+        dscacheutil() { echo "dscacheutil called"; }
+        dig() { echo 192.0.2.7; }
+        nc() { return 0; }; route() { return 0; }
+        . "$TMP/direct.sh"
+        echo "went on:$DIRECT_IPS"
+    )
+}
+OUT=$(direct_run 1)
+WANT=$'log:direct: mc.hypixel.net 192.0.2.7:25565 reachable, kept off the tunnel\nwent on: 192.0.2.7'
+[ "$OUT" = "$WANT" ] || { echo "FAIL: direct-host probe, expected a dig-only lookup, got:"; echo "$OUT"; exit 1; } >&2
+OUT=$(direct_run 0 | tail -1)
+[ "$OUT" = "log:control file withdrawn during start" ] || {
+    echo "FAIL: with the control file gone the start must end before the tunnel, got: $OUT" >&2; exit 1; }
 echo "gamemode.sh checks passed"

@@ -128,14 +128,22 @@ if [ -z "$ORIG_GW" ]; then
 fi
 log "gateway $ORIG_GW via $ORIG_IF"
 
-# The MASQUE endpoint must stay reachable over the physical link, or the
-# tunnel's own packets would route into the tunnel.
-route -n add -host "$ENDPOINT_IP" "$ORIG_GW" >/dev/null 2>&1
-log "pinned $ENDPOINT_IP via $ORIG_GW"
-if [ -n "$WG_IP" ]; then
-    route -n add -host "$WG_IP" "$ORIG_GW" >/dev/null 2>&1
-    log "pinned $WG_IP via $ORIG_GW"
-fi
+# The hold loop is where a stop is normally seen, but the start below can take
+# seconds, and the app may withdraw the control file meanwhile (the user pressed
+# Disconnect, or Connect twice). Carrying on brought the tunnel up for a moment
+# and, when a second start was already running, deleted the pins that one
+# depended on: "FATAL could not route" (2026-10-11).
+bail_if_stopped() { [ -f "$CONTROL" ] || { log "control file withdrawn during start"; exit 0; }; }
+bail_if_stopped
+
+# The endpoints must stay reachable over the physical link, or the tunnel's own
+# packets would route into the tunnel.
+pin_endpoints() {
+    local ip
+    for ip in $ENDPOINT_IP ${WG_IP:-}; do route -n add -host "$ip" "$ORIG_GW" >/dev/null 2>&1; done
+}
+pin_endpoints
+log "pinned $ENDPOINT_IP${WG_IP:+ $WG_IP} via $ORIG_GW"
 
 # Game servers the network already lets through stay off the tunnel. This
 # school's Sophos gateway lets mc.hypixel.net:25565 through directly on both
@@ -144,6 +152,12 @@ fi
 # connection inside it. Only a host that answers a direct TCP connect *now*,
 # before the tunnel takes the default route, is excluded; blocked games still
 # go through WARP. Extra hosts: one per line in direct-hosts next to config.json.
+# Both lookups are dig, which gives up after 2s a server. Not dscacheutil: macOS
+# may carry the system's DNS over one long-lived TLS connection, an uplink
+# switch or a tunnel that just stopped leaves that connection dead, and
+# dscacheutil then waits 30s for it (measured 2026-10-11: 14 queries sent, none
+# answered, and gaming mode sat at "starting" for 30s on three starts in a row).
+# --- direct hosts (Tools/test-gamemode.sh runs from here to the matching end) ---
 DIRECT_HOSTS="mc.hypixel.net:25565"
 DIRECT_FILE="$(dirname "$CONFIG")/direct-hosts"
 if [ -f "$DIRECT_FILE" ] && [ ! -L "$DIRECT_FILE" ]; then
@@ -151,9 +165,9 @@ if [ -f "$DIRECT_FILE" ] && [ ! -L "$DIRECT_FILE" ]; then
 fi
 for ENTRY in $DIRECT_HOSTS; do
     HOST=${ENTRY%%:*}; PORT=${ENTRY#*:}; [ "$PORT" = "$ENTRY" ] && PORT=25565
-    # Both the school resolver and 1.1.1.1 (what the game will ask once DNS is
-    # pinned below) - they can disagree for anycast hosts.
-    IPS=$( { dscacheutil -q host -a name "$HOST" | awk '/^ip_address:/{print $2}'
+    # Both the network's resolver and 1.1.1.1 (what the game will ask once DNS
+    # is pinned below) - they can disagree for anycast hosts.
+    IPS=$( { dig +short +time=2 +tries=1 A "$HOST"
              dig +short +time=2 +tries=1 A "$HOST" @1.1.1.1; } 2>/dev/null |
            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
     for ip in $IPS; do
@@ -165,6 +179,8 @@ for ENTRY in $DIRECT_HOSTS; do
         fi
     done
 done
+bail_if_stopped
+# --- end direct hosts ---
 
 # IPv4 only, deliberately: with IPv6 inside the tunnel every new MASQUE session
 # hands out a different public address, so a rotation or reconnect changes the
@@ -288,6 +304,10 @@ log "tunnel $IFACE addr $TUN_ADDR"
 # Two halves instead of replacing the default route: they beat the existing
 # default on longest-prefix match, so the original stays intact and teardown is
 # a delete rather than a restore.
+# Pin again first: a run the app stopped a moment ago deletes the same pins on
+# its way out, and may have done so since we added ours.
+bail_if_stopped
+pin_endpoints
 point_default -interface "$IFACE"
 if routes_ok; then
     log "default routed through $IFACE"
