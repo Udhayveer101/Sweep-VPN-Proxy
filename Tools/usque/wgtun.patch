@@ -1,4 +1,4 @@
-From bab60fa55a3b3fa6874c5740f31bfbddd4071337 Mon Sep 17 00:00:00 2001
+From b01fb5fb179033856329c59c29354d7fd0076ac9 Mon Sep 17 00:00:00 2001
 From: Udhayveer Singh <udhayveersingh@Udhayveer.local>
 Date: Sun, 11 Oct 2026 00:49:30 +0530
 Subject: [PATCH] Carry the tunnel over WireGuard so it survives a change of
@@ -25,20 +25,20 @@ caller's routes with it.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- api/wgbind.go       | 164 ++++++++++++++++++++++++++++
- api/wgbind_test.go  | 167 ++++++++++++++++++++++++++++
- cmd/wgtun_darwin.go | 259 ++++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 590 insertions(+)
+ api/wgbind.go       | 200 +++++++++++++++++++++++++++++++++
+ api/wgbind_test.go  | 208 +++++++++++++++++++++++++++++++++++
+ cmd/wgtun_darwin.go | 261 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 669 insertions(+)
  create mode 100644 api/wgbind.go
  create mode 100644 api/wgbind_test.go
  create mode 100644 cmd/wgtun_darwin.go
 
 diff --git a/api/wgbind.go b/api/wgbind.go
 new file mode 100644
-index 0000000..b73c3a4
+index 0000000..908fd51
 --- /dev/null
 +++ b/api/wgbind.go
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,200 @@
 +package api
 +
 +import (
@@ -147,9 +147,22 @@ index 0000000..b73c3a4
 +	WgNewSession          // a new handshake, on a new socket
 +)
 +
++// WgReadings is how many readings a second WgWatch.Step expects.
++const WgReadings = 4
++
 +const (
-+	wgStallWindow = 3 // readings: traffic out and nothing back for this long is a dead path
-+	// Bytes that must have left in the window. Above what persistent keepalives
++	// A dead path: nothing came back for wgQuiet readings, though wgStallMinTx
++	// bytes had left before the last wgWait of them, so a reply had time to
++	// arrive. Without the wait, a request sent just before a reading on an
++	// idle tunnel counted as a stall (40 needless moves in one idle night).
++	wgQuiet, wgWait = 3 * WgReadings, WgReadings
++	// The same on a busy tunnel, where it shows sooner: inbound in every one
++	// of wgSteady readings, then none. The gateway this is built for drops
++	// the tunnel's flow in mid-stream about twice an hour (measured
++	// 2026-10-11): inbound goes from tens of kB/s to nothing between two
++	// readings, and the wait for it is the whole outage.
++	wgFastQuiet, wgFastWait, wgSteady = WgReadings, WgReadings / 2, 2 * WgReadings
++	// Bytes that must have left unanswered. Above what persistent keepalives
 +	// alone send (32 bytes every few seconds, never answered), so an idle
 +	// tunnel is not a stall.
 +	wgStallMinTx = 2 * wgInitiationSize
@@ -163,24 +176,45 @@ index 0000000..b73c3a4
 +	wgActPause    = 5 * time.Second
 +)
 +
-+// WgWatch decides, from one reading a second, whether the tunnel's path has
-+// died. WireGuard's own answer to a dead path is to wait 15s and retry the
-+// handshake from the same socket, which cannot work when it is that socket's
-+// flow the network dropped.
++// WgWatch decides, from WgReadings readings a second, whether the tunnel's
++// path has died. WireGuard's own answer to a dead path is to wait 15s and
++// retry the handshake from the same socket, which cannot work when it is that
++// socket's flow the network dropped.
 +type WgWatch struct {
-+	window [wgStallWindow + 1]WgCounters
++	// Quiet is how long nothing had come back when Step last asked for a new socket.
++	Quiet time.Duration
++
++	window [wgQuiet + 1]WgCounters
 +	n      int
 +	last   time.Time
 +}
 +
++// ago is the reading k steps before the newest.
++func (w *WgWatch) ago(k int) WgCounters {
++	return w.window[(w.n-1-k+2*len(w.window))%len(w.window)]
++}
++
++// silent: nothing in for q readings, though enough had left before the last wait of them.
++func (w *WgWatch) silent(q, wait int) bool {
++	return w.ago(0).Rx == w.ago(q).Rx && w.ago(wait).Tx-w.ago(q).Tx >= wgStallMinTx
++}
++
++// steady: inbound in every one of the wgSteady readings before the last wgFastQuiet.
++func (w *WgWatch) steady() bool {
++	for k := wgFastQuiet; k < wgFastQuiet+wgSteady; k++ {
++		if w.ago(k).Rx == w.ago(k+1).Rx {
++			return false
++		}
++	}
++	return true
++}
++
 +func (w *WgWatch) Step(now WgCounters, wall time.Time) WgAction {
-+	old := w.window[(w.n+1)%len(w.window)]
-+	if w.n == 0 || now.Tx < old.Tx || now.Rx < old.Rx {
++	if w.n == 0 || now.Tx < w.ago(0).Tx || now.Rx < w.ago(0).Rx {
 +		// First reading, or the peer was replaced and its counters began again.
 +		for i := range w.window {
 +			w.window[i] = now
 +		}
-+		old = now
 +		if w.last.IsZero() {
 +			w.last = wall
 +		}
@@ -195,8 +229,10 @@ index 0000000..b73c3a4
 +	case now.Handshake == 0 && wall.Sub(w.last) >= wgNoSession,
 +		now.Handshake != 0 && wall.Sub(time.Unix(now.Handshake, 0)) > wgSessionDead:
 +		act = WgNewSession
-+	case now.Rx == old.Rx && now.Tx-old.Tx >= wgStallMinTx:
-+		act = WgNewSocket
++	case w.silent(wgQuiet, wgWait):
++		act, w.Quiet = WgNewSocket, wgQuiet*time.Second/WgReadings
++	case w.steady() && w.silent(wgFastQuiet, wgFastWait):
++		act, w.Quiet = WgNewSocket, wgFastQuiet*time.Second/WgReadings
 +	}
 +	if act != WgKeep {
 +		w.last = wall
@@ -205,10 +241,10 @@ index 0000000..b73c3a4
 +}
 diff --git a/api/wgbind_test.go b/api/wgbind_test.go
 new file mode 100644
-index 0000000..c48fd0e
+index 0000000..5b838a1
 --- /dev/null
 +++ b/api/wgbind_test.go
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,208 @@
 +package api
 +
 +import (
@@ -302,30 +338,34 @@ index 0000000..c48fd0e
 +	}
 +}
 +
-+// feed gives the watcher one reading a second and returns what it asked for.
++// feed gives the watcher its next reading and returns what it asked for.
 +func feed(w *WgWatch, at *time.Time, c WgCounters) WgAction {
-+	*at = at.Add(time.Second)
++	*at = at.Add(time.Second / WgReadings)
 +	return w.Step(c, *at)
 +}
 +
 +func TestWgWatchLeavesAnIdleAndABusyTunnelAlone(t *testing.T) {
 +	w, at := &WgWatch{}, time.Unix(1_000_000, 0)
 +	c := WgCounters{Handshake: at.Unix()}
-+	for i := 0; i < 100; i++ {
-+		c.Tx += 32 / 5 // keepalives, never answered
-+		if i%2 == 0 {
-+			c.Handshake = at.Unix() // renewed in time
++	for i := 0; i < 100*WgReadings; i++ {
++		c.Tx += 2               // keepalives, never answered
++		c.Handshake = at.Unix() // renewed in time
++		switch i % (10 * WgReadings) {
++		case 20:
++			c.Tx += 600 // a request on the idle tunnel, seen the instant it left...
++		case 22:
++			c.Rx += 600 // ...and answered half a second later
 +		}
 +		if a := feed(w, &at, c); a != WgKeep {
-+			t.Fatalf("idle tunnel, second %d: action %d", i, a)
++			t.Fatalf("idle tunnel, reading %d: action %d", i, a)
 +		}
 +	}
-+	for i := 0; i < 30; i++ {
-+		c.Tx += 50_000
-+		c.Rx += 92 // anything back means the path works
++	for i := 0; i < 30*WgReadings; i++ {
++		c.Tx += 12_000
++		c.Rx += 23 // anything back means the path works
 +		c.Handshake = at.Unix()
 +		if a := feed(w, &at, c); a != WgKeep {
-+			t.Fatalf("busy tunnel, second %d: action %d", i, a)
++			t.Fatalf("busy tunnel, reading %d: action %d", i, a)
 +		}
 +	}
 +}
@@ -334,23 +374,60 @@ index 0000000..c48fd0e
 +	w, at := &WgWatch{}, time.Unix(1_000_000, 0)
 +	c := WgCounters{Handshake: at.Unix()}
 +	var got []int
-+	for i := 0; i < 20; i++ {
-+		c.Tx += 1000 // traffic into a dead path
++	for i := 0; i < 20*WgReadings; i++ {
++		c.Tx += 250 // traffic into a dead path
 +		c.Handshake = at.Unix() - 30
 +		if feed(w, &at, c) == WgNewSocket {
 +			got = append(got, i)
 +		}
 +	}
 +	// Not before the window can show it, then no more often than the pause.
-+	if len(got) < 2 || got[0] > 6 || got[1]-got[0] < 5 {
-+		t.Fatalf("new sockets at seconds %v", got)
++	if len(got) < 2 || got[0] > 6*WgReadings || got[1]-got[0] < 5*WgReadings || w.Quiet != 3*time.Second {
++		t.Fatalf("new sockets at readings %v after %v of silence", got, w.Quiet)
++	}
++}
++
++// stopsAfter feeds ten seconds of traffic with inbound in every reading where
++// in(i) is true, then cuts inbound, and returns how many readings later the
++// watcher asked for a new socket.
++func stopsAfter(t *testing.T, w *WgWatch, in func(i int) bool) int {
++	at := time.Unix(1_000_000, 0)
++	c := WgCounters{Handshake: at.Unix()}
++	for i := 0; i < 10*WgReadings; i++ {
++		c.Tx += 2_500
++		if in(i) {
++			c.Rx += 10_000
++		}
++		if a := feed(w, &at, c); a != WgKeep {
++			t.Fatalf("live path, reading %d: action %d", i, a)
++		}
++	}
++	for i := 1; i <= 5*WgReadings; i++ {
++		c.Tx += 2_500
++		if feed(w, &at, c) == WgNewSocket {
++			return i
++		}
++	}
++	t.Fatal("no new socket in 5s of silence")
++	return 0
++}
++
++func TestWgWatchSeesASteadyStreamStopWithinASecond(t *testing.T) {
++	w := &WgWatch{}
++	if n := stopsAfter(t, w, func(int) bool { return true }); n != WgReadings || w.Quiet != time.Second {
++		t.Fatalf("steady stream: new socket %d readings after it stopped (%v), want %d", n, w.Quiet, WgReadings)
++	}
++	// Inbound that came in bursts was not a stream: its gaps are ordinary, so the 3s rule decides.
++	w = &WgWatch{}
++	if n := stopsAfter(t, w, func(i int) bool { return i%2 == 0 }); n < 3*WgReadings-1 || w.Quiet != 3*time.Second {
++		t.Fatalf("bursty inbound: new socket %d readings after it stopped (%v), want about %d", n, w.Quiet, 3*WgReadings)
 +	}
 +}
 +
 +func TestWgWatchStartsANewSessionAfterSleepAndWhileNoneCompletes(t *testing.T) {
 +	w, at := &WgWatch{}, time.Unix(1_000_000, 0)
 +	c := WgCounters{Tx: 500, Rx: 500, Handshake: at.Unix()}
-+	for i := 0; i < 10; i++ {
++	for i := 0; i < 10*WgReadings; i++ {
 +		feed(w, &at, c)
 +	}
 +	// The Mac slept for ten minutes: the wall clock moved, the counters did not.
@@ -361,14 +438,14 @@ index 0000000..c48fd0e
 +	// The peer was replaced: counters start over and no handshake has completed.
 +	c = WgCounters{}
 +	var got []int
-+	for i := 0; i < 25; i++ {
-+		c.Tx += 148 / 5 // initiations, unanswered
++	for i := 0; i < 25*WgReadings; i++ {
++		c.Tx += 7 // initiations, unanswered
 +		if feed(w, &at, c) == WgNewSession {
 +			got = append(got, i)
 +		}
 +	}
-+	if len(got) != 2 || got[0] < 8 || got[0] > 10 {
-+		t.Fatalf("with no handshake, new sessions at seconds %v, want one about every 10s", got)
++	if len(got) != 2 || got[0] < 9*WgReadings || got[0] > 10*WgReadings {
++		t.Fatalf("with no handshake, new sessions at readings %v, want one about every 10s", got)
 +	}
 +	// It completes: quiet again.
 +	c.Handshake, c.Rx = at.Unix(), 92
@@ -378,10 +455,10 @@ index 0000000..c48fd0e
 +}
 diff --git a/cmd/wgtun_darwin.go b/cmd/wgtun_darwin.go
 new file mode 100644
-index 0000000..0ea6f60
+index 0000000..a836461
 --- /dev/null
 +++ b/cmd/wgtun_darwin.go
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,261 @@
 +//go:build darwin
 +
 +package cmd
@@ -523,10 +600,10 @@ index 0000000..0ea6f60
 +	var downAt time.Time
 +	var rxAtDown uint64
 +	for {
-+		time.Sleep(time.Second)
++		time.Sleep(time.Second / api.WgReadings)
 +		now := wgStats(wg)
 +		if !downAt.IsZero() && now.Handshake != 0 && now.Rx > rxAtDown {
-+			log.Printf("WireGuard path restored after %.0fs", time.Since(downAt).Seconds())
++			log.Printf("WireGuard path restored after %.1fs", time.Since(downAt).Seconds())
 +			downAt = time.Time{}
 +		}
 +		if act := w.Step(now, time.Now()); act != api.WgKeep {
@@ -536,7 +613,8 @@ index 0000000..0ea6f60
 +				if act == api.WgNewSession {
 +					log.Println("WireGuard session expired or never completed; starting a new one on a new socket")
 +				} else {
-+					log.Println("No reply for 3s; moving the WireGuard session to a new socket")
++					// The handshake's age tells a stall that follows a rekey (every 120s) from one that does not.
++					log.Printf("No reply for %.0fs, last handshake %ds ago; moving the WireGuard session to a new socket", w.Quiet.Seconds(), time.Now().Unix()-now.Handshake)
 +				}
 +			}
 +			if act == api.WgNewSession {
@@ -552,6 +630,7 @@ index 0000000..0ea6f60
 +		if pending != api.WgKeep {
 +			if err := wg.IpcSet(conf); err != nil {
 +				log.Printf("Failed to open a new socket: %v", err)
++				time.Sleep(time.Second)
 +				continue
 +			}
 +			pending = api.WgKeep
