@@ -29,6 +29,11 @@ type Warp struct {
 	// long-lived TCP flows never reaches it. Empty or "0" disables rotation;
 	// it is opt-in because the swap can briefly stall new connections.
 	FlowTTL string
+	// WG is gaming mode's WireGuard registration (wg-warp.json). When set, the
+	// tunnel is carried over WireGuard, which survives the change of public
+	// address that ends every MASQUE session (gamemode.sh has the numbers).
+	// Empty means MASQUE only.
+	WG      string
 	Port    int
 	OnState func(State, string)
 	Log     io.Writer
@@ -44,6 +49,7 @@ type Warp struct {
 	recovery    *time.Timer // armed by a session fault, disarmed by a reconnect
 	recoveryGen uint64      // which arming a firing timer belongs to
 	streak      int         // consecutive wedge restarts, for the backoff
+	wgDown      bool        // WireGuard failed this session: MASQUE until the mode is set again
 	streakAt    time.Time
 
 	seq     uint64 // orders state callbacks, which run off the lock
@@ -79,6 +85,13 @@ func (w *Warp) Args() []string {
 	// -P 8443: the firewall proxies every tcp/443 flow (WarpController.masquePort).
 	common := []string{"-s", w.SNI, "--http2", "-P", "8443", "--always-reconnect", "-k", "5s"}
 
+	if w.viaWireGuard() {
+		// wgtun's own defaults are the measured ones (UDP 2408, 4 junk
+		// packets, 5s keepalive, 8s to the first handshake). It exits with
+		// status 3 when no handshake gets through, and launch falls back.
+		return []string{"-c", w.Config, "wgtun", "--identity", w.WG}
+	}
+
 	if !w.Game {
 		// socks/http-proxy resolve in-process, so they take the resolver flags.
 		args := append([]string{"-c", w.Config, "http-proxy"}, common...)
@@ -102,16 +115,27 @@ func (w *Warp) Args() []string {
 	// promotion is planned rather than a response to a kill.
 	// --hop-probe: reconnect when the second hop changes, instead of 8s later
 	// when the PING times out (gamemode.sh records the measurements).
-	// ponytail: usque's probe uses the unprivileged ICMP socket, which Windows
-	// does not have, so here it logs "Hop probe disabled" and the PING timeout
-	// still does the work. Give the probe a raw-socket path when a Windows
-	// machine is there to measure it on.
+	// On Windows the probe asks the system (wgtun-windows.patch), since there
+	// is no unprivileged ICMP socket.
 	args := append([]string{"-c", w.Config, "nativetun"}, common...)
 	args = append(args, "-S", "--hop-probe", "250ms")
 	if w.FlowTTL != "" && w.FlowTTL != "0" {
 		args = append(args, "--hot-standby", "--flow-ttl", w.FlowTTL)
 	}
 	return args
+}
+
+// viaWireGuard (mu held, or before Start): the next launch is wgtun.
+func (w *Warp) viaWireGuard() bool { return w.Game && w.WG != "" && !w.wgDown }
+
+// Transport names what carries gaming mode's tunnel right now, for the status line.
+func (w *Warp) Transport() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.viaWireGuard() {
+		return "WireGuard"
+	}
+	return "MASQUE"
 }
 
 type logEvent int
@@ -147,7 +171,8 @@ func classify(line string) logEvent {
 	case strings.Contains(line, "proxy listening on"),
 		strings.Contains(line, "Created TUN device"):
 		return evListening
-	case strings.Contains(line, "Connected to MASQUE server"):
+	case strings.Contains(line, "Connected to MASQUE server"),
+		strings.Contains(line, "Connected to WARP over WireGuard"):
 		return evConnected
 	case strings.Contains(line, "Tunnel connection lost"):
 		return evLost
@@ -212,9 +237,9 @@ func (w *Warp) Start() {
 // SetMode switches between the loopback proxy and gaming mode's TUN device.
 // Takes effect at the next launch; Args reads these under mu from the respawn
 // timer, so they must not be written without it.
-func (w *Warp) SetMode(game bool, flowTTL, sni string) {
+func (w *Warp) SetMode(game bool, flowTTL, sni, wg string) {
 	w.mu.Lock()
-	w.Game, w.FlowTTL = game, flowTTL
+	w.Game, w.FlowTTL, w.WG, w.wgDown = game, flowTTL, wg, false
 	if sni != "" {
 		w.SNI = sni
 	}
@@ -256,6 +281,7 @@ func (w *Warp) launch() {
 		w.recovery.Stop()
 		w.recovery = nil
 	}
+	wg := w.viaWireGuard()
 	c := exec.Command(w.Exe, w.Args()...)
 	pr, pw := io.Pipe()
 	c.Stdout, c.Stderr = pw, pw
@@ -269,7 +295,11 @@ func (w *Warp) launch() {
 	w.cmd, w.done = c, done
 	w.lastError = ""
 	w.setState(Starting, "")
-	w.logf("warp starting: sni=%s port=%d pid=%d", w.SNI, w.Port, c.Process.Pid)
+	if wg {
+		w.logf("warp starting over WireGuard: pid=%d", c.Process.Pid)
+	} else {
+		w.logf("warp starting: sni=%s port=%d pid=%d", w.SNI, w.Port, c.Process.Pid)
+	}
 
 	go func() {
 		s := bufio.NewScanner(pr)
@@ -281,6 +311,9 @@ func (w *Warp) launch() {
 		time.Sleep(stallTimeout)
 		w.mu.Lock()
 		stalled := w.cmd == c && w.state == Starting
+		if stalled && wg {
+			w.wgDown = true
+		}
 		w.mu.Unlock()
 		if stalled {
 			w.logf("warp stalled: no listener after %s", stallTimeout)
@@ -297,6 +330,18 @@ func (w *Warp) launch() {
 			return // restart() or Stop() already took over
 		}
 		w.cmd = nil
+		if wg {
+			// wgtun exits when no handshake gets through at start (another
+			// network, or a firewall that has learned this), and does not
+			// exit once it is up, so anything else was a crash. Either way
+			// MASQUE is the transport that always starts. Not counted as a
+			// crash: it is the fallback working.
+			w.wgDown = true
+			w.logf("warp: WireGuard ended (%v); continuing over MASQUE", err)
+			w.setState(Starting, "")
+			w.launch()
+			return
+		}
 		now := time.Now()
 		w.exits = append(prune(w.exits, now, exitWindow), now)
 		w.logf("warp exited unexpectedly: %v (%s)", err, w.lastError)

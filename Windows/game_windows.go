@@ -45,14 +45,37 @@ func MasqueEndpoint(config string) string {
 	return defaultMasqueEndpoint
 }
 
+// WireGuardEndpoint is the address wgtun will dial for this registration, or
+// "" when the file is not a usable one.
+func WireGuardEndpoint(identity string) string {
+	var id struct {
+		Config struct {
+			Peers []struct {
+				Endpoint struct {
+					V4 string `json:"v4"`
+				} `json:"endpoint"`
+			} `json:"peers"`
+		} `json:"config"`
+	}
+	b, err := os.ReadFile(identity)
+	if err != nil || json.Unmarshal(b, &id) != nil || len(id.Config.Peers) == 0 {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(id.Config.Peers[0].Endpoint.V4)
+	if ip := net.ParseIP(host); err == nil && ip != nil && ip.To4() != nil {
+		return ip.String()
+	}
+	return ""
+}
+
 // GameRoutes owns every routing-table change gaming mode makes, so teardown is
 // exactly the inverse of setup and a crash cannot strand the PC on a dead
 // tunnel.
 type GameRoutes struct {
-	iface    string // wintun interface name, e.g. "usque"
-	gateway  string // the physical default gateway, restored on the way out
-	endpoint string // the MASQUE server, pinned to the physical link
-	applied  bool
+	iface     string   // wintun interface name, e.g. "usque"
+	gateway   string   // the physical default gateway, restored on the way out
+	endpoints []string // the MASQUE and WireGuard servers, pinned to the physical link
+	applied   bool
 }
 
 var privateRanges = [][2]string{{"10.0.0.0", "255.0.0.0"}, {"192.168.0.0", "255.255.0.0"}}
@@ -115,15 +138,22 @@ func DefaultGateway() (gateway string, err error) {
 // Two halves rather than replacing the default route: they win on
 // longest-prefix match, so the original default stays untouched and teardown
 // is a delete instead of a restore.
-func (g *GameRoutes) Apply(iface, gateway, endpoint string) error {
-	g.iface, g.gateway, g.endpoint = iface, gateway, endpoint
+func (g *GameRoutes) Apply(iface, gateway string, endpoints ...string) error {
+	g.iface, g.gateway, g.endpoints = iface, gateway, endpoints
 
 	// The tunnel's own packets must keep using the physical link, or they
-	// would route into the tunnel they carry.
-	if err := run("route", "add", endpoint, "mask", "255.255.255.255", gateway); err != nil {
-		return fmt.Errorf("pin MASQUE endpoint: %w", err)
-	}
+	// would route into the tunnel they carry. Both transports' servers are
+	// pinned whichever is in use: a fallback must not have to wait for it.
 	g.applied = true
+	for _, ep := range endpoints {
+		// A pin left by a run that crashed, or one pointing at another
+		// network's gateway, makes "route add" fail: clear it first.
+		_ = run("route", "delete", ep, "mask", "255.255.255.255")
+		if err := run("route", "add", ep, "mask", "255.255.255.255", gateway); err != nil {
+			_ = g.Remove()
+			return fmt.Errorf("pin tunnel endpoint %s: %w", ep, err)
+		}
+	}
 
 	for _, half := range [][2]string{{"0.0.0.0", "128.0.0.0"}, {"128.0.0.0", "128.0.0.0"}} {
 		if err := run("netsh", "interface", "ipv4", "add", "route",
@@ -167,7 +197,10 @@ func (g *GameRoutes) Remove() error {
 	for _, half := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
 		note(run("netsh", "interface", "ipv4", "delete", "route", half, g.iface, "store=active"))
 	}
-	note(run("route", "delete", g.endpoint))
+	for _, ep := range g.endpoints {
+		// Not noted: a pin that was never added is not a failure to restore.
+		_ = run("route", "delete", ep, "mask", "255.255.255.255", g.gateway)
+	}
 	for _, lan := range privateRanges {
 		_ = run("route", "delete", lan[0], "mask", lan[1], g.gateway)
 	}

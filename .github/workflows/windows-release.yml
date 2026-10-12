@@ -9,6 +9,10 @@ on:
     branches: [vpn-overhaul, main]
     paths: ["Windows/**", "Tools/usque/**", ".github/workflows/windows-release.yml"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build as (a test build; nothing is published)
+        required: false
 
 permissions:
   contents: write
@@ -28,12 +32,16 @@ jobs:
           cache-dependency-path: Windows/go.sum
 
       - name: Version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/windows-v* ]]; then V="${GITHUB_REF_NAME#windows-v}"; else V="0.0.0-ci.${GITHUB_RUN_NUMBER}"; fi
+          if [[ "$GITHUB_REF" == refs/tags/windows-v* ]]; then V="${GITHUB_REF_NAME#windows-v}"
+          elif [[ "$INPUT_VERSION" =~ ^[0-9A-Za-z.-]+$ ]]; then V="$INPUT_VERSION"
+          else V="0.0.0-ci.${GITHUB_RUN_NUMBER}"; fi
           echo "VERSION=$V" >> "$GITHUB_ENV"
 
       - name: Build
-        run: Windows/build.sh "$VERSION"
+        run: SWEEP_TEST_USQUE=1 Windows/build.sh "$VERSION"
 
       - name: Register a WARP device for the tests
         run: |
@@ -106,6 +114,89 @@ jobs:
           Stop-Process -Id $app.Id -Force
           Start-Process $exe -ArgumentList "-restore-proxy" -Wait
           Get-Content "$env:LOCALAPPDATA\SweepVPN\sweep.log" | Where-Object { $_ -notmatch "usque: " }
+
+      # Gaming mode, for real: the whole runner routed through a wintun device,
+      # over WireGuard, then over MASQUE when WireGuard cannot get through.
+      # Azure's own control addresses stay on the physical link, or the runner
+      # loses its host while the default route points at the tunnel.
+      - name: End-to-end gaming mode (WireGuard, then the MASQUE fallback)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = (Resolve-Path "Windows/dist/SweepVPN-$env:VERSION-windows-x64.exe").Path
+          $log = "$env:LOCALAPPDATA\SweepVPN\sweep.log"
+          $wg = "$env:APPDATA\SweepVPN\warp\wg-warp.json"
+          Set-ItemProperty "HKCU:\Software\SweepVPN" Enabled 0 -Type DWord
+          Remove-Item $wg -ErrorAction SilentlyContinue
+
+          $gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0" | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+          foreach ($ip in "168.63.129.16", "169.254.169.254") { route add $ip mask 255.255.255.255 $gw | Out-Null }
+
+          function Lines($pattern) { @(Select-String -Path $log -Pattern $pattern -SimpleMatch) }
+          function Wait-Log($pattern, $after, $seconds = 120) {
+            for ($i = 0; $i -lt $seconds; $i++) { if ((Lines $pattern).Count -gt $after) { return }; Start-Sleep 1 }
+            Get-Content $log | Select-Object -Last 60
+            throw "never logged: $pattern"
+          }
+          function Assert-Tunnelled($what) {
+            $via = (Find-NetRoute -RemoteIPAddress "1.0.0.1" | Select-Object -First 1).InterfaceAlias
+            if ($via -ne "usque") { throw "$what`: 1.0.0.1 routes via '$via', not the tunnel" }
+            for ($i = 0; $i -lt 6; $i++) {
+              try {
+                $body = (Invoke-WebRequest "https://www.cloudflare.com/cdn-cgi/trace" -UseBasicParsing -TimeoutSec 10).Content
+                if ($body -match "warp=(on|plus)") { Write-Host "$what`: routed through the tunnel, $($Matches[0])"; return }
+              } catch { Write-Host $_ }
+              Start-Sleep 3
+            }
+            throw "$what`: traffic through the tunnel is not on WARP"
+          }
+          function Stop-Sweep { Get-Process | Where-Object { $_.Path -eq $exe } | Stop-Process -Force; Start-Sleep 3 }
+
+          try {
+            # --- WireGuard: registers by itself, handshakes, carries traffic ---
+            $n = (Lines "gaming mode routed through usque over").Count
+            Start-Process $exe -ArgumentList "-game","-background"
+            Wait-Log "gaming mode routed through usque over" $n
+            if (-not (Test-Path $wg)) { throw "no WireGuard registration was made" }
+            if ((Lines "gaming mode routed through usque over WireGuard").Count -eq 0) {
+              Get-Content $log | Select-Object -Last 60
+              throw "gaming mode did not come up over WireGuard"
+            }
+            Assert-Tunnelled "WireGuard"
+            # Idle and busy for a while: the watcher must not move a healthy session.
+            1..10 | ForEach-Object { Invoke-WebRequest "https://www.cloudflare.com/cdn-cgi/trace" -UseBasicParsing -TimeoutSec 10 | Out-Null; Start-Sleep 2 }
+            if ((Lines "moving the WireGuard session").Count -gt 0 -or (Lines "WireGuard ended").Count -gt 0) {
+              Get-Content $log | Select-Object -Last 60
+              throw "a healthy WireGuard session was disturbed"
+            }
+            Stop-Sweep
+            # A crash must not strand the PC: the device went with the process.
+            $via = (Find-NetRoute -RemoteIPAddress "1.0.0.1" | Select-Object -First 1).InterfaceAlias
+            if ($via -eq "usque") { throw "the tunnel route outlived the app" }
+            Invoke-WebRequest "https://www.cloudflare.com/cdn-cgi/trace" -UseBasicParsing -TimeoutSec 15 | Out-Null
+            Write-Host "WireGuard OK; network back after a kill"
+
+            # --- fallback: a registration whose server never answers ---
+            $id = Get-Content $wg -Raw | ConvertFrom-Json
+            $id.config.peers[0].endpoint.v4 = "192.0.2.1:0"
+            $id | ConvertTo-Json -Depth 20 | Set-Content $wg
+            $n = (Lines "gaming mode routed through usque over").Count
+            Start-Process $exe -ArgumentList "-game","-background"
+            Wait-Log "continuing over MASQUE" 0
+            Wait-Log "gaming mode routed through usque over MASQUE" 0
+            Assert-Tunnelled "MASQUE fallback"
+            Start-Sleep 5
+            $hop = Lines "Hop 2 is"
+            Write-Host ("hop probe: " + $(if ($hop.Count) { $hop[-1].Line } elseif ((Lines "Hop probe disabled").Count) { "DISABLED" } else { "running, no router answered at hop 2 on this network" }))
+            if ((Lines "Hop probe disabled").Count -gt 0) { throw "the hop probe is disabled on Windows" }
+            Stop-Sweep
+            Write-Host "MASQUE fallback OK"
+          } finally {
+            Get-Process | Where-Object { $_.Path -eq $exe } | Stop-Process -Force -ErrorAction SilentlyContinue
+            Remove-Item $wg -ErrorAction SilentlyContinue
+            foreach ($ip in "168.63.129.16", "169.254.169.254", "192.0.2.1") { route delete $ip 2>$null | Out-Null }
+            Get-Content $log | Where-Object { $_ -match "wireguard|WireGuard|gaming|game routes|Hop |alert" } | Select-Object -Last 40
+          }
 
       # The updater, for real: an "installed" older build whose feed is this
       # machine updates itself to a newer build, keeps its settings and comes

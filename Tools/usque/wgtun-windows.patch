@@ -1,0 +1,643 @@
+From bc42dc4d282a04cf37e5f57c072e711251ab5bb9 Mon Sep 17 00:00:00 2001
+From: Udhayveer Singh <ci@localhost>
+Date: Mon, 12 Oct 2026 20:35:46 +0530
+Subject: [PATCH] WireGuard tunnel, its registration and the hop probe on
+ Windows
+
+wgtun was darwin-only: the device setup is now per platform (wintun on Windows,
+same name and addressing as nativetun). wgregister makes the curve25519
+registration wgtun needs, so a desktop app no longer needs one placed by hand.
+
+The hop probe used the unprivileged ICMP datagram socket, which Windows does not
+have, so it was disabled there. Windows now asks the system (IcmpSendEcho, what
+tracert uses): no raw socket and no firewall rule.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ api/hopprobe.go                   |  38 +++++++++
+ api/hopprobe_test.go              |  33 ++++++++
+ api/hopprobe_windows.go           |  94 +++++++++++++++++++++
+ api/hopprobe_windows_test.go      |  46 +++++++++++
+ cmd/wgregister.go                 | 131 ++++++++++++++++++++++++++++++
+ cmd/wgregister_test.go            |  85 +++++++++++++++++++
+ cmd/{wgtun_darwin.go => wgtun.go} |  15 +---
+ cmd/wgtun_tun_darwin.go           |  28 +++++++
+ cmd/wgtun_tun_windows.go          |  34 ++++++++
+ 9 files changed, 492 insertions(+), 12 deletions(-)
+ create mode 100644 api/hopprobe_windows.go
+ create mode 100644 api/hopprobe_windows_test.go
+ create mode 100644 cmd/wgregister.go
+ create mode 100644 cmd/wgregister_test.go
+ rename cmd/{wgtun_darwin.go => wgtun.go} (94%)
+ create mode 100644 cmd/wgtun_tun_darwin.go
+ create mode 100644 cmd/wgtun_tun_windows.go
+
+diff --git a/api/hopprobe.go b/api/hopprobe.go
+index c1498fa..8cca557 100644
+--- a/api/hopprobe.go
++++ b/api/hopprobe.go
+@@ -48,6 +48,10 @@ func (h *hopTracker) observe(hop string) bool {
+ // event; a second change before the first is consumed is the same news.
+ func watchHop(ctx context.Context, endpoint net.IP, interval time.Duration) <-chan struct{} {
+ 	changed := make(chan struct{}, 1)
++	if hopOnce != nil {
++		go watchHopWith(ctx, endpoint, interval, hopOnce, changed)
++		return changed
++	}
+ 	// "udp4" is the unprivileged ICMP datagram socket, so this works for the
+ 	// socks proxy as well as the root nativetun.
+ 	conn, err := icmp.ListenPacket("udp4", "0.0.0.0")
+@@ -136,3 +140,37 @@ func isOwnProbe(quoted []byte, endpoint net.IP, id, seq int) bool {
+ 		int(binary.BigEndian.Uint16(echo[4:6])) == id &&
+ 		int(binary.BigEndian.Uint16(echo[6:8])) == seq
+ }
++
++// hopOnce, where a platform sets it, sends one probe and reports the router
++// that answered, or "" when none did within the timeout. Windows has no
++// unprivileged ICMP socket, and its firewall drops the Time Exceeded replies a
++// raw socket would wait for; it has an API for exactly this instead.
++var hopOnce func(endpoint net.IP, timeout time.Duration) string
++
++// watchHopWith is watchHop's loop over hopOnce.
++func watchHopWith(ctx context.Context, endpoint net.IP, interval time.Duration,
++	probe func(net.IP, time.Duration) string, changed chan<- struct{}) {
++	var tracker hopTracker
++	for ctx.Err() == nil {
++		start := time.Now()
++		if hop := probe(endpoint, interval); hop != "" {
++			was := tracker.last
++			if was == "" {
++				log.Printf("Hop %d is %s", hopProbeTTL, hop)
++			}
++			if tracker.observe(hop) {
++				log.Printf("Hop %d changed: %s -> %s", hopProbeTTL, was, hop)
++				select {
++				case changed <- struct{}{}:
++				default:
++				}
++			}
++		}
++		// A probe that was answered at once must not turn into a flood.
++		select {
++		case <-ctx.Done():
++			return
++		case <-time.After(time.Until(start.Add(interval))):
++		}
++	}
++}
+diff --git a/api/hopprobe_test.go b/api/hopprobe_test.go
+index 8db39a1..4600da3 100644
+--- a/api/hopprobe_test.go
++++ b/api/hopprobe_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"net"
+ 	"testing"
++	"time"
+ )
+ 
+ func TestHopTrackerReportsOnlyChanges(t *testing.T) {
+@@ -75,3 +76,35 @@ func TestNoShutdownGraceAfterAHopChange(t *testing.T) {
+ 		t.Fatalf("grace after a pump error = %s, want %s", g, pumpShutdownGrace)
+ 	}
+ }
++
++// The loop every platform-specific probe runs in: the first answer is only a
++// baseline, a lost probe is not a change, and a new router is signalled once.
++func TestWatchHopWithSignalsOnlyARealChange(t *testing.T) {
++	answers := []string{"10.0.0.1", "", "10.0.0.1", "10.0.0.2", "10.0.0.2"}
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	i := 0
++	done := make(chan struct{})
++	probe := func(net.IP, time.Duration) string {
++		if i == len(answers) {
++			close(done)
++			<-ctx.Done()
++			return ""
++		}
++		i++
++		return answers[i-1]
++	}
++	changed := make(chan struct{}, 1)
++	go watchHopWith(ctx, net.IPv4(1, 1, 1, 1), time.Millisecond, probe, changed)
++	<-done
++	select {
++	case <-changed:
++	default:
++		t.Fatal("a changed hop was not signalled")
++	}
++	select {
++	case <-changed:
++		t.Fatal("signalled twice for one change")
++	default:
++	}
++}
+diff --git a/api/hopprobe_windows.go b/api/hopprobe_windows.go
+new file mode 100644
+index 0000000..d8f85be
+--- /dev/null
++++ b/api/hopprobe_windows.go
+@@ -0,0 +1,94 @@
++//go:build windows
++
++package api
++
++import (
++	"encoding/binary"
++	"log"
++	"net"
++	"time"
++	"unsafe"
++
++	"golang.org/x/sys/windows"
++)
++
++// The API tracert uses. The system sends the echo and matches the reply
++// itself, so no raw socket, no administrator rights and no firewall rule.
++var (
++	iphlpapi        = windows.NewLazySystemDLL("iphlpapi.dll")
++	icmpCreateFile  = iphlpapi.NewProc("IcmpCreateFile")
++	icmpSendEcho    = iphlpapi.NewProc("IcmpSendEcho")
++	icmpCloseHandle = iphlpapi.NewProc("IcmpCloseHandle")
++)
++
++// IP_TTL_EXPIRED_TRANSIT: a router on the way dropped the echo because its
++// TTL ran out, which is the answer the probe is after.
++const ipTTLExpiredTransit = 11013
++
++// IP_OPTION_INFORMATION and ICMP_ECHO_REPLY (ipexport.h), as laid out on
++// 64-bit Windows; hopprobe_windows_test.go pins the sizes.
++type ipOptionInformation struct {
++	TTL         uint8
++	Tos         uint8
++	Flags       uint8
++	OptionsSize uint8
++	OptionsData *byte
++}
++
++type icmpEchoReply struct {
++	Address       [4]byte // network order
++	Status        uint32
++	RoundTripTime uint32
++	DataSize      uint16
++	Reserved      uint16
++	Data          *byte
++	Options       ipOptionInformation
++}
++
++func init() {
++	if err := icmpSendEcho.Find(); err != nil {
++		log.Printf("Hop probe disabled: %v", err)
++		hopOnce = func(net.IP, time.Duration) string { return "" }
++		return
++	}
++	hopOnce = icmpHop
++}
++
++// icmpHop sends one echo that dies hopProbeTTL routers out and returns the
++// address of the router that said so, or "" when nothing answered in time.
++func icmpHop(endpoint net.IP, timeout time.Duration) string {
++	v4 := endpoint.To4()
++	if v4 == nil {
++		return ""
++	}
++	h, _, _ := icmpCreateFile.Call()
++	if h == 0 || h == uintptr(windows.InvalidHandle) {
++		return ""
++	}
++	defer icmpCloseHandle.Call(h)
++
++	data := []byte("usquehop")
++	opts := ipOptionInformation{TTL: hopProbeTTL}
++	// Room for the reply, the echoed data, and the 8 bytes of an ICMP error
++	// the documentation asks for.
++	buf := make([]byte, int(unsafe.Sizeof(icmpEchoReply{}))+len(data)+8+64)
++	ms := uint32(timeout / time.Millisecond)
++	if ms == 0 {
++		ms = 1
++	}
++	// The count returned is not the test: an expired TTL is reported in the
++	// reply's Status, and some Windows versions return 0 replies for it while
++	// still filling the buffer in. The buffer starts zeroed, so an untouched
++	// one reads as status 0 and address 0.0.0.0, which is refused below.
++	_, _, _ = icmpSendEcho.Call(h,
++		uintptr(binary.LittleEndian.Uint32(v4)), // an in_addr: the bytes as they are
++		uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)),
++		uintptr(unsafe.Pointer(&opts)),
++		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)),
++		uintptr(ms))
++	reply := (*icmpEchoReply)(unsafe.Pointer(&buf[0]))
++	if reply.Status != ipTTLExpiredTransit || reply.Address == [4]byte{} {
++		return ""
++	}
++	return net.IP(reply.Address[:]).String()
++}
+diff --git a/api/hopprobe_windows_test.go b/api/hopprobe_windows_test.go
+new file mode 100644
+index 0000000..46d4848
+--- /dev/null
++++ b/api/hopprobe_windows_test.go
+@@ -0,0 +1,46 @@
++//go:build windows
++
++package api
++
++import (
++	"net"
++	"testing"
++	"time"
++	"unsafe"
++)
++
++// The structs are read out of a buffer the system fills in, so a wrong layout
++// reads garbage instead of failing.
++func TestICMPStructLayout(t *testing.T) {
++	if unsafe.Sizeof(uintptr(0)) != 8 {
++		t.Skip("layout pinned for 64-bit Windows")
++	}
++	if got := unsafe.Sizeof(ipOptionInformation{}); got != 16 {
++		t.Fatalf("IP_OPTION_INFORMATION is %d bytes, want 16", got)
++	}
++	if got := unsafe.Sizeof(icmpEchoReply{}); got != 40 {
++		t.Fatalf("ICMP_ECHO_REPLY is %d bytes, want 40", got)
++	}
++	if off := unsafe.Offsetof(icmpEchoReply{}.Status); off != 4 {
++		t.Fatalf("Status at offset %d, want 4", off)
++	}
++}
++
++// Against the real API. Whether a router answers depends on the network (a
++// cloud runner's often do not), so the only hard claims are that the call
++// returns within its timeout and that any answer is a router, not the target.
++func TestICMPHopReturnsARouterOrNothing(t *testing.T) {
++	target := net.IPv4(1, 1, 1, 1)
++	start := time.Now()
++	hop := icmpHop(target, 500*time.Millisecond)
++	if took := time.Since(start); took > 3*time.Second {
++		t.Fatalf("probe took %s with a 500ms timeout", took)
++	}
++	t.Logf("hop %d towards %s: %q", hopProbeTTL, target, hop)
++	if hop == "" {
++		return
++	}
++	if ip := net.ParseIP(hop); ip == nil || ip.Equal(target) || ip.IsUnspecified() {
++		t.Fatalf("not a router on the way: %q", hop)
++	}
++}
+diff --git a/cmd/wgregister.go b/cmd/wgregister.go
+new file mode 100644
+index 0000000..c021441
+--- /dev/null
++++ b/cmd/wgregister.go
+@@ -0,0 +1,131 @@
++//go:build darwin || windows
++
++package cmd
++
++import (
++	"bytes"
++	"crypto/ecdh"
++	"crypto/rand"
++	"encoding/base64"
++	"encoding/json"
++	"fmt"
++	"io"
++	"log"
++	"net/http"
++	"os"
++	"time"
++
++	"github.com/Diniboy1123/usque/internal"
++	"github.com/Diniboy1123/usque/models"
++	"github.com/spf13/cobra"
++)
++
++// wgAPI is where registrations go; a variable so a test can stand in for it.
++var wgAPI = internal.ApiUrl + "/" + internal.ApiVersion
++
++// registerWG makes the WireGuard registration wgtun needs and writes it to
++// path; it does nothing when one is already there. It is a second anonymous
++// device, under the terms accepted for the first. The same as registerWG in
++// Sweep's warpmobile, which cannot import package cmd: keep them in step.
++func registerWG(path string) error {
++	if _, err := os.Stat(path); err == nil {
++		return nil
++	}
++	key, err := ecdh.X25519().GenerateKey(rand.Reader)
++	if err != nil {
++		return fmt.Errorf("could not generate a WireGuard key: %w", err)
++	}
++	serial, err := internal.GenerateRandomAndroidSerial()
++	if err != nil {
++		return err
++	}
++	body, _ := json.Marshal(models.Registration{
++		Key:     base64.StdEncoding.EncodeToString(key.PublicKey().Bytes()),
++		Tos:     internal.TimeAsCfString(time.Now()),
++		Model:   internal.DefaultModel,
++		Serial:  serial,
++		KeyType: internal.KeyTypeWg,
++		TunType: internal.TunTypeWg,
++		Locale:  internal.DefaultLocale,
++	})
++	answer, err := wgCall(http.MethodPost, "/reg", "", body)
++	if err != nil {
++		return fmt.Errorf("WireGuard registration failed: %w", err)
++	}
++	var device struct {
++		ID    string `json:"id"`
++		Token string `json:"token"`
++	}
++	identity := map[string]json.RawMessage{}
++	if err := json.Unmarshal(answer, &identity); err != nil {
++		return fmt.Errorf("WireGuard registration: unreadable answer: %w", err)
++	}
++	_ = json.Unmarshal(answer, &device)
++	// A new registration comes back with WARP off. Best effort: the identity
++	// is good either way, and a tunnel that cannot open falls back to MASQUE.
++	if _, err := wgCall(http.MethodPatch, "/reg/"+device.ID, device.Token, []byte(`{"warp_enabled":true}`)); err != nil {
++		log.Printf("WireGuard registration: could not switch WARP on: %v", err)
++	}
++	identity["private_key"], _ = json.Marshal(base64.StdEncoding.EncodeToString(key.Bytes()))
++	out, _ := json.Marshal(identity)
++	var check wgIdentity
++	if err := json.Unmarshal(out, &check); err != nil {
++		return fmt.Errorf("WireGuard registration: unreadable answer: %w", err)
++	}
++	if _, _, _, _, err := check.uapi(2408, 5*time.Second); err != nil {
++		return fmt.Errorf("WireGuard registration: %w", err)
++	}
++	// The file holds the device's private key. Written whole or not at all:
++	// wgtun treats any file at the path as an identity.
++	tmp := path + ".tmp"
++	if err := os.WriteFile(tmp, out, 0o600); err != nil {
++		return err
++	}
++	return os.Rename(tmp, path)
++}
++
++func wgCall(method, path, token string, body []byte) ([]byte, error) {
++	req, err := http.NewRequest(method, wgAPI+path, bytes.NewReader(body))
++	if err != nil {
++		return nil, err
++	}
++	for k, v := range internal.Headers {
++		req.Header.Set(k, v)
++	}
++	if token != "" {
++		req.Header.Set("Authorization", "Bearer "+token)
++	}
++	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer func() { _ = resp.Body.Close() }()
++	answer, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		return nil, err
++	}
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
++	}
++	return answer, nil
++}
++
++var wgRegisterCmd = &cobra.Command{
++	Use:   "wgregister",
++	Short: "Register a WireGuard device for wgtun",
++	Long: "Registers a second anonymous WARP device with a curve25519 key and saves the answer," +
++		" with the private key, where wgtun's --identity reads it. Does nothing when the file exists.",
++	Run: func(cmd *cobra.Command, args []string) {
++		path, _ := cmd.Flags().GetString("identity")
++		if err := registerWG(path); err != nil {
++			log.Fatalf("%v", err)
++		}
++		log.Println("WireGuard registration ready")
++	},
++}
++
++func init() {
++	wgRegisterCmd.Flags().String("identity", "", "Where to write the WireGuard registration")
++	_ = wgRegisterCmd.MarkFlagRequired("identity")
++	rootCmd.AddCommand(wgRegisterCmd)
++}
+diff --git a/cmd/wgregister_test.go b/cmd/wgregister_test.go
+new file mode 100644
+index 0000000..2a52448
+--- /dev/null
++++ b/cmd/wgregister_test.go
+@@ -0,0 +1,85 @@
++//go:build darwin || windows
++
++package cmd
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestRegisterWGWritesAnIdentityWgtunAccepts(t *testing.T) {
++	var patched bool
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method == http.MethodPatch {
++			patched = r.URL.Path == "/reg/dev1" && r.Header.Get("Authorization") == "Bearer tok"
++			_, _ = w.Write([]byte(`{}`))
++			return
++		}
++		var reg struct {
++			Key     string `json:"key"`
++			KeyType string `json:"key_type"`
++		}
++		_ = json.NewDecoder(r.Body).Decode(&reg)
++		if reg.KeyType != "curve25519" || len(reg.Key) != 44 {
++			http.Error(w, "bad registration", http.StatusBadRequest)
++			return
++		}
++		_, _ = w.Write([]byte(`{"id":"dev1","token":"tok","config":{"client_id":"AQID",
++			"peers":[{"public_key":"` + reg.Key + `","endpoint":{"v4":"162.159.192.3:0"}}],
++			"interface":{"addresses":{"v4":"172.16.0.2"}}}}`))
++	}))
++	defer srv.Close()
++	was := wgAPI
++	wgAPI = srv.URL
++	defer func() { wgAPI = was }()
++
++	path := filepath.Join(t.TempDir(), "wg-warp.json")
++	if err := registerWG(path); err != nil {
++		t.Fatal(err)
++	}
++	if !patched {
++		t.Fatal("WARP was not switched on for the new device")
++	}
++	raw, _ := os.ReadFile(path)
++	var id wgIdentity
++	if err := json.Unmarshal(raw, &id); err != nil {
++		t.Fatal(err)
++	}
++	_, peer, addr, reserved, err := id.uapi(2408, 5e9)
++	if err != nil || addr != "172.16.0.2" || reserved != [3]byte{1, 2, 3} || peer == "" {
++		t.Fatalf("identity not usable: %v addr=%q reserved=%v", err, addr, reserved)
++	}
++
++	// A second call must leave the device that is already registered alone.
++	if err := os.WriteFile(path, []byte("kept"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if err := registerWG(path); err != nil {
++		t.Fatal(err)
++	}
++	if raw, _ := os.ReadFile(path); string(raw) != "kept" {
++		t.Fatal("an existing registration was replaced")
++	}
++}
++
++func TestRegisterWGLeavesNoFileWhenTheAPIRefuses(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		http.Error(w, "no", http.StatusForbidden)
++	}))
++	defer srv.Close()
++	was := wgAPI
++	wgAPI = srv.URL
++	defer func() { wgAPI = was }()
++
++	path := filepath.Join(t.TempDir(), "wg-warp.json")
++	if err := registerWG(path); err == nil {
++		t.Fatal("a refused registration reported success")
++	}
++	if _, err := os.Stat(path); err == nil {
++		t.Fatal("a refused registration left an identity behind")
++	}
++}
+diff --git a/cmd/wgtun_darwin.go b/cmd/wgtun.go
+similarity index 94%
+rename from cmd/wgtun_darwin.go
+rename to cmd/wgtun.go
+index c17931c..a153524 100644
+--- a/cmd/wgtun_darwin.go
++++ b/cmd/wgtun.go
+@@ -1,4 +1,4 @@
+-//go:build darwin
++//go:build darwin || windows
+ 
+ package cmd
+ 
+@@ -20,7 +20,6 @@ import (
+ 	"github.com/spf13/cobra"
+ 	"golang.zx2c4.com/wireguard/conn"
+ 	"golang.zx2c4.com/wireguard/device"
+-	"golang.zx2c4.com/wireguard/tun"
+ )
+ 
+ // wgIdentity is a WARP registration made with a curve25519 key: the API's
+@@ -183,7 +182,7 @@ var wgTunCmd = &cobra.Command{
+ 	Long: "Expose Warp as a native TUN device that accepts any IP traffic, carried over WireGuard (UDP) instead of MASQUE." +
+ 		" A WireGuard session is not tied to the client's address, so it survives a change of the network's public" +
+ 		" address that ends every TCP connection, the HTTP/2 MASQUE flow included." +
+-		" Requires root and a curve25519 registration (--identity). Routing is left to the caller." +
++		" Requires root or administrator rights and a curve25519 registration (--identity; see wgregister). Routing is left to the caller." +
+ 		" Exits with status 3 when no handshake gets through at start, so the caller can fall back to nativetun.",
+ 	Run: func(cmd *cobra.Command, args []string) {
+ 		path, _ := cmd.Flags().GetString("identity")
+@@ -206,19 +205,11 @@ var wgTunCmd = &cobra.Command{
+ 			log.Fatalf("%v", err)
+ 		}
+ 
+-		tunDev, err := tun.CreateTUN("utun", mtu)
++		tunDev, name, err := wgCreateTUN(addr, mtu)
+ 		if err != nil {
+ 			log.Println("Are you root/administrator? TUN device creation usually requires elevated privileges.")
+ 			log.Fatalf("Failed to create TUN device: %v", err)
+ 		}
+-		name, err := tunDev.Name()
+-		if err != nil {
+-			log.Fatalf("Failed to name TUN device: %v", err)
+-		}
+-		// Same point-to-point addressing as nativetun; see tunDevice.create.
+-		if err := ifconfig(name, "inet", addr, addr, "mtu", fmt.Sprint(mtu), "up"); err != nil {
+-			log.Fatalf("Failed to set IPv4 address: %v", err)
+-		}
+ 
+ 		wg := device.NewDevice(tunDev, &api.WarpBind{Bind: conn.NewStdNetBind(), Reserved: reserved, Junk: junk}, wgLogger())
+ 		if err := wg.IpcSet(devConf + peerConf); err != nil {
+diff --git a/cmd/wgtun_tun_darwin.go b/cmd/wgtun_tun_darwin.go
+new file mode 100644
+index 0000000..e34c1c0
+--- /dev/null
++++ b/cmd/wgtun_tun_darwin.go
+@@ -0,0 +1,28 @@
++//go:build darwin
++
++package cmd
++
++import (
++	"fmt"
++
++	"golang.zx2c4.com/wireguard/tun"
++)
++
++// wgCreateTUN brings up the device wgtun runs on, with the same
++// point-to-point addressing as nativetun; see tunDevice.create.
++func wgCreateTUN(addr string, mtu int) (tun.Device, string, error) {
++	dev, err := tun.CreateTUN("utun", mtu)
++	if err != nil {
++		return nil, "", err
++	}
++	name, err := dev.Name()
++	if err != nil {
++		_ = dev.Close()
++		return nil, "", err
++	}
++	if err := ifconfig(name, "inet", addr, addr, "mtu", fmt.Sprint(mtu), "up"); err != nil {
++		_ = dev.Close()
++		return nil, "", fmt.Errorf("failed to set IPv4 address: %w", err)
++	}
++	return dev, name, nil
++}
+diff --git a/cmd/wgtun_tun_windows.go b/cmd/wgtun_tun_windows.go
+new file mode 100644
+index 0000000..a3d8de2
+--- /dev/null
++++ b/cmd/wgtun_tun_windows.go
+@@ -0,0 +1,34 @@
++//go:build windows
++
++package cmd
++
++import (
++	"fmt"
++
++	"github.com/Diniboy1123/usque/internal"
++	"golang.zx2c4.com/wireguard/tun"
++)
++
++// wgCreateTUN brings up the wintun device wgtun runs on. Same name and
++// addressing as nativetun's (tunDevice.create), so whatever routes into one
++// routes into the other: only one of the two runs at a time.
++func wgCreateTUN(addr string, mtu int) (tun.Device, string, error) {
++	dev, err := tun.CreateTUN("usque", mtu)
++	if err != nil {
++		return nil, "", err
++	}
++	name, err := dev.Name()
++	if err != nil {
++		_ = dev.Close()
++		return nil, "", err
++	}
++	if err := internal.SetIPv4Address(name, addr, "255.255.255.255"); err != nil {
++		_ = dev.Close()
++		return nil, "", fmt.Errorf("failed to set IPv4 address: %v", err)
++	}
++	if err := internal.SetIPv4MTU(name, mtu); err != nil {
++		_ = dev.Close()
++		return nil, "", fmt.Errorf("failed to set IPv4 MTU: %v", err)
++	}
++	return dev, name, nil
++}
+-- 
+2.54.0 (Apple Git-157)
+

@@ -23,7 +23,8 @@ git -C "$WORK" -c user.name=ci -c user.email=ci@localhost am -q \
     "$HERE/standby-backoff.patch" \
     "$HERE/standby-age-log.patch" \
     "$HERE/hop-probe.patch" \
-    "$HERE/wgtun.patch"
+    "$HERE/wgtun.patch" \
+    "$HERE/wgtun-windows.patch"
 
 for ARCH in arm64 amd64; do
   (cd "$WORK" && CGO_ENABLED=0 GOOS=darwin GOARCH=$ARCH go build -trimpath -ldflags "-s -w" -o "usque-$ARCH" .)

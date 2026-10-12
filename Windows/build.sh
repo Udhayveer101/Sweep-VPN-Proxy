@@ -18,7 +18,13 @@ git -C "$WORK" -c user.name=ci -c user.email=ci@localhost am -q \
   "$PATCHES/flow-standby-rotation.patch" "$PATCHES/darwin-tun-framing.patch" \
   "$PATCHES/standby-backoff.patch" "$PATCHES/standby-age-log.patch" \
     "$PATCHES/hop-probe.patch" \
-    "$PATCHES/wgtun.patch"
+    "$PATCHES/wgtun.patch" \
+    "$PATCHES/wgtun-windows.patch"
+# On a Windows machine (CI), run the patched tree's own tests where they can
+# reach the real thing: the ICMP API behind the hop probe, wintun's types.
+if [ -n "${SWEEP_TEST_USQUE:-}" ]; then
+  (cd "$WORK" && go test -count=1 -run 'Hop|ICMP|Wg|RegisterWG|Junk|Reserved' -v ./api/ ./cmd/ 2>&1 | grep -E '^(=== RUN|--- |ok|FAIL|PASS|\s+hopprobe)' )
+fi
 (cd "$WORK" && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o "$HERE/usque.exe" .)
 
 # usque's TUN (gaming mode) loads wintun.dll from beside its own exe.
