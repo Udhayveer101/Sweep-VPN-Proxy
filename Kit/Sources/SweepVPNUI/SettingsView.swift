@@ -26,17 +26,10 @@ public struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 #if os(iOS)
-                Section("WARP") {
-                    Toggle("Route this \(DeviceNoun.current) through WARP", isOn: Binding(
-                        get: { model.systemProxyEnabled },
-                        set: { model.setEverythingThroughWarp($0) }))
-                        .disabled(!model.warpRegistered)
-                    if let status = model.warpStatusText {
-                        Text(status).font(.footnote)
-                            .foregroundStyle(model.warpState.isFailed ? Midnight.danger : .secondary)
-                            .textSelection(.enabled)
-                    }
-                    TextField("WARP SNI", text: Binding(
+                // Connect and the gaming switch live on the home screen.
+                Section("Advanced") {
+                    LabeledContent("WARP SNI") {
+                    TextField("example.com", text: Binding(
                         get: { model.options.warpSNI },
                         set: {
                             var o = model.options
@@ -46,12 +39,10 @@ public struct SettingsView: View {
                         .font(.system(.footnote, design: .monospaced))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .multilineTextAlignment(.trailing)
                         .disabled(model.systemProxyEnabled)
+                    }
                     Text("Sends every app's traffic to Cloudflare WARP inside HTTPS that names an ordinary site, which the network filter lets through. Change the SNI with WARP off.")
-                        .font(.footnote).foregroundStyle(.secondary)
-
-                    Toggle("Gaming mode", isOn: $model.gameModeEnabled)
-                    Text("Games already go through the tunnel. This carries it over WireGuard where the network allows, so a change of network path no longer drops the game's connections. Uses a little more battery.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 #endif

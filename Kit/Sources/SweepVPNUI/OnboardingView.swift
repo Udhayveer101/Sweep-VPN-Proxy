@@ -30,7 +30,7 @@ public struct OnboardingView: View {
             VStack(spacing: 12) {
                 Image(systemName: "lock.shield.fill")
                     .font(.system(size: 48, weight: .medium))
-                    .foregroundStyle(.green)
+                    .foregroundStyle(Midnight.good)
                 Text("Sweep VPN").font(.title.weight(.semibold))
                 Text("No account, no logs, no third-party SDKs.")
                     .font(.subheadline).foregroundStyle(.secondary)
@@ -47,7 +47,7 @@ public struct OnboardingView: View {
                       "On iOS, some traffic to Apple's own services can leave outside the tunnel. No app can change that.")
             }
             .padding(20)
-            .background(.ultraThinMaterial, in: .rect(cornerRadius: 20, style: .continuous))
+            .background(Midnight.panel, in: .rect(cornerRadius: 20, style: .continuous))
 
             Spacer(minLength: 0)
 
@@ -100,9 +100,10 @@ struct WarpSetupGuide: View {
                         registration
                     }
                     #if os(iOS)
-                    step(3, "Turn WARP on", done: false) {
+                    step(3, "Connect", done: false) {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Tap **Route this \(DeviceNoun.current) through WARP** on the main screen. The first time, iOS asks to add a VPN configuration: choose **Allow**.")
+                            Text("Tap the power button on the main screen. The first time, iOS asks to add a VPN configuration: choose **Allow**.")
+                            Text("**Games:** turn on **Gaming** under the button first. It keeps game connections up when the network changes path.")
                             Text("Every app then goes through Cloudflare WARP inside HTTPS that names an ordinary site. It keeps running after you close Sweep.")
                                 .foregroundStyle(.secondary)
                         }

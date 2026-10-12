@@ -121,7 +121,7 @@ public struct HomeView: View {
     /// switch reads as the app working, not the connection breaking.
     private func protocolSwitchRow(_ note: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(.blue)
+            Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(Midnight.accent)
             Text(note).font(.caption).multilineTextAlignment(.leading)
             Spacer(minLength: 0)
         }
@@ -214,37 +214,27 @@ public struct HomeView: View {
 struct ProxyHomePanel: View {
     @ObservedObject var model: VPNViewModel
 
-    private var headline: String {
-        if !model.warpRegistered { return "WARP is not set up" }
-        #if os(macOS)
-        if model.systemProxyEnabled { return "This Mac is using WARP" }
-        #else
-        if model.warpState == .running { return "This \(DeviceNoun.current) is using WARP" }
-        if model.warpState == .starting { return "Connecting to WARP…" }
-        #endif
-        if model.options.warpEnabled {
-            if model.warpState == .running { return "WARP is ready" }
-            return model.warpState.isFailed ? "WARP could not start" : "Starting WARP…"
-        }
-        return "Proxy is off"
-    }
-
-    #if os(macOS)
     private var up: Bool { model.connectionEstablished }
 
-    private var macHeadline: String {
+    private var failed: Bool {
+        #if os(macOS)
+        model.gameState.isFailed || model.warpState.isFailed || model.systemProxyError != nil
+        #else
+        model.warpState.isFailed || model.systemProxyError != nil
+        #endif
+    }
+
+    private var headline: String {
         if !model.warpRegistered { return "WARP is not set up" }
-                if up { return "Connected" }
+        if up { return "Connected" }
         if model.connectionActive { return "Connecting…" }
-        if model.gameState.isFailed || model.warpState.isFailed || model.systemProxyError != nil {
-            return "Could not connect"
-        }
-        return "Not connected"
+        return failed ? "Could not connect" : "Not connected"
     }
 
     /// One line under the headline: the failure if there is one, otherwise
     /// what the current mode does.
-    private var macDetail: (text: String, isError: Bool) {
+    private var detail: (text: String, isError: Bool) {
+        #if os(macOS)
         if case .failed(let why) = model.gameState { return (why, true) }
         if let why = model.systemProxyError { return (why, true) }
         if !model.connectionIsGaming, case .failed(let why) = model.warpState { return (why, true) }
@@ -255,6 +245,31 @@ struct ProxyHomePanel: View {
         return (model.gamingPreferred
                 ? "Gaming routes the whole Mac, so games work too."
                 : "Routes apps that use the system proxy.", false)
+        #else
+        // The packet tunnel carries every app in both modes; Gaming changes
+        // what carries the tunnel (see VPNViewModel.gamingPreferred).
+        let device = DeviceNoun.current
+        if case .failed(let why) = model.warpState { return (why, true) }
+        if let why = model.systemProxyError { return (why, true) }
+        if up {
+            return (model.gamingPreferred
+                    ? "Everything on this \(device) goes through WARP, held steady for games."
+                    : "Everything on this \(device) goes through WARP.", false)
+        }
+        if model.connectionActive { return ("Starting WARP…", false) }
+        return (model.gamingPreferred
+                ? "Gaming keeps game connections up when the network changes path."
+                : "Routes every app on this \(device) through WARP.", false)
+        #endif
+    }
+
+    private var pillHelp: String {
+        if model.connectionActive { return "Disconnect to change mode" }
+        #if os(macOS)
+        return "On: the whole Mac is routed, so games work. Off: apps that use the system proxy."
+        #else
+        return "On: the tunnel runs over WireGuard where the network allows. Uses a little more battery."
+        #endif
     }
 
     private var orbPhase: PowerOrb.Phase {
@@ -279,9 +294,7 @@ struct ProxyHomePanel: View {
         .background(Midnight.card, in: Capsule())
         .opacity(model.connectionActive ? 0.6 : 1)
         .disabled(model.connectionActive)
-        .help(model.connectionActive
-              ? "Disconnect to change mode"
-              : "On: the whole Mac is routed, so games work. Off: apps that use the system proxy.")
+        .help(pillHelp)
         .accessibilityElement(children: .combine)
         .accessibilityHint("Chooses how the next connection routes traffic")
     }
@@ -295,11 +308,11 @@ struct ProxyHomePanel: View {
                     .accessibilityLabel(model.connectionActive ? "Disconnect" : "Connect")
             }
             VStack(spacing: 6) {
-                Text(macHeadline)
+                Text(headline)
                     .font(.system(size: 26, weight: .semibold))
                     .multilineTextAlignment(.center)
-                Text(macDetail.text).font(.callout)
-                    .foregroundStyle(macDetail.isError ? Midnight.danger : .secondary)
+                Text(detail.text).font(.callout)
+                    .foregroundStyle(detail.isError ? Midnight.danger : .secondary)
                     .multilineTextAlignment(.center).textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(minHeight: 40, alignment: .top)
@@ -319,48 +332,6 @@ struct ProxyHomePanel: View {
         }
         .frame(maxWidth: 420)
     }
-    #else
-    var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: model.systemProxyEnabled ? "lock.shield.fill" : "shield")
-                .font(.system(size: 44, weight: .medium))
-                .foregroundStyle(model.systemProxyEnabled ? Midnight.good : .secondary)
-            Text(headline).font(.title2.weight(.semibold))
-            if let status = model.warpStatusText {
-                Text(status).font(.caption)
-                    .foregroundStyle(model.warpState.isFailed ? Midnight.danger : .secondary)
-                    .multilineTextAlignment(.center).textSelection(.enabled)
-            }
-            if let why = model.systemProxyError {
-                Text(why).font(.caption).foregroundStyle(Midnight.danger).multilineTextAlignment(.center)
-            }
-            if model.warpRegistered {
-                Button {
-                    model.setEverythingThroughWarp(!model.systemProxyEnabled)
-                } label: {
-                    Text(model.systemProxyEnabled ? "Stop routing this \(DeviceNoun.current) through WARP"
-                                                  : "Route this \(DeviceNoun.current) through WARP")
-                        .font(.headline).frame(maxWidth: .infinity, minHeight: 44)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(model.systemProxyEnabled ? Midnight.danger : .accentColor)
-                #if os(macOS)
-                Text("macOS asks for your password each way. For a single app, use Settings ▸ Tor and proxy.")
-                    .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                #else
-                Text("iOS asks once to add a VPN configuration. It stays on after you close Sweep; turn it off here or in Settings ▸ VPN.")
-                    .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                #endif
-            } else {
-                Button("Set up WARP") { model.activeSheet = .onboarding }
-                    .buttonStyle(.borderedProminent).controlSize(.large)
-            }
-        }
-        .padding(24)
-        .frame(maxWidth: 420)
-        .background(Midnight.panel, in: .rect(cornerRadius: 24, style: .continuous))
-    }
-    #endif
 }
 
 /// "Mac", "iPhone" or "iPad", for copy that names the device being routed.
@@ -388,7 +359,7 @@ struct Backdrop: View {
 
     var body: some View {
         ZStack {
-            Color(nsColorOrSystemBackground)
+            Midnight.background
             LinearGradient(colors: [tint.color.opacity(strength),
                                     Color.clear,
                                     tint.color.opacity(strength * 0.5)],
@@ -403,14 +374,6 @@ struct Backdrop: View {
         // window sent to the background kept the GPU drawing a gradient nobody
         // could see. Setting the phase without an animation is what stops it.
         .onChange(of: animate) { phase = $0 }
-    }
-
-    private var nsColorOrSystemBackground: Color {
-        #if os(macOS)
-        Midnight.background
-        #else
-        Color(uiColor: .systemBackground)
-        #endif
     }
 }
 

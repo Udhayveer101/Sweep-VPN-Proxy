@@ -497,15 +497,6 @@ public final class VPNViewModel: ObservableObject {
         }
     }
 
-    public var warpStatusText: String? {
-        switch warpState {
-        case .stopped: return nil
-        case .starting: return "Connecting to WARP… (SNI \(options.warpSNI))"
-        case .running: return "All traffic goes through Cloudflare WARP (SNI \(options.warpSNI))"
-        case .failed(let why): return why
-        }
-    }
-
     /// The iOS app ships as the WARP build (SweepProxyOnly in Info.plist).
     public let proxyOnly = Bundle.main.object(forInfoDictionaryKey: "SweepProxyOnly") as? String == "YES"
 
@@ -520,14 +511,17 @@ public final class VPNViewModel: ObservableObject {
     /// work in the ordinary mode. Gaming mode carries it over WireGuard where
     /// the network allows, so a change of network path does not reset the
     /// connections inside it (see `WarpController.gaming`). Opt-in: it keeps
-    /// the radio busier. Same defaults key as the Mac's switch.
-    @Published public var gameModeEnabled = UserDefaults.standard.bool(forKey: "sweep.gamingMode") {
-        didSet {
-            guard gameModeEnabled != oldValue else { return }
-            UserDefaults.standard.set(gameModeEnabled, forKey: "sweep.gamingMode")
-            if options.warpEnabled { setWarp(enabled: true) }   // restart with the new setting
-        }
+    /// the radio busier. Same name and defaults key as the Mac's switch, and
+    /// like it only read when a connection starts: the home screen locks the
+    /// switch while one is up.
+    @Published public var gamingPreferred = UserDefaults.standard.bool(forKey: "sweep.gamingMode") {
+        didSet { UserDefaults.standard.set(gamingPreferred, forKey: "sweep.gamingMode") }
     }
+
+    // What the home screen's one button needs, under the Mac's names.
+    public var connectionActive: Bool { systemProxyEnabled }
+    public var connectionEstablished: Bool { warpState == .running }
+    public func toggleConnection() { setEverythingThroughWarp(!connectionActive) }
 
     public func setWarp(enabled: Bool) {
         systemProxyError = nil
@@ -536,7 +530,7 @@ public final class VPNViewModel: ObservableObject {
         options = o
         guard enabled else { warp.stop(); return }
         if warp.sni != options.warpSNI { warp = WarpController(sni: options.warpSNI) }
-        warp.gaming = gameModeEnabled
+        warp.gaming = gamingPreferred
         warp.start { [weak self] st in Task { @MainActor in self?.warpState = st } }
     }
 

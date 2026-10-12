@@ -1,11 +1,8 @@
 import SwiftUI
 
-/// The app's one look: true black, dark grey surfaces, system blue for what
-/// you can press and green for "protected". macOS only for now; on iOS every
-/// token falls back to the system colour it replaces, so shared views keep
-/// their existing appearance there.
+/// The app's one look, on the Mac, iPhone and iPad alike: true black, dark
+/// grey surfaces, system blue for what you can press and green for "protected".
 enum Midnight {
-    #if os(macOS)
     static let background = Color.black
     static let card = Color(red: 0.11, green: 0.11, blue: 0.118)       // #1c1c1e
     static let raised = Color(red: 0.173, green: 0.173, blue: 0.18)    // #2c2c2e
@@ -13,45 +10,19 @@ enum Midnight {
     static let good = Color(red: 0.188, green: 0.82, blue: 0.345)      // #30d158
     static let danger = Color(red: 1, green: 0.271, blue: 0.227)       // #ff453a
     static let warning = Color(red: 1, green: 0.624, blue: 0.039)      // #ff9f0a
-    #else
-    static let background = Color(uiColor: .systemBackground)
-    static let card = Color(uiColor: .secondarySystemBackground)
-    static let raised = Color(uiColor: .tertiarySystemBackground)
-    static let accent = Color.accentColor
-    static let good = Color.green
-    static let danger = Color.red
-    static let warning = Color.orange
-    #endif
     static let hairline = Color.primary.opacity(0.12)
 
-    /// Chrome behind a row or a banner. A flat card here; iOS keeps the
-    /// material it always had.
-    static var surface: AnyShapeStyle {
-        #if os(macOS)
-        AnyShapeStyle(card)
-        #else
-        AnyShapeStyle(.thinMaterial)
-        #endif
-    }
-    static var panel: AnyShapeStyle {
-        #if os(macOS)
-        AnyShapeStyle(card)
-        #else
-        AnyShapeStyle(.ultraThinMaterial)
-        #endif
-    }
+    /// Chrome behind a row, a banner or a panel: a flat card.
+    static let surface = card
+    static let panel = card
 }
 
 extension View {
     /// Root of a window or sheet: black canvas, dark controls, blue tint.
-    @ViewBuilder func midnightPage() -> some View {
-        #if os(macOS)
-        self.background(Midnight.background)
+    func midnightPage() -> some View {
+        background(Midnight.background)
             .tint(Midnight.accent)
             .preferredColorScheme(.dark)
-        #else
-        self
-        #endif
     }
 
     /// A surface one step above the page.
