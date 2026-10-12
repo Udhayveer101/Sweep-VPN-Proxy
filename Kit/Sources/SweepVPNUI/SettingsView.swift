@@ -51,10 +51,7 @@ public struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
 
                     Toggle("Gaming mode", isOn: $model.gameModeEnabled)
-                    if let status = model.gameStatusText {
-                        Text(status).font(.footnote).foregroundStyle(.secondary)
-                    }
-                    Text("Games already go through the tunnel. This additionally retires each connection to Cloudflare before the network can drop it, which removes the pauses mid-game.")
+                    Text("Games already go through the tunnel. This carries it over WireGuard where the network allows, so a change of network path no longer drops the game's connections. Uses a little more battery.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 #endif

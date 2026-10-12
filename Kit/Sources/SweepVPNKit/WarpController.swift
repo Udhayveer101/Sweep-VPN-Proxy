@@ -437,6 +437,8 @@ extension WarpController {
     static func classify(_ line: String) -> LogEvent? {
         if line.contains("SOCKS proxy listening on") { return .listening }
         if line.contains("Connected to MASQUE server") { return .connected }
+        // iOS gaming mode (warpmobile/wg.go).
+        if line.contains("Connected to WARP over WireGuard") { return .connected }
         if line.contains("Tunnel connection lost") { return .lost }
         if sessionFaultPhrases.contains(where: line.contains) { return .error }
         let l = line.lowercased()

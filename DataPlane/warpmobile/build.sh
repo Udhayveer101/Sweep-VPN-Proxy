@@ -24,7 +24,7 @@ git -C "$WORK" -c user.name=ci -c user.email=ci@localhost am -q \
     "$PATCHES/standby-age-log.patch" \
     "$PATCHES/hop-probe.patch" \
     "$PATCHES/wgtun.patch"
-mkdir -p "$WORK/sweepwarp" && cp "$HERE/main.go" "$HERE/main_test.go" "$WORK/sweepwarp/"
+mkdir -p "$WORK/sweepwarp" && cp "$HERE"/*.go "$WORK/sweepwarp/"
 (cd "$WORK" && go vet ./sweepwarp && go test ./sweepwarp)
 
 build() { # <sdk> <clang target> <out dir>

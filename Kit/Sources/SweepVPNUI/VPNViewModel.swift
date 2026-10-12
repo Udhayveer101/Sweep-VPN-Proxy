@@ -514,23 +514,19 @@ public final class VPNViewModel: ObservableObject {
 
     public func setEverythingThroughWarp(_ on: Bool) { setWarp(enabled: on) }
 
-    /// Gaming mode on iOS is only about flow rotation.
+    /// Gaming mode on iOS is about which transport carries the tunnel.
     ///
     /// The packet tunnel already carries every packet, UDP included, so games
-    /// work in the ordinary mode; the warm standby is always on. Rotation is
-    /// the one extra step, and it stays opt-in because the swap can briefly
-    /// stall new connections.
-    @Published public var gameModeEnabled = false {
+    /// work in the ordinary mode. Gaming mode carries it over WireGuard where
+    /// the network allows, so a change of network path does not reset the
+    /// connections inside it (see `WarpController.gaming`). Opt-in: it keeps
+    /// the radio busier. Same defaults key as the Mac's switch.
+    @Published public var gameModeEnabled = UserDefaults.standard.bool(forKey: "sweep.gamingMode") {
         didSet {
             guard gameModeEnabled != oldValue else { return }
+            UserDefaults.standard.set(gameModeEnabled, forKey: "sweep.gamingMode")
             if options.warpEnabled { setWarp(enabled: true) }   // restart with the new setting
         }
-    }
-
-    public var gameStatusText: String? {
-        gameModeEnabled
-            ? "Flows are retired before the network can drop them. New connections may pause briefly."
-            : nil
     }
 
     public func setWarp(enabled: Bool) {
@@ -540,7 +536,7 @@ public final class VPNViewModel: ObservableObject {
         options = o
         guard enabled else { warp.stop(); return }
         if warp.sni != options.warpSNI { warp = WarpController(sni: options.warpSNI) }
-        warp.flowTTLSeconds = gameModeEnabled ? 90 : 0
+        warp.gaming = gameModeEnabled
         warp.start { [weak self] st in Task { @MainActor in self?.warpState = st } }
     }
 
