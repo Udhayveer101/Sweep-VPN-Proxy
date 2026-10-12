@@ -139,8 +139,13 @@ jobs:
             throw "never logged: $pattern"
           }
           function Assert-Tunnelled($what) {
-            $via = (Find-NetRoute -RemoteIPAddress "1.0.0.1" | Select-Object -First 1).InterfaceAlias
-            if ($via -ne "usque") { throw "$what`: 1.0.0.1 routes via '$via', not the tunnel" }
+            # What Windows made of the device and its routes, for the log.
+            Get-NetIPAddress -InterfaceAlias usque -AddressFamily IPv4 -ErrorAction SilentlyContinue | Format-Table IPAddress, PrefixLength, AddressState | Out-String | Write-Host
+            Get-NetRoute -InterfaceAlias usque -AddressFamily IPv4 -ErrorAction SilentlyContinue | Format-Table DestinationPrefix, NextHop, RouteMetric | Out-String | Write-Host
+            try { Write-Host "1.0.0.1 routes via $((Find-NetRoute -RemoteIPAddress '1.0.0.1' | Select-Object -First 1).InterfaceAlias)" } catch { Write-Host "Find-NetRoute: $_" }
+            $halves = @(Get-NetRoute -InterfaceAlias usque -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.DestinationPrefix -in "0.0.0.0/1", "128.0.0.0/1" })
+            if ($halves.Count -ne 2) { throw "$what`: the default route is not on the tunnel" }
+            # Direct traffic says warp=off here, so warp=on is the tunnel carrying it.
             for ($i = 0; $i -lt 6; $i++) {
               try {
                 $body = (Invoke-WebRequest "https://www.cloudflare.com/cdn-cgi/trace" -UseBasicParsing -TimeoutSec 10).Content
@@ -171,8 +176,7 @@ jobs:
             }
             Stop-Sweep
             # A crash must not strand the PC: the device went with the process.
-            $via = (Find-NetRoute -RemoteIPAddress "1.0.0.1" | Select-Object -First 1).InterfaceAlias
-            if ($via -eq "usque") { throw "the tunnel route outlived the app" }
+            if (Get-NetRoute -DestinationPrefix "0.0.0.0/1" -ErrorAction SilentlyContinue) { throw "the tunnel route outlived the app" }
             Invoke-WebRequest "https://www.cloudflare.com/cdn-cgi/trace" -UseBasicParsing -TimeoutSec 15 | Out-Null
             Write-Host "WireGuard OK; network back after a kill"
 
