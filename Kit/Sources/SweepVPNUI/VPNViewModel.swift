@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import NetworkExtension
+import Network
 import SweepVPNCore
 import SweepVPNKit
 
@@ -160,7 +161,7 @@ public final class VPNViewModel: ObservableObject {
     /// in Info.plist), so its screens offer the proxy instead of Connect.
     public let proxyOnly = Bundle.main.object(forInfoDictionaryKey: "SweepProxyOnly") as? String == "YES"
 
-    @Published public private(set) var systemProxyEnabled = false
+    @Published public internal(set) var systemProxyEnabled = false
     @Published public private(set) var systemProxyError: String?
     /// Set while WARP is still starting and the whole Mac is meant to follow it.
     private var armSystemProxyWhenReady = false
@@ -205,6 +206,50 @@ public final class VPNViewModel: ObservableObject {
             systemProxyEnabled = SystemProxy.isEnabled(port: options.localProxyPort)
             systemProxyError = error.localizedDescription
         }
+        watchSystemProxy(systemProxyEnabled)
+    }
+
+    private var proxyPathMonitor: NWPathMonitor?
+    private var systemProxyDrifted = false
+    static let proxyDriftMessage = "The network changed and this Mac's proxy setting no longer points at Sweep, so apps are not going through WARP. Disconnect and connect again."
+
+    /// `systemProxyEnabled` records what we set, not what is in force. The
+    /// setting belongs to a network service, so a service that did not exist
+    /// when we set it (a new adapter, a tether) or a change made in System
+    /// Settings leaves apps going out directly under a "Connected" headline.
+    /// Ask the system what it hands apps whenever the network path changes.
+    private func watchSystemProxy(_ on: Bool) {
+        proxyPathMonitor?.cancel()
+        proxyPathMonitor = nil
+        noteSystemProxy(inForce: true)
+        guard on else { return }
+        let port = options.localProxyPort
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            // Offline has no primary service and so no proxy to read.
+            guard path.status == .satisfied else { return }
+            // configd settles the new primary service a moment after the path.
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                let inForce = SystemProxy.isEffective(port: port)
+                Task { @MainActor in self?.noteSystemProxy(inForce: inForce) }
+            }
+        }
+        monitor.start(queue: .global())
+        proxyPathMonitor = monitor
+    }
+
+    /// Only the message changes. `systemProxyEnabled` stays as it was, so
+    /// Disconnect and quitting still undo the setting on every service.
+    func noteSystemProxy(inForce: Bool) {
+        if inForce {
+            if systemProxyDrifted { systemProxyDrifted = false; systemProxyError = nil }
+            return
+        }
+        guard systemProxyEnabled, !systemProxyDrifted else { return }
+        systemProxyDrifted = true
+        systemProxyError = Self.proxyDriftMessage
+        EventLog.shared.record(phase: "systemProxy", level: .error, kind: "drifted",
+                               detail: "the effective proxy is no longer ours")
     }
 
     /// Leaving the system pointed at a proxy that died with the app would take
@@ -296,7 +341,7 @@ public final class VPNViewModel: ObservableObject {
         switch gameState {
         case .stopped:  return nil
         case .starting: return "Gaming mode starting - this needs your admin password"
-        case .running:  return "Gaming mode on: the whole Mac, games included, goes through WARP"
+        case .running:  return "Gaming mode on: this Mac's IPv4 internet traffic, games included, goes through WARP"
         case .failed(let why): return why
         }
     }

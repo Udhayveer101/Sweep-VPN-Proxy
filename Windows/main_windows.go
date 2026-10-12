@@ -601,7 +601,7 @@ func (a *app) statusLine() (title string, r, g, b byte) {
 	if a.gameOn {
 		switch a.gameState {
 		case "running":
-			return "Gaming mode on: the whole PC goes through WARP (" + transport + ")", 52, 199, 89
+			return "Gaming mode on: this PC's IPv4 traffic goes through WARP (" + transport + ")", 52, 199, 89
 		case "failed":
 			return "Problem: " + a.gameMsg, 255, 59, 48
 		}
@@ -613,7 +613,7 @@ func (a *app) statusLine() (title string, r, g, b byte) {
 	switch a.warpState {
 	case Running:
 		if a.proxyOn {
-			return "Connected — this PC goes through WARP", 52, 199, 89
+			return "Connected — apps that use the Windows proxy go through WARP", 52, 199, 89
 		}
 		return fmt.Sprintf("WARP ready on 127.0.0.1:%d (SNI %s)", proxyPort, a.sni()), 52, 199, 89
 	case Starting:

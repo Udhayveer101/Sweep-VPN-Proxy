@@ -249,14 +249,50 @@ and the simulator cannot host a NetworkExtension at all.
 The `.xcodeproj` is generated, not tracked — `make project` writes it from
 `project.yml` plus your local config.
 
+## What the proxy build does and does not protect
+
+The released macOS and Windows apps are not a system-wide VPN. They run
+[usque](https://github.com/Diniboy1123/usque) (Cloudflare WARP over MASQUE) and
+steer traffic to it one of two ways.
+
+| | Proxy mode (default) | Gaming mode |
+|---|---|---|
+| How | System proxy pointed at a loopback listener (SOCKS on macOS, HTTP on Windows) | A TUN device and a split default route; needs admin rights |
+| Carried | TCP from apps that honour the system proxy | IPv4 internet traffic from every app, UDP included |
+| Not carried | Apps that ignore the proxy, all UDP (games, QUIC, WebRTC media), ICMP | Private ranges `10/8` and `192.168/16`, multicast, the tunnel endpoints, hosts in `direct-hosts` that answer directly (by default `mc.hypixel.net`), and IPv6 on a network that has it |
+| DNS | Resolved by whatever each app does: through the proxy for apps that pass hostnames to it, through the system resolver otherwise | System resolver pinned to `1.1.1.1` (macOS); set on the tunnel adapter only (Windows) |
+| If the tunnel drops | Proxied apps get a refused connection; everything else was never in it | macOS holds traffic in a blackhole until usque is back; Windows has no such hold, so when usque exits its adapter and routes go with it and traffic uses the physical link |
+
+Who can still see what:
+
+- **Cloudflare** terminates the tunnel and sees every destination, as any VPN
+  provider does. Content stays protected only by the application's own TLS.
+- **The local network and ISP** see that this device talks to a Cloudflare
+  endpoint, and everything in the "Not carried" row in full.
+- **Websites** see a Cloudflare address in the same country as you. WARP does
+  not let you pick an exit country and is not built to hide your location; a
+  browser's WebRTC can still reveal your real address in proxy mode.
+- The proxy listener is bound to loopback without a password, so any program
+  running on the machine can use it.
+
 ## What this does not collect
 
 No account, no telemetry, no crash reporting, no analytics SDK. The diagnostics
 ring buffer is scrubbed of IPs, domains and DNS names before anything reaches it
 and never leaves the device. Secrets live in the keychain
-(`AfterFirstUnlock`, `ThisDeviceOnly`, app-group scoped). The only network calls
-a build makes on its own are to the server you configured and, if you asked for
-public relays, to `vpngate.net` or the mirror you named.
+(`AfterFirstUnlock`, `ThisDeviceOnly`, app-group scoped).
+
+Network calls a build makes on its own:
+
+- **GitHub** (`api.github.com`, then the release asset host): the macOS and
+  Windows apps check this repository's releases at launch and once a day.
+- **Cloudflare**: WARP registration (`api.cloudflareclient.com`) when you press
+  Register, and the tunnel itself while connected.
+- **Gaming mode, at each start**: a DNS lookup of `mc.hypixel.net` (plus any
+  host in `direct-hosts`) through the network's resolver and `1.1.1.1`, and one
+  TCP connect to each answer, to decide whether it stays off the tunnel.
+- The server you configured and, if you asked for public relays, `vpngate.net`
+  or the mirror you named.
 
 ## License
 

@@ -247,7 +247,7 @@ struct ProxyHomePanel: View {
         if let why = model.systemProxyError { return (why, true) }
         if !model.connectionIsGaming, case .failed(let why) = model.warpState { return (why, true) }
         if model.gameState == .starting { return ("macOS will ask for your admin password.", false) }
-        if model.gameState == .running { return ("Everything on this Mac goes through WARP, games included.", false) }
+        if model.gameState == .running { return ("This Mac's IPv4 internet traffic goes through WARP, games included. The local network stays direct.", false) }
         if model.systemProxyEnabled { return ("Apps that use the system proxy go through WARP.", false) }
         if model.connectionActive { return ("Starting WARP…", false) }
         return (model.gamingPreferred

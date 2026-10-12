@@ -385,7 +385,7 @@ function detail(s, active) {
   if (s.proxyError) return [s.proxyError, true];
   if (!s.game && s.warp === "failed") return [s.status || "WARP failed.", true];
   if (s.gameBusy) return ["Windows will ask for administrator rights.", false];
-  if (s.game && s.gameState === "running") return ["Everything on this PC goes through WARP, games included.", false];
+  if (s.game && s.gameState === "running") return ["This PC's IPv4 internet traffic goes through WARP, games included. The local network stays direct.", false];
   if (s.proxyOn) return ["Apps that use the Windows proxy go through WARP.", false];
   if (active) return ["Starting WARP…", false];
   if (!s.registered) return ["Register this PC with Cloudflare WARP to begin. It is free.", false];
