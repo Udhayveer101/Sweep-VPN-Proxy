@@ -62,10 +62,11 @@ type app struct {
 	setupBusy             bool
 	setupError            string
 
-	update      *Update
-	updateState string // idle | checking | uptodate | downloading | failed
-	updateError string
-	installing  bool
+	update       *Update
+	updateState  string // idle | checking | uptodate | downloading | installing | failed
+	updateError  string
+	updateNotice string // what the last update did, until dismissed
+	installing   bool
 
 	mStatus, mRoute, mGame, mSetup, mStartup, mUpdate *systray.MenuItem
 }
@@ -74,7 +75,14 @@ func main() {
 	restore := flag.Bool("restore-proxy", false, "put back the proxy settings Sweep changed, then exit")
 	game := flag.Bool("game", false, "start with gaming mode on (set by the elevated relaunch)")
 	background := flag.Bool("background", false, "start in the tray without opening the window (Start with Windows)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
+	flag.StringVar(&updatedFrom, "updated-from", "", "set by the updater: the version this one replaced")
+	flag.BoolVar(&updateNow, "update", false, "install a newer version, if there is one, without asking")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 	startInGameMode = *game
 	enableDPIAwareness()
 
@@ -97,7 +105,7 @@ func main() {
 		h, err := windows.CreateMutex(nil, false, name)
 		switch {
 		case err == nil:
-			owned = true
+			owned, instance = true, h
 		case h != 0:
 			windows.CloseHandle(h)
 		}
@@ -126,6 +134,22 @@ func main() {
 	openAtStart = !*background || startInGameMode
 	systray.Run(a.onReady, a.onExit)
 }
+
+// instance is the single-instance mutex. The updater gives it up early so the
+// new version can start while this one waits to see that it did.
+var instance windows.Handle
+
+func releaseInstance() {
+	if instance != 0 {
+		windows.CloseHandle(instance)
+		instance = 0
+	}
+}
+
+var (
+	updatedFrom string // -updated-from
+	updateNow   bool   // -update
+)
 
 // openAtStart: a normal launch opens the window like the Mac app; Start with
 // Windows starts quietly in the tray.
@@ -243,6 +267,19 @@ func (a *app) onReady() {
 		go a.ui.show() // off the tray's thread: WebView2 takes a moment
 	}
 	go a.watchShowRequests()
+
+	// Everything an update could have broken has run by now.
+	if updatedFrom != "" {
+		a.logf("updated from %s", updatedFrom)
+		confirmUpdate(updatedFrom)
+	}
+	if n := getString(noticeValue); n != "" {
+		setString(noticeValue, "")
+		a.mu.Lock()
+		a.updateNotice = n
+		a.mu.Unlock()
+		a.changed()
+	}
 
 	// Quiet unless there is something to offer; the ticker is for the PCs
 	// that stay signed in for weeks.

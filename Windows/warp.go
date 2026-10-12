@@ -29,9 +29,9 @@ type Warp struct {
 	// long-lived TCP flows never reaches it. Empty or "0" disables rotation;
 	// it is opt-in because the swap can briefly stall new connections.
 	FlowTTL string
-	Port             int
-	OnState          func(State, string)
-	Log              io.Writer
+	Port    int
+	OnState func(State, string)
+	Log     io.Writer
 
 	mu          sync.Mutex
 	cmd         *exec.Cmd
@@ -67,10 +67,10 @@ func (s State) String() string {
 var (
 	recoveryGrace = 15 * time.Second
 	restartFloor  = 20 * time.Second
-	stallTimeout = 30 * time.Second
-	respawnDelay = 2 * time.Second
-	exitWindow   = 2 * time.Minute
-	exitBurst    = 5
+	stallTimeout  = 30 * time.Second
+	respawnDelay  = 2 * time.Second
+	exitWindow    = 2 * time.Minute
+	exitBurst     = 5
 )
 
 // Args mirrors WarpController.arguments; the comments there record why each
@@ -100,8 +100,14 @@ func (w *Warp) Args() []string {
 	// 11 of 26 promotions already dead (docs/measurements-2026-09-20.md).
 	// Rotation is the one case that needs a warm session, because there the
 	// promotion is planned rather than a response to a kill.
+	// --hop-probe: reconnect when the second hop changes, instead of 8s later
+	// when the PING times out (gamemode.sh records the measurements).
+	// ponytail: usque's probe uses the unprivileged ICMP socket, which Windows
+	// does not have, so here it logs "Hop probe disabled" and the PING timeout
+	// still does the work. Give the probe a raw-socket path when a Windows
+	// machine is there to measure it on.
 	args := append([]string{"-c", w.Config, "nativetun"}, common...)
-	args = append(args, "-S")
+	args = append(args, "-S", "--hop-probe", "250ms")
 	if w.FlowTTL != "" && w.FlowTTL != "0" {
 		args = append(args, "--hot-standby", "--flow-ttl", w.FlowTTL)
 	}

@@ -184,7 +184,7 @@ public struct SettingsView: View {
                         Text("Version \(update.version) is available.")
                         HStack {
                             Button("Update now") { model.installUpdate() }
-                                .disabled(model.updateState == .downloading)
+                                .disabled(model.updateState == .downloading || model.updateState == .installing)
                             Button("Later") { model.snoozeUpdate() }
                         }
                     } else {
@@ -198,6 +198,8 @@ public struct SettingsView: View {
                         // The download is verified against the checksum the
                         // release publishes before the disk image is opened.
                         Text("Downloading and verifying…").font(.footnote).foregroundStyle(.secondary)
+                    case .installing:
+                        Text("Installing. Sweep VPN will restart…").font(.footnote).foregroundStyle(.secondary)
                     case .failed(let why):
                         Text(why).font(.footnote).foregroundStyle(Midnight.danger)
                     case .idle:

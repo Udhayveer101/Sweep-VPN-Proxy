@@ -217,8 +217,11 @@ public final class VPNViewModel: ObservableObject {
     // MARK: Updates
 
     public enum UpdateState: Equatable, Sendable {
-        case idle, checking, downloading, failed(String)
+        case idle, checking, downloading, installing, failed(String)
     }
+
+    /// What the last update did, shown once after the relaunch.
+    @Published public var updateNotice: String?
 
     @Published public private(set) var availableUpdate: UpdateChecker.Update?
     @Published public private(set) var updateState: UpdateState = .idle
@@ -229,7 +232,7 @@ public final class VPNViewModel: ObservableObject {
     /// being offline, up to date or snoozed all look the same to the user.
     /// `force` is the Settings button, which ignores an outstanding "Later".
     public func checkForUpdates(force: Bool = false) {
-        guard updateState != .checking, updateState != .downloading else { return }
+        guard updateState != .checking, updateState != .downloading, updateState != .installing else { return }
         updateState = .checking
         let checker = UpdateChecker()
         Task { @MainActor in
@@ -245,13 +248,14 @@ public final class VPNViewModel: ObservableObject {
     /// Builds with network extensions, and copies that cannot write their own
     /// folder, get the mounted DMG instead.
     public func installUpdate() {
-        guard let update = availableUpdate, updateState != .downloading else { return }
+        guard let update = availableUpdate, updateState != .downloading, updateState != .installing else { return }
         updateState = .downloading
         let checker = UpdateChecker()
         let replaceInPlace = proxyOnly
         Task { @MainActor in
             do {
                 let dmg = try await checker.download(update)
+                self.updateState = .installing
                 // hdiutil and codesign take seconds; keep them off the main thread.
                 let staged = try await Task.detached { () -> URL? in
                     if replaceInPlace, let staged = try checker.stage(dmg) { return staged }
@@ -259,12 +263,17 @@ public final class VPNViewModel: ObservableObject {
                     return nil
                 }.value
                 if let staged {
-                    try UpdateChecker.swapAfterExit(staged: staged)
+                    try UpdateChecker.swapAfterExit(staged: staged, version: update.version)
                     NSApp.terminate(nil)
+                    return
                 }
-                self.updateState = .idle
+                // This copy cannot replace itself (it runs from a folder it may
+                // not write, or straight from a download), so say what is left.
+                self.updateState = .failed("This copy of Sweep VPN cannot replace itself here. The new version is open in Finder: drag it to Applications.")
             } catch UpdateChecker.UpdateError.digestMismatch {
                 self.updateState = .failed("The downloaded update did not match its published checksum, so it was discarded.")
+            } catch UpdateChecker.UpdateError.noSpace {
+                self.updateState = .failed("Not enough free disk space to install the update.")
             } catch UpdateChecker.UpdateError.untrustedSignature {
                 self.updateState = .failed("The downloaded app is not signed by Sweep's developer, so it was not installed.")
             } catch {
@@ -631,6 +640,15 @@ public final class VPNViewModel: ObservableObject {
         #if os(macOS)
         // Quiet unless there is something to offer, and snoozed for a day by
         // "Later". The repeat is for the Macs that stay logged in for weeks.
+        if updateTimer == nil {
+            switch UpdateChecker().finishPendingUpdate() {
+            case .updated(let version)?:
+                updateNotice = "Updated to version \(version)."
+            case .failed(let version, let reason)?:
+                updateNotice = "Version \(version) was not installed. \(reason)"
+            case nil: break
+            }
+        }
         checkForUpdates()
         if updateTimer == nil {
             updateTimer = Timer.scheduledTimer(withTimeInterval: UpdateChecker.snoozeInterval,

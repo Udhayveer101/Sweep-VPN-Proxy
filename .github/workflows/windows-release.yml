@@ -107,6 +107,106 @@ jobs:
           Start-Process $exe -ArgumentList "-restore-proxy" -Wait
           Get-Content "$env:LOCALAPPDATA\SweepVPN\sweep.log" | Where-Object { $_ -notmatch "usque: " }
 
+      # The updater, for real: an "installed" older build whose feed is this
+      # machine updates itself to a newer build, keeps its settings and comes
+      # back routed; then it is offered a build that never starts and must put
+      # itself back. Both builds are this commit's code under other versions.
+      - name: End-to-end update and rollback
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $work = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\installed").FullName
+          $feed = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\feed").FullName
+          $exe = "$work\SweepVPN.exe"
+          $key = "HKCU:\Software\SweepVPN"
+          $inet = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+          $log = "$env:LOCALAPPDATA\SweepVPN\sweep.log"
+
+          Push-Location Windows
+          $url = "http://127.0.0.1:8765"
+          go build -trimpath -ldflags "-H windowsgui -X main.version=0.0.1 -X main.releasesFeed=$url/releases.json" -o "$feed\old.exe" .
+          go build -trimpath -ldflags "-H windowsgui -X main.version=99.0.0 -X main.releasesFeed=$url/releases.json" -o "$feed\SweepVPN-99.0.0-windows-x64.exe" .
+          go build -trimpath -ldflags "-H windowsgui -X main.version=99.0.1" -o "$feed\SweepVPN-99.0.1-windows-x64.exe" ./testdata/neverconfirms
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+          Pop-Location
+
+          function Publish($version) {
+            $name = "SweepVPN-$version-windows-x64.exe"
+            $hash = (Get-FileHash "$feed\$name" -Algorithm SHA256).Hash.ToLower()
+            Set-Content "$feed\$name.sha256" "$hash  $name" -NoNewline
+            $assets = @(@{name = $name; browser_download_url = "$url/$name"},
+                        @{name = "$name.sha256"; browser_download_url = "$url/$name.sha256"})
+            # A macOS release newer than everything, which must never be picked.
+            $mac = @{tag_name = "v999.0"; body = ""; draft = $false; prerelease = $false; assets = @(
+                     @{name = "SweepVPN-999.0.dmg"; browser_download_url = "$url/none"},
+                     @{name = "SweepVPN-999.0.dmg.sha256"; browser_download_url = "$url/none"})}
+            $win = @{tag_name = "windows-v$version"; body = ""; draft = $false; prerelease = $false; assets = $assets}
+            ConvertTo-Json @($mac, $win) -Depth 5 | Set-Content "$feed\releases.json"
+          }
+          function Get-Version {
+            $out = "$env:RUNNER_TEMP\version.txt"
+            Start-Process $exe -ArgumentList "-version" -Wait -NoNewWindow -RedirectStandardOutput $out
+            (Get-Content $out -Raw).Trim()
+          }
+          function Running { @(Get-Process | Where-Object { $_.Path -eq $exe }) }
+          function Wait-Until($what, [scriptblock]$test, $seconds = 150) {
+            for ($i = 0; $i -lt $seconds; $i++) { if (& $test) { return }; Start-Sleep 1 }
+            Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch "usque: " } | Select-Object -Last 40
+            throw "timed out waiting for: $what"
+          }
+          function Stop-Sweep {
+            Running | Stop-Process -Force
+            Start-Sleep 2
+            Start-Process $exe -ArgumentList "-restore-proxy" -Wait
+          }
+
+          $server = Start-Process python -ArgumentList "-m","http.server","8765","--bind","127.0.0.1","--directory",$feed -PassThru -WindowStyle Hidden
+          try {
+            # --- update: 0.0.1 -> 99.0.0 ---
+            Publish "99.0.0"
+            Copy-Item "$feed\old.exe" $exe
+            Set-ItemProperty $key Enabled 1 -Type DWord
+            Set-ItemProperty $key GameRotate 1 -Type DWord      # a setting that must survive
+            Remove-ItemProperty $key UpdateFailedVersion -ErrorAction SilentlyContinue
+            if ((Get-Version) -ne "0.0.1") { throw "installed build is not 0.0.1" }
+
+            $old = Start-Process $exe -ArgumentList "-background","-update" -PassThru
+            Wait-Until "the old process to hand over and exit" { $old.HasExited }
+            if ((Get-Version) -ne "99.0.0") { throw "installed version is $(Get-Version), not 99.0.0" }
+            $now = Running
+            if ($now.Count -ne 1 -or $now[0].Id -eq $old.Id) { throw "expected exactly one new process, found $($now.Count)" }
+            if (-not (Select-String -Path $log -Pattern "updated from 0.0.1" -Quiet)) { throw "new version never confirmed" }
+            $k = Get-ItemProperty $key
+            if ($k.GameRotate -ne 1 -or $k.Enabled -ne 1) { throw "settings were not preserved" }
+            Wait-Until "the new version to route this PC again" { $p = Get-ItemProperty $inet; $p.ProxyEnable -eq 1 -and $p.ProxyServer -eq "127.0.0.1:1080" } 90
+            Wait-Until "the replaced build to be deleted" { -not (Test-Path "$exe.old") } 30
+            Write-Host "update 0.0.1 -> 99.0.0 OK: replaced, relaunched, confirmed, settings kept, routed"
+            Stop-Sweep
+
+            # --- rollback: 99.0.1 passes its checks and never starts ---
+            Publish "99.0.1"
+            Copy-Item "$feed\old.exe" $exe -Force
+            $old = Start-Process $exe -ArgumentList "-background","-update" -PassThru
+            Wait-Until "the old process to give up on the new one and exit" { $old.HasExited }
+            Wait-Until "the previous version to be running again" { (Running).Count -eq 1 } 30
+            if ((Get-Version) -ne "0.0.1") { throw "rollback left version $(Get-Version) installed" }
+            $left = Get-ChildItem $work | ForEach-Object Name
+            if ("$left" -ne "SweepVPN.exe") { throw "rollback left files behind: $left" }
+            if ((Get-ItemProperty $key).UpdateFailedVersion -ne "99.0.1") { throw "the failed version was not remembered" }
+            # No loop: left alone, it must not try 99.0.1 again.
+            Start-Sleep 20
+            if ((Get-Version) -ne "0.0.1" -or (Select-String -Path $log -Pattern "update: downloading 99.0.1").Count -ne 1) {
+              throw "the failed update was attempted again"
+            }
+            Write-Host "rollback OK: previous version restored and running, failed version not retried"
+            Stop-Sweep
+          } finally {
+            Running | Stop-Process -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            Remove-ItemProperty $key UpdateFailedVersion, UpdateNotice -ErrorAction SilentlyContinue
+            Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match "update|alert|started" } | Select-Object -Last 30
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: SweepVPN-windows

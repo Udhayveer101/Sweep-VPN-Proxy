@@ -26,6 +26,14 @@ public struct HomeView: View {
                 header
                 #if os(macOS)
                 if model.availableUpdate != nil { UpdateBanner(model: model) }
+                if let notice = model.updateNotice {
+                    HStack(spacing: 12) {
+                        Text(notice).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
+                        Button("OK") { model.updateNotice = nil }
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 10)
+                    .background(Midnight.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
                 #endif
                 Spacer(minLength: 0)
                 if model.proxyOnly {
@@ -433,13 +441,15 @@ struct UpdateBanner: View {
                     .font(.callout.weight(.medium))
                 if case .downloading = model.updateState {
                     Text("Downloading and verifying…").font(.caption).foregroundStyle(.secondary)
+                } else if case .installing = model.updateState {
+                    Text("Installing. Sweep VPN will restart…").font(.caption).foregroundStyle(.secondary)
                 } else if case .failed(let why) = model.updateState {
                     Text(why).font(.caption).foregroundStyle(Midnight.danger)
                 }
             }
             Spacer(minLength: 0)
             Button("Update") { model.installUpdate() }
-                .disabled(model.updateState == .downloading)
+                .disabled(model.updateState == .downloading || model.updateState == .installing)
             Button("Later") { model.snoozeUpdate() }
                 .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary)
         }

@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -151,5 +154,70 @@ func TestDownloadAcceptsAMatch(t *testing.T) {
 		Asset: srv.URL + "/SweepVPN.exe", Digest: srv.URL + "/SweepVPN.exe.sha256"})
 	if err != nil || string(got) != string(payload) {
 		t.Fatalf("rejected a good download: %v", err)
+	}
+}
+
+func TestSwapKeepsTheOldBuildAndRollbackRestoresIt(t *testing.T) {
+	dir := t.TempDir()
+	exe, staged := filepath.Join(dir, "Sweep.exe"), filepath.Join(dir, "Sweep.exe.new")
+	write := func(p, s string) {
+		if err := os.WriteFile(p, []byte(s), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(p string) string { b, _ := os.ReadFile(p); return string(b) }
+	write(exe, "old")
+	write(staged, "new")
+	write(exe+".old", "ancient") // left by an earlier update
+
+	if err := swapExe(exe, staged); err != nil {
+		t.Fatal(err)
+	}
+	if read(exe) != "new" || read(exe+".old") != "old" {
+		t.Fatalf("after swap: exe=%q old=%q", read(exe), read(exe+".old"))
+	}
+	if err := rollbackExe(exe); err != nil {
+		t.Fatal(err)
+	}
+	left, _ := os.ReadDir(dir)
+	if read(exe) != "old" || len(left) != 1 {
+		t.Fatalf("after rollback: exe=%q, %d files left", read(exe), len(left))
+	}
+}
+
+// A swap that cannot finish must leave the installed build where it was.
+func TestFailedSwapLeavesTheInstalledBuild(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "Sweep.exe")
+	if err := os.WriteFile(exe, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := swapExe(exe, filepath.Join(dir, "missing.new")); err == nil {
+		t.Fatal("swapped in a file that does not exist")
+	}
+	if b, _ := os.ReadFile(exe); string(b) != "old" {
+		t.Fatalf("installed build is now %q", b)
+	}
+}
+
+func TestStagedBuildMustRunAndReportItsVersion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script as the staged build; the CI end-to-end step covers the real exe")
+	}
+	script := func(body string) string {
+		p := filepath.Join(t.TempDir(), "staged")
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if err := reportsVersion(script("echo 2.6"), "2.6"); err != nil {
+		t.Fatalf("a good build was refused: %v", err)
+	}
+	if err := reportsVersion(script("echo 2.5"), "2.6"); err == nil {
+		t.Fatal("accepted a build that reports another version")
+	}
+	if err := reportsVersion(script("exit 1"), "2.6"); err == nil {
+		t.Fatal("accepted a build that does not run")
 	}
 }

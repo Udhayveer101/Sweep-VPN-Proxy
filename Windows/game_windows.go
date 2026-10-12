@@ -52,8 +52,10 @@ type GameRoutes struct {
 	iface    string // wintun interface name, e.g. "usque"
 	gateway  string // the physical default gateway, restored on the way out
 	endpoint string // the MASQUE server, pinned to the physical link
-	applied bool
+	applied  bool
 }
+
+var privateRanges = [][2]string{{"10.0.0.0", "255.0.0.0"}, {"192.168.0.0", "255.255.0.0"}}
 
 // IsElevated reports whether this process can change the routing table.
 func IsElevated() bool {
@@ -131,6 +133,13 @@ func (g *GameRoutes) Apply(iface, gateway, endpoint string) error {
 		}
 	}
 
+	// Private ranges stay on the physical link, as on the Mac: WARP cannot
+	// reach them, and a network whose resolvers are private otherwise loses
+	// every lookup. 172.16/12 is left out: it holds the tunnel's own address.
+	for _, lan := range privateRanges {
+		_ = run("route", "add", lan[0], "mask", lan[1], gateway)
+	}
+
 	if err := run("netsh", "interface", "ipv4", "set", "dnsservers",
 		"name="+iface, "static", "1.1.1.1", "primary"); err != nil {
 		// DNS is a comfort, not a requirement: the tunnel still carries
@@ -159,6 +168,9 @@ func (g *GameRoutes) Remove() error {
 		note(run("netsh", "interface", "ipv4", "delete", "route", half, g.iface, "store=active"))
 	}
 	note(run("route", "delete", g.endpoint))
+	for _, lan := range privateRanges {
+		_ = run("route", "delete", lan[0], "mask", lan[1], g.gateway)
+	}
 	g.applied = false
 	return firstErr
 }

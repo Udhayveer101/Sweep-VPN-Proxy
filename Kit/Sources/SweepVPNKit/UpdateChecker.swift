@@ -17,6 +17,8 @@ public struct UpdateChecker: @unchecked Sendable {
         public let notes: String
         public let asset: URL
         public let digest: URL
+        /// Bytes, from the feed; 0 when it did not say.
+        public var size: Int = 0
     }
 
     public enum UpdateError: Error, Equatable {
@@ -24,6 +26,7 @@ public struct UpdateChecker: @unchecked Sendable {
         case noAsset
         case digestMismatch
         case untrustedSignature
+        case noSpace
     }
 
     /// Both products publish into one release list, so `latest` is whichever
@@ -34,6 +37,7 @@ public struct UpdateChecker: @unchecked Sendable {
 
     public static let snoozeKey = "updateSnoozeUntil"
     public static let snoozeInterval: TimeInterval = 24 * 3600
+    public static let failedVersionKey = "updateFailedVersion"
 
     let current: String
     let tagPrefix: String
@@ -60,7 +64,14 @@ public struct UpdateChecker: @unchecked Sendable {
             return nil
         }
         guard let releases = try? await fetchReleases() else { return nil }
-        return Self.pick(from: releases, newerThan: current, tagPrefix: tagPrefix)
+        let found = Self.pick(from: releases, newerThan: current, tagPrefix: tagPrefix)
+        // A version that already failed to start here is not offered again on
+        // its own: that is how an updater ends up restarting the app every day.
+        // "Check for updates" still finds it, and a later release clears it.
+        if !force, let found, found.version == defaults.string(forKey: Self.failedVersionKey) {
+            return nil
+        }
+        return found
     }
 
     public func snooze(now: Date = Date()) {
@@ -87,7 +98,7 @@ public struct UpdateChecker: @unchecked Sendable {
         let draft: Bool?
         let prerelease: Bool?
         let assets: [Asset]
-        struct Asset: Decodable { let name: String; let browser_download_url: URL }
+        struct Asset: Decodable { let name: String; let browser_download_url: URL; var size: Int? }
     }
 
     /// The newest release whose tag carries our prefix and beats `current`.
@@ -110,7 +121,7 @@ public struct UpdateChecker: @unchecked Sendable {
             bestVersion = version
             best = Update(version: version, notes: release.body ?? "",
                           asset: asset.browser_download_url,
-                          digest: digest.browser_download_url)
+                          digest: digest.browser_download_url, size: asset.size ?? 0)
         }
         return best
     }
@@ -151,6 +162,15 @@ public struct UpdateChecker: @unchecked Sendable {
         let dir = Self.cacheDirectory
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let destination = dir.appendingPathComponent(update.asset.lastPathComponent)
+        // The image, the copy staged beside the app and the old app kept for
+        // rollback all exist at once. Refuse now rather than fail half-way.
+        let need = Int64(update.size) * 4
+        for volume in [dir, Bundle.main.bundleURL.deletingLastPathComponent()] {
+            if let free = try? volume.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+                .volumeAvailableCapacityForImportantUsage, free < need {
+                throw UpdateError.noSpace
+            }
+        }
 
         let (payload, response) = try await session.data(from: update.asset)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw UpdateError.transport }
@@ -291,38 +311,90 @@ public struct UpdateChecker: @unchecked Sendable {
     }
 
     /// Waits for the app to exit, renames the old bundle aside, renames the
-    /// staged one into place and relaunches. A failed second rename puts the
-    /// old bundle back, so there is always an app at the path. Gives up after
-    /// a minute if the app never quits.
+    /// staged one into place and launches it. The old bundle is kept until the
+    /// new app writes `confirmed` (see `finishPendingUpdate`); if it never
+    /// does, the old bundle goes back, is relaunched, and `failed` says why.
+    /// There is an app at the path on every exit.
+    /// Arguments: pid, bundle, staged, opener, state directory, ticks (0.2s)
+    /// to wait for the confirmation.
     static let swapScript = #"""
-        pid=$1 cur=$2 new=$3 old="$2.old" n=0
+        pid=$1 cur=$2 new=$3 opener=$4 state=$5 ticks=$6 old="$2.old" n=0
+        fail() { echo "$1" > "$state/failed"; rm -rf "$new"; exec "$opener" "$cur"; }
         while kill -0 "$pid" 2>/dev/null; do
-          n=$((n+1)); [ $n -gt 300 ] && { rm -rf "$new"; exit 1; }
+          n=$((n+1)); [ $n -gt 300 ] && { echo "Sweep VPN did not quit." > "$state/failed"; rm -rf "$new"; exit 1; }
           sleep 0.2
         done
         rm -rf "$old"
-        if mv "$cur" "$old"; then
-          if mv "$new" "$cur"; then rm -rf "$old"; else mv "$old" "$cur"; fi
-        fi
-        rm -rf "$new"
-        exec "$4" "$cur"
+        mv "$cur" "$old" || fail "macOS did not allow the installed app to be replaced."
+        mv "$new" "$cur" || { mv "$old" "$cur"; fail "The new version could not be moved into place."; }
+        "$opener" "$cur"
+        n=0
+        while [ ! -f "$state/confirmed" ] && [ $n -lt "$ticks" ]; do n=$((n+1)); sleep 0.2; done
+        if [ -f "$state/confirmed" ]; then rm -rf "$old"; rm -f "$state/confirmed"; exit 0; fi
+        pkill -f "$cur/Contents/MacOS/" 2>/dev/null; sleep 1
+        rm -rf "$cur.failed"
+        mv "$cur" "$cur.failed" && mv "$old" "$cur" && rm -rf "$cur.failed"
+        fail "The new version did not start, so the previous one was restored."
         """#
 
-    /// Starts the shell that performs the swap once `pid` is gone. The caller
+    /// How long the new version has to say it started: 45s.
+    public static let confirmTicks = 225
+
+    /// Starts the shell that performs the swap once `pid` is gone, and leaves
+    /// `pending` so the next launch knows an update was in flight. The caller
     /// then quits normally, so the usual quit-time cleanup (system proxy,
     /// gaming-mode routes) runs before the bundle is touched.
     @discardableResult
-    public static func swapAfterExit(staged: URL, bundle: URL = Bundle.main.bundleURL,
+    public static func swapAfterExit(staged: URL, version: String,
+                                     bundle: URL = Bundle.main.bundleURL,
                                      pid: Int32 = ProcessInfo.processInfo.processIdentifier,
-                                     opener: String = "/usr/bin/open") throws -> Process {
+                                     opener: String = "/usr/bin/open",
+                                     state: URL = cacheDirectory,
+                                     ticks: Int = confirmTicks) throws -> Process {
+        let fm = FileManager.default
+        try fm.createDirectory(at: state, withIntermediateDirectories: true)
+        for name in ["confirmed", "failed"] { try? fm.removeItem(at: state.appendingPathComponent(name)) }
+        try version.write(to: state.appendingPathComponent("pending"), atomically: true, encoding: .utf8)
         let swap = Process()
         swap.executableURL = URL(fileURLWithPath: "/bin/sh")
-        swap.arguments = ["-c", swapScript, "sh", String(pid), bundle.path, staged.path, opener]
+        swap.arguments = ["-c", swapScript, "sh", String(pid), bundle.path, staged.path, opener,
+                          state.path, String(ticks)]
         swap.standardInput = FileHandle.nullDevice
         swap.standardOutput = FileHandle.nullDevice
         swap.standardError = FileHandle.nullDevice
         try swap.run()
         return swap
+    }
+
+    public enum Outcome: Equatable, Sendable {
+        case updated(String)
+        case failed(version: String, reason: String)
+    }
+
+    /// Call once at launch. If the previous run started an update, this is
+    /// where it ends: the new version confirms it is running (which lets the
+    /// swap script delete the old bundle), or the restored old version learns
+    /// why it is still here and stops offering that release by itself.
+    public func finishPendingUpdate(state: URL = cacheDirectory) -> Outcome? {
+        let fm = FileManager.default
+        let pending = state.appendingPathComponent("pending")
+        let failed = state.appendingPathComponent("failed")
+        guard let version = (try? String(contentsOf: pending, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        try? fm.removeItem(at: pending)
+        if version == current {
+            fm.createFile(atPath: state.appendingPathComponent("confirmed").path, contents: nil)
+            defaults.removeObject(forKey: Self.failedVersionKey)
+            // The images are only needed until the version they hold is running.
+            for file in (try? fm.contentsOfDirectory(at: state, includingPropertiesForKeys: nil)) ?? []
+            where file.pathExtension == "dmg" { try? fm.removeItem(at: file) }
+            return .updated(version)
+        }
+        let reason = (try? String(contentsOf: failed, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try? fm.removeItem(at: failed)
+        defaults.set(version, forKey: Self.failedVersionKey)
+        return .failed(version: version, reason: reason ?? "The update did not finish.")
     }
 }
 
