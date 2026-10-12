@@ -164,6 +164,7 @@ jobs:
           try {
             # --- update: 0.0.1 -> 99.0.0 ---
             Publish "99.0.0"
+            Wait-Until "the local feed to answer" { try { (Invoke-WebRequest "$url/releases.json" -UseBasicParsing).StatusCode -eq 200 } catch { $false } } 30
             Copy-Item "$feed\old.exe" $exe
             Set-ItemProperty $key Enabled 1 -Type DWord
             Set-ItemProperty $key GameRotate 1 -Type DWord      # a setting that must survive
