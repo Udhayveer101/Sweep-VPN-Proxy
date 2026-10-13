@@ -40,13 +40,14 @@ xcodegen generate
 xcodebuild -project SweepVPN.xcodeproj -scheme SweepVPN-macOS-Direct -configuration Release \
   -destination 'generic/platform=macOS' -archivePath "$ARCHIVE" archive \
   CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="$IDENTITY" DEVELOPMENT_TEAM="$TEAM_ID" \
-  OTHER_CODE_SIGN_FLAGS=--timestamp ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+  OTHER_CODE_SIGN_FLAGS=--timestamp ARCHS="${ARCHS:-arm64 x86_64}" ONLY_ACTIVE_ARCH=NO \
   MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" | tail -5
 
 APP="$ARCHIVE/Products/Applications/Sweep VPN.app"
 [ -d "$APP" ] || { echo "archive produced no app" >&2; exit 1; }
 
 Tools/usque/build.sh "$OUT/usque"
+[ "${ARCHS:-}" = x86_64 ] && lipo "$OUT/usque" -thin x86_64 -output "$OUT/usque"
 USQUE="$OUT/usque" SIGN_TIMESTAMP=--timestamp Tools/bundle-warp.sh "$APP" "$IDENTITY"
 
 codesign --verify --deep --strict --verbose=2 "$APP"
@@ -93,7 +94,7 @@ if [ $NOTARIZE = 1 ]; then
   for i in 1 2 3; do xcrun stapler staple "$APP" && break; sleep 10; done
 fi
 
-DMG="$OUT/SweepVPN-$VERSION.dmg"
+DMG="$OUT/${DMG_NAME:-SweepVPN-$VERSION}.dmg"
 STAGE="$OUT/dmg" && mkdir -p "$STAGE"
 ditto "$APP" "$STAGE/Sweep VPN.app"
 ln -s /Applications "$STAGE/Applications"
