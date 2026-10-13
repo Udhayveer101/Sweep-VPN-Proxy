@@ -9,9 +9,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
-export CFLAGS="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET -O2"
-export CXXFLAGS="$CFLAGS" LDFLAGS="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
+# ARCH=x86_64 cross-builds only what SweepOpenVPN links (openssl, lz4, fmt) into
+# build/deps-x86_64, for the Intel slice. tor is not bundled any more.
+ARCH="${ARCH:-arm64}"
+export CFLAGS="-arch $ARCH -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET -O2"
+export CXXFLAGS="$CFLAGS" LDFLAGS="-arch $ARCH -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET"
 PREFIX="$PWD/build/deps"
+[ "$ARCH" = arm64 ] || PREFIX="$PREFIX-$ARCH"
 SRC="$PWD/build/deps-src"
 JOBS="$(sysctl -n hw.ncpu)"
 mkdir -p "$PREFIX" "$SRC"
@@ -28,9 +32,10 @@ unpack() { # formula -> prints source dir
 }
 
 D=$(unpack openssl@3)
-(cd "$D" && ./Configure darwin64-arm64-cc no-tests no-shared \
+(cd "$D" && ./Configure "darwin64-$ARCH-cc" no-tests no-shared \
    --prefix="$PREFIX" --libdir=lib && make -j"$JOBS" && make install_sw) >/dev/null
 
+if [ "$ARCH" = arm64 ]; then
 D=$(unpack libevent)
 (cd "$D" && ./configure --prefix="$PREFIX" --disable-samples \
    --disable-openssl --disable-shared && make -j"$JOBS" install) >/dev/null
@@ -44,14 +49,15 @@ rm -rf "$SRC/tor-$TOR" && tar -xzf "$SRC/tor.tgz" -C "$SRC"
    --with-libevent-dir="$PREFIX" --enable-static-openssl --enable-static-libevent \
    --disable-asciidoc --disable-manpage --disable-html-manual --disable-lzma \
    --disable-zstd --disable-unittests && make -j"$JOBS" install) >/dev/null
+fi
 
 D=$(unpack lz4)
-(cd "$D" && make -j"$JOBS" -C lib liblz4.a && cp lib/liblz4.a "$PREFIX/lib/" \
+(cd "$D" && make -j"$JOBS" -C lib liblz4.a && mkdir -p "$PREFIX/include" && cp lib/liblz4.a "$PREFIX/lib/" \
    && cp lib/lz4.h lib/lz4hc.h lib/lz4frame.h "$PREFIX/include/") >/dev/null
 
 D=$(unpack fmt)
-(cmake -S "$D" -B "$SRC/fmt-build" -GNinja -DCMAKE_BUILD_TYPE=Release \
-   -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" -DFMT_TEST=OFF -DFMT_DOC=OFF \
-   -DCMAKE_INSTALL_PREFIX="$PREFIX" && cmake --build "$SRC/fmt-build" --target install) >/dev/null
+(cmake -S "$D" -B "$SRC/fmt-build-$ARCH" -GNinja -DCMAKE_BUILD_TYPE=Release \
+   -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" -DCMAKE_OSX_ARCHITECTURES="$ARCH" -DFMT_TEST=OFF -DFMT_DOC=OFF \
+   -DCMAKE_INSTALL_PREFIX="$PREFIX" && cmake --build "$SRC/fmt-build-$ARCH" --target install) >/dev/null
 
 echo "deps -> $PREFIX (minos $MACOSX_DEPLOYMENT_TARGET)"

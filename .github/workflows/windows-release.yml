@@ -9,6 +9,10 @@ on:
     branches: [vpn-overhaul, main]
     paths: ["Windows/**", "Tools/usque/**", ".github/workflows/windows-release.yml"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build as (a test build; nothing is published)
+        required: false
 
 permissions:
   contents: write
@@ -28,12 +32,16 @@ jobs:
           cache-dependency-path: Windows/go.sum
 
       - name: Version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/windows-v* ]]; then V="${GITHUB_REF_NAME#windows-v}"; else V="0.0.0-ci.${GITHUB_RUN_NUMBER}"; fi
+          if [[ "$GITHUB_REF" == refs/tags/windows-v* ]]; then V="${GITHUB_REF_NAME#windows-v}"
+          elif [[ "$INPUT_VERSION" =~ ^[0-9A-Za-z.-]+$ ]]; then V="$INPUT_VERSION"
+          else V="0.0.0-ci.${GITHUB_RUN_NUMBER}"; fi
           echo "VERSION=$V" >> "$GITHUB_ENV"
 
       - name: Build
-        run: Windows/build.sh "$VERSION"
+        run: SWEEP_TEST_USQUE=1 Windows/build.sh "$VERSION"
 
       - name: Register a WARP device for the tests
         run: |
@@ -106,6 +114,194 @@ jobs:
           Stop-Process -Id $app.Id -Force
           Start-Process $exe -ArgumentList "-restore-proxy" -Wait
           Get-Content "$env:LOCALAPPDATA\SweepVPN\sweep.log" | Where-Object { $_ -notmatch "usque: " }
+
+      # Gaming mode, for real: the whole runner routed through a wintun device,
+      # over WireGuard, then over MASQUE when WireGuard cannot get through.
+      # Azure's own control addresses stay on the physical link, or the runner
+      # loses its host while the default route points at the tunnel.
+      - name: End-to-end gaming mode (WireGuard, then the MASQUE fallback)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = (Resolve-Path "Windows/dist/SweepVPN-$env:VERSION-windows-x64.exe").Path
+          $log = "$env:LOCALAPPDATA\SweepVPN\sweep.log"
+          $wg = "$env:APPDATA\SweepVPN\warp\wg-warp.json"
+          Set-ItemProperty "HKCU:\Software\SweepVPN" Enabled 0 -Type DWord
+          Remove-Item $wg -ErrorAction SilentlyContinue
+
+          $gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0" | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+          foreach ($ip in "168.63.129.16", "169.254.169.254") { route add $ip mask 255.255.255.255 $gw | Out-Null }
+
+          function Lines($pattern) { @(Select-String -Path $log -Pattern $pattern -SimpleMatch) }
+          function Wait-Log($pattern, $after, $seconds = 120) {
+            for ($i = 0; $i -lt $seconds; $i++) { if ((Lines $pattern).Count -gt $after) { return }; Start-Sleep 1 }
+            Get-Content $log | Select-Object -Last 60
+            throw "never logged: $pattern"
+          }
+          function Assert-Tunnelled($what) {
+            # What Windows made of the device and its routes, for the log.
+            Get-NetIPAddress -InterfaceAlias usque -AddressFamily IPv4 -ErrorAction SilentlyContinue | Format-Table IPAddress, PrefixLength, AddressState | Out-String | Write-Host
+            Get-NetRoute -InterfaceAlias usque -AddressFamily IPv4 -ErrorAction SilentlyContinue | Format-Table DestinationPrefix, NextHop, RouteMetric | Out-String | Write-Host
+            try { Write-Host "1.0.0.1 routes via $((Find-NetRoute -RemoteIPAddress '1.0.0.1' | Select-Object -First 1).InterfaceAlias)" } catch { Write-Host "Find-NetRoute: $_" }
+            $halves = @(Get-NetRoute -InterfaceAlias usque -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.DestinationPrefix -in "0.0.0.0/1", "128.0.0.0/1" })
+            if ($halves.Count -ne 2) { throw "$what`: the default route is not on the tunnel" }
+            # Direct traffic says warp=off here, so warp=on is the tunnel carrying it.
+            for ($i = 0; $i -lt 6; $i++) {
+              try {
+                $body = (Invoke-WebRequest "https://www.cloudflare.com/cdn-cgi/trace" -UseBasicParsing -TimeoutSec 10).Content
+                if ($body -match "warp=(on|plus)") { Write-Host "$what`: routed through the tunnel, $($Matches[0])"; return }
+              } catch { Write-Host $_ }
+              Start-Sleep 3
+            }
+            throw "$what`: traffic through the tunnel is not on WARP"
+          }
+          function Stop-Sweep { Get-Process | Where-Object { $_.Path -eq $exe } | Stop-Process -Force; Start-Sleep 3 }
+
+          try {
+            # --- WireGuard: registers by itself, handshakes, carries traffic ---
+            $n = (Lines "gaming mode routed through usque over").Count
+            Start-Process $exe -ArgumentList "-game","-background"
+            Wait-Log "gaming mode routed through usque over" $n
+            if (-not (Test-Path $wg)) { throw "no WireGuard registration was made" }
+            if ((Lines "gaming mode routed through usque over WireGuard").Count -eq 0) {
+              Get-Content $log | Select-Object -Last 60
+              throw "gaming mode did not come up over WireGuard"
+            }
+            Assert-Tunnelled "WireGuard"
+            # Idle and busy for a while: the watcher must not move a healthy session.
+            1..10 | ForEach-Object { Invoke-WebRequest "https://www.cloudflare.com/cdn-cgi/trace" -UseBasicParsing -TimeoutSec 10 | Out-Null; Start-Sleep 2 }
+            if ((Lines "moving the WireGuard session").Count -gt 0 -or (Lines "WireGuard ended").Count -gt 0) {
+              Get-Content $log | Select-Object -Last 60
+              throw "a healthy WireGuard session was disturbed"
+            }
+            Stop-Sweep
+            # A crash must not strand the PC: the device went with the process.
+            if (Get-NetRoute -DestinationPrefix "0.0.0.0/1" -ErrorAction SilentlyContinue) { throw "the tunnel route outlived the app" }
+            Invoke-WebRequest "https://www.cloudflare.com/cdn-cgi/trace" -UseBasicParsing -TimeoutSec 15 | Out-Null
+            Write-Host "WireGuard OK; network back after a kill"
+
+            # --- fallback: a registration whose server never answers ---
+            $id = Get-Content $wg -Raw | ConvertFrom-Json
+            $id.config.peers[0].endpoint.v4 = "192.0.2.1:0"
+            $id | ConvertTo-Json -Depth 20 | Set-Content $wg
+            $n = (Lines "gaming mode routed through usque over").Count
+            Start-Process $exe -ArgumentList "-game","-background"
+            Wait-Log "continuing over MASQUE" 0
+            Wait-Log "gaming mode routed through usque over MASQUE" 0
+            Assert-Tunnelled "MASQUE fallback"
+            Start-Sleep 5
+            $hop = Lines "Hop 2 is"
+            Write-Host ("hop probe: " + $(if ($hop.Count) { $hop[-1].Line } elseif ((Lines "Hop probe disabled").Count) { "DISABLED" } else { "running, no router answered at hop 2 on this network" }))
+            if ((Lines "Hop probe disabled").Count -gt 0) { throw "the hop probe is disabled on Windows" }
+            Stop-Sweep
+            Write-Host "MASQUE fallback OK"
+          } finally {
+            Get-Process | Where-Object { $_.Path -eq $exe } | Stop-Process -Force -ErrorAction SilentlyContinue
+            Remove-Item $wg -ErrorAction SilentlyContinue
+            foreach ($ip in "168.63.129.16", "169.254.169.254", "192.0.2.1") { route delete $ip 2>$null | Out-Null }
+            Get-Content $log | Where-Object { $_ -match "wireguard|WireGuard|gaming|game routes|Hop |alert" } | Select-Object -Last 40
+          }
+
+      # The updater, for real: an "installed" older build whose feed is this
+      # machine updates itself to a newer build, keeps its settings and comes
+      # back routed; then it is offered a build that never starts and must put
+      # itself back. Both builds are this commit's code under other versions.
+      - name: End-to-end update and rollback
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $work = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\installed").FullName
+          $feed = (New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\feed").FullName
+          $exe = "$work\SweepVPN.exe"
+          $key = "HKCU:\Software\SweepVPN"
+          $inet = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+          $log = "$env:LOCALAPPDATA\SweepVPN\sweep.log"
+
+          Push-Location Windows
+          $url = "http://127.0.0.1:8765"
+          go build -trimpath -ldflags "-H windowsgui -X main.version=0.0.1 -X main.releasesFeed=$url/releases.json" -o "$feed\old.exe" .
+          go build -trimpath -ldflags "-H windowsgui -X main.version=99.0.0 -X main.releasesFeed=$url/releases.json" -o "$feed\SweepVPN-99.0.0-windows-x64.exe" .
+          go build -trimpath -ldflags "-H windowsgui -X main.version=99.0.1" -o "$feed\SweepVPN-99.0.1-windows-x64.exe" ./testdata/neverconfirms
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+          Pop-Location
+
+          function Publish($version) {
+            $name = "SweepVPN-$version-windows-x64.exe"
+            $hash = (Get-FileHash "$feed\$name" -Algorithm SHA256).Hash.ToLower()
+            Set-Content "$feed\$name.sha256" "$hash  $name" -NoNewline
+            $assets = @(@{name = $name; browser_download_url = "$url/$name"},
+                        @{name = "$name.sha256"; browser_download_url = "$url/$name.sha256"})
+            # A macOS release newer than everything, which must never be picked.
+            $mac = @{tag_name = "v999.0"; body = ""; draft = $false; prerelease = $false; assets = @(
+                     @{name = "SweepVPN-999.0.dmg"; browser_download_url = "$url/none"},
+                     @{name = "SweepVPN-999.0.dmg.sha256"; browser_download_url = "$url/none"})}
+            $win = @{tag_name = "windows-v$version"; body = ""; draft = $false; prerelease = $false; assets = $assets}
+            ConvertTo-Json @($mac, $win) -Depth 5 | Set-Content "$feed\releases.json"
+          }
+          function Get-Version {
+            $out = "$env:RUNNER_TEMP\version.txt"
+            Start-Process $exe -ArgumentList "-version" -Wait -NoNewWindow -RedirectStandardOutput $out
+            (Get-Content $out -Raw).Trim()
+          }
+          function Running { @(Get-Process | Where-Object { $_.Path -eq $exe }) }
+          function Wait-Until($what, [scriptblock]$test, $seconds = 150) {
+            for ($i = 0; $i -lt $seconds; $i++) { if (& $test) { return }; Start-Sleep 1 }
+            Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch "usque: " } | Select-Object -Last 40
+            throw "timed out waiting for: $what"
+          }
+          function Stop-Sweep {
+            Running | Stop-Process -Force
+            Start-Sleep 2
+            Start-Process $exe -ArgumentList "-restore-proxy" -Wait
+          }
+
+          $server = Start-Process python -ArgumentList "-m","http.server","8765","--bind","127.0.0.1","--directory",$feed -PassThru -WindowStyle Hidden
+          try {
+            # --- update: 0.0.1 -> 99.0.0 ---
+            Publish "99.0.0"
+            Wait-Until "the local feed to answer" { try { (Invoke-WebRequest "$url/releases.json" -UseBasicParsing).StatusCode -eq 200 } catch { $false } } 30
+            Copy-Item "$feed\old.exe" $exe
+            Set-ItemProperty $key Enabled 1 -Type DWord
+            Set-ItemProperty $key GameRotate 1 -Type DWord      # a setting that must survive
+            Remove-ItemProperty $key UpdateFailedVersion -ErrorAction SilentlyContinue
+            if ((Get-Version) -ne "0.0.1") { throw "installed build is not 0.0.1" }
+
+            $old = Start-Process $exe -ArgumentList "-background","-update" -PassThru
+            Wait-Until "the old process to hand over and exit" { $old.HasExited }
+            if ((Get-Version) -ne "99.0.0") { throw "installed version is $(Get-Version), not 99.0.0" }
+            $now = Running
+            if ($now.Count -ne 1 -or $now[0].Id -eq $old.Id) { throw "expected exactly one new process, found $($now.Count)" }
+            if (-not (Select-String -Path $log -Pattern "updated from 0.0.1" -Quiet)) { throw "new version never confirmed" }
+            $k = Get-ItemProperty $key
+            if ($k.GameRotate -ne 1 -or $k.Enabled -ne 1) { throw "settings were not preserved" }
+            Wait-Until "the new version to route this PC again" { $p = Get-ItemProperty $inet; $p.ProxyEnable -eq 1 -and $p.ProxyServer -eq "127.0.0.1:1080" } 90
+            Wait-Until "the replaced build to be deleted" { -not (Test-Path "$exe.old") } 30
+            Write-Host "update 0.0.1 -> 99.0.0 OK: replaced, relaunched, confirmed, settings kept, routed"
+            Stop-Sweep
+
+            # --- rollback: 99.0.1 passes its checks and never starts ---
+            Publish "99.0.1"
+            Copy-Item "$feed\old.exe" $exe -Force
+            $old = Start-Process $exe -ArgumentList "-background","-update" -PassThru
+            Wait-Until "the old process to give up on the new one and exit" { $old.HasExited }
+            Wait-Until "the previous version to be running again" { (Running).Count -eq 1 } 30
+            if ((Get-Version) -ne "0.0.1") { throw "rollback left version $(Get-Version) installed" }
+            $left = Get-ChildItem $work | ForEach-Object Name
+            if ("$left" -ne "SweepVPN.exe") { throw "rollback left files behind: $left" }
+            if ((Get-ItemProperty $key).UpdateFailedVersion -ne "99.0.1") { throw "the failed version was not remembered" }
+            # No loop: left alone, it must not try 99.0.1 again.
+            Start-Sleep 20
+            if ((Get-Version) -ne "0.0.1" -or (Select-String -Path $log -Pattern "update: downloading 99.0.1").Count -ne 1) {
+              throw "the failed update was attempted again"
+            }
+            Write-Host "rollback OK: previous version restored and running, failed version not retried"
+            Stop-Sweep
+          } finally {
+            Running | Stop-Process -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            Remove-ItemProperty $key UpdateFailedVersion, UpdateNotice -ErrorAction SilentlyContinue
+            Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match "update|alert|started" } | Select-Object -Last 30
+          }
 
       - uses: actions/upload-artifact@v4
         with:

@@ -32,7 +32,7 @@ final class WarpControllerTests: XCTestCase {
         let w = WarpController(executable: URL(fileURLWithPath: "/usr/bin/false"),
                                socksPort: 1081, sni: "example.com", directory: dir)
         XCTAssertEqual(w.arguments, ["-c", dir.appendingPathComponent("config.json").path, "socks",
-                                     "-s", "example.com", "--http2",
+                                     "-s", "example.com", "--http2", "-P", "8443",
                                      "--always-reconnect", "-k", "5s", "--dns-timeout", "15s",
                                      "-d", "1.1.1.1", "-d", "1.0.0.1",
                                      "-b", "127.0.0.1", "-p", "1081"])

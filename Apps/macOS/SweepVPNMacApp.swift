@@ -115,6 +115,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         GameModeController.withdrawOrphanedRuns()
+        // A sheet blocks its parent window, so SwiftUI never sees a click
+        // beside it. Watch for one here and close the sheet, the way a click
+        // outside a popover would. Onboarding stays: it is not dismissable.
+        NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+            if let window = event.window, window.sheetParent == nil,
+               let sheet = window.attachedSheet, sheet.attachedSheet == nil,
+               event.locationInWindow.y < window.contentLayoutRect.maxY {
+                MainActor.assumeIsolated {
+                    if Self.model?.activeSheet != .onboarding { Self.model?.activeSheet = nil }
+                }
+            }
+            return event
+        }
     }
 
     /// The system SOCKS proxy points at a listener that dies with this app, so

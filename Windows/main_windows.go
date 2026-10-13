@@ -20,6 +20,12 @@ import (
 //go:embed usque.exe
 var usqueBinary []byte
 
+// wintun.dll (fetched by build.sh) must sit beside usque.exe: gaming mode's
+// TUN device cannot be created without it.
+//
+//go:embed wintun.dll
+var wintunDLL []byte
+
 var version = "dev"
 
 const proxyPort = 1080
@@ -56,10 +62,11 @@ type app struct {
 	setupBusy             bool
 	setupError            string
 
-	update      *Update
-	updateState string // idle | checking | uptodate | downloading | failed
-	updateError string
-	installing  bool
+	update       *Update
+	updateState  string // idle | checking | uptodate | downloading | installing | failed
+	updateError  string
+	updateNotice string // what the last update did, until dismissed
+	installing   bool
 
 	mStatus, mRoute, mGame, mSetup, mStartup, mUpdate *systray.MenuItem
 }
@@ -68,7 +75,14 @@ func main() {
 	restore := flag.Bool("restore-proxy", false, "put back the proxy settings Sweep changed, then exit")
 	game := flag.Bool("game", false, "start with gaming mode on (set by the elevated relaunch)")
 	background := flag.Bool("background", false, "start in the tray without opening the window (Start with Windows)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
+	flag.StringVar(&updatedFrom, "updated-from", "", "set by the updater: the version this one replaced")
+	flag.BoolVar(&updateNow, "update", false, "install a newer version, if there is one, without asking")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 	startInGameMode = *game
 	enableDPIAwareness()
 
@@ -91,7 +105,7 @@ func main() {
 		h, err := windows.CreateMutex(nil, false, name)
 		switch {
 		case err == nil:
-			owned = true
+			owned, instance = true, h
 		case h != 0:
 			windows.CloseHandle(h)
 		}
@@ -120,6 +134,22 @@ func main() {
 	openAtStart = !*background || startInGameMode
 	systray.Run(a.onReady, a.onExit)
 }
+
+// instance is the single-instance mutex. The updater gives it up early so the
+// new version can start while this one waits to see that it did.
+var instance windows.Handle
+
+func releaseInstance() {
+	if instance != 0 {
+		windows.CloseHandle(instance)
+		instance = 0
+	}
+}
+
+var (
+	updatedFrom string // -updated-from
+	updateNow   bool   // -update
+)
 
 // openAtStart: a normal launch opens the window like the Mac app; Start with
 // Windows starts quietly in the tray.
@@ -150,10 +180,11 @@ func newApp() (*app, error) {
 
 	sum := sha256.Sum256(usqueBinary)
 	a.usque = filepath.Join(a.dataDir, "usque-"+hex.EncodeToString(sum[:4])+".exe")
-	if fi, err := os.Stat(a.usque); err != nil || fi.Size() != int64(len(usqueBinary)) {
-		if err := os.WriteFile(a.usque, usqueBinary, 0o700); err != nil {
-			return nil, fmt.Errorf("could not unpack WARP: %w", err)
-		}
+	if err := unpack(a.usque, usqueBinary, 0o700); err != nil {
+		return nil, fmt.Errorf("could not unpack WARP: %w", err)
+	}
+	if err := unpack(filepath.Join(a.dataDir, "wintun.dll"), wintunDLL, 0o600); err != nil {
+		return nil, fmt.Errorf("could not unpack wintun: %w", err)
 	}
 	a.warp = &Warp{Exe: a.usque, Config: a.config, SNI: a.sni(), Port: proxyPort, Log: a.log, OnState: a.onWarpState}
 	a.logf("sweep %s started", version)
@@ -231,6 +262,19 @@ func (a *app) onReady() {
 		go a.ui.show() // off the tray's thread: WebView2 takes a moment
 	}
 	go a.watchShowRequests()
+
+	// Everything an update could have broken has run by now.
+	if updatedFrom != "" {
+		a.logf("updated from %s", updatedFrom)
+		confirmUpdate(updatedFrom)
+	}
+	if n := getString(noticeValue); n != "" {
+		setString(noticeValue, "")
+		a.mu.Lock()
+		a.updateNotice = n
+		a.mu.Unlock()
+		a.changed()
+	}
 
 	// Quiet unless there is something to offer; the ticker is for the PCs
 	// that stay signed in for weeks.
@@ -363,7 +407,7 @@ func (a *app) setGameMode(on bool) {
 	a.gameOn, a.gameGW, a.gameState, a.gameMsg = true, gateway, "starting", ""
 	a.mu.Unlock()
 	a.changed()
-	a.warp.SetMode(true, a.flowTTL(), a.sni())
+	a.warp.SetMode(true, a.flowTTL(), a.sni(), a.wireGuard(true))
 	a.warp.Start() // onWarpState applies the routes once the device is up
 }
 
@@ -376,7 +420,7 @@ func (a *app) stopGame() {
 		return
 	}
 	a.warp.Stop()
-	a.warp.SetMode(false, "0", a.sni())
+	a.warp.SetMode(false, "0", a.sni(), "")
 	a.routesMu.Lock()
 	err := a.routes.Remove()
 	a.routesMu.Unlock()
@@ -400,7 +444,11 @@ func (a *app) applyGameRoutes() {
 	err := WaitForInterface(gameInterface, 30*time.Second)
 	if err == nil {
 		_ = a.routes.Remove()
-		err = a.routes.Apply(gameInterface, gw, MasqueEndpoint(a.config))
+		eps := []string{MasqueEndpoint(a.config)}
+		if wg := WireGuardEndpoint(a.wgIdentity()); wg != "" {
+			eps = append(eps, wg)
+		}
+		err = a.routes.Apply(gameInterface, gw, eps...)
 	}
 	a.mu.Lock()
 	still := a.gameOn
@@ -415,8 +463,50 @@ func (a *app) applyGameRoutes() {
 	}
 	if err != nil {
 		a.logf("game routes: %v", err)
+	} else if still {
+		a.logf("gaming mode routed through %s over %s", gameInterface, a.warp.Transport())
+		// A network that would not let the registration through directly
+		// will through the tunnel; it is then there for the next connect.
+		go a.wireGuard(true)
 	}
 	a.changed()
+}
+
+func (a *app) wgIdentity() string { return filepath.Join(filepath.Dir(a.config), "wg-warp.json") }
+
+var wgRegistering sync.Mutex
+
+// wireGuard returns gaming mode's WireGuard registration, making it first if
+// asked to and it is missing, or "" to stay on MASQUE. It is a second
+// anonymous device under the terms accepted at setup, as on iOS. HKCU
+// GameWireGuard=0 turns the transport off.
+func (a *app) wireGuard(register bool) string {
+	if !getBoolDefault("GameWireGuard", true) {
+		return ""
+	}
+	path := a.wgIdentity()
+	if WireGuardEndpoint(path) != "" {
+		return path
+	}
+	if !register {
+		return ""
+	}
+	wgRegistering.Lock()
+	defer wgRegistering.Unlock()
+	if WireGuardEndpoint(path) != "" {
+		return path
+	}
+	_ = os.Remove(path) // unreadable: wgregister leaves an existing file alone
+	if err := runOnce(a.usque, []string{"wgregister", "--identity", path}, "WireGuard registration"); err != nil {
+		a.logf("wireguard: %v; gaming mode uses MASQUE", err)
+		return ""
+	}
+	if WireGuardEndpoint(path) == "" {
+		a.logf("wireguard: registration saved no usable identity; gaming mode uses MASQUE")
+		return ""
+	}
+	a.logf("wireguard: registered this PC")
+	return path
 }
 
 // gameInterface is the wintun device name usque creates for nativetun.
@@ -441,7 +531,7 @@ func (a *app) setEnabled(on bool) {
 	a.enabled, a.proxyError = true, ""
 	a.mu.Unlock()
 	a.changed()
-	a.warp.SetMode(false, "0", a.sni())
+	a.warp.SetMode(false, "0", a.sni(), "")
 	a.warp.Start()
 }
 
@@ -505,12 +595,13 @@ func (a *app) onWarpState(s State, msg string) {
 
 // statusLine is the one-line summary the tray and the window share.
 func (a *app) statusLine() (title string, r, g, b byte) {
+	transport := a.warp.Transport() // takes the supervisor's lock: before ours
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.gameOn {
 		switch a.gameState {
 		case "running":
-			return "Gaming mode on: the whole PC goes through WARP", 52, 199, 89
+			return "Gaming mode on: this PC's IPv4 traffic goes through WARP (" + transport + ")", 52, 199, 89
 		case "failed":
 			return "Problem: " + a.gameMsg, 255, 59, 48
 		}
@@ -522,7 +613,7 @@ func (a *app) statusLine() (title string, r, g, b byte) {
 	switch a.warpState {
 	case Running:
 		if a.proxyOn {
-			return "Connected — this PC goes through WARP", 52, 199, 89
+			return "Connected — apps that use the Windows proxy go through WARP", 52, 199, 89
 		}
 		return fmt.Sprintf("WARP ready on 127.0.0.1:%d (SNI %s)", proxyPort, a.sni()), 52, 199, 89
 	case Starting:

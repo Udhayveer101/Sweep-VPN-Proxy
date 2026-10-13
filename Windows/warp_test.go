@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +33,7 @@ func TestClassify(t *testing.T) {
 func TestArgsBindLoopbackOnly(t *testing.T) {
 	w := &Warp{Config: "c.json", SNI: "example.com", Port: 1080}
 	a := strings.Join(w.Args(), " ")
-	for _, want := range []string{"http-proxy", "-b 127.0.0.1", "-p 1080", "--always-reconnect", "-k 5s", "--http2", "-s example.com", "-d 1.1.1.1 -d 1.0.0.1"} {
+	for _, want := range []string{"http-proxy", "-b 127.0.0.1", "-p 1080", "--always-reconnect", "-k 5s", "--http2", "-P 8443", "-s example.com", "-d 1.1.1.1 -d 1.0.0.1"} {
 		if !strings.Contains(a, want) {
 			t.Errorf("args %q missing %q", a, want)
 		}
@@ -222,5 +223,78 @@ func TestProxyArgsUnchanged(t *testing.T) {
 func TestTunDeviceCountsAsListening(t *testing.T) {
 	if classify("2026/09/18 00:40:02 Created TUN device: usque") != evListening {
 		t.Fatal("TUN creation must count as the tunnel being up")
+	}
+}
+
+// With a WireGuard registration, gaming mode is carried over WireGuard: a
+// session that is not tied to the client's address outlives the uplink switch
+// that ends every MASQUE session.
+func TestGameArgsUseWireGuardWhenRegistered(t *testing.T) {
+	w := &Warp{Exe: "usque.exe", Config: "c.json", SNI: "example.com", Game: true, WG: "wg-warp.json"}
+	if got := strings.Join(w.Args(), " "); got != "-c c.json wgtun --identity wg-warp.json" {
+		t.Fatalf("wrong WireGuard arguments: %s", got)
+	}
+	if w.Transport() != "WireGuard" {
+		t.Fatalf("transport reads %s", w.Transport())
+	}
+	// The proxy mode never uses it, whatever is registered.
+	w.Game = false
+	if strings.Contains(strings.Join(w.Args(), " "), "wgtun") {
+		t.Fatal("the proxy mode was given the WireGuard tunnel")
+	}
+}
+
+func TestWireGuardConnectLineCountsAsConnected(t *testing.T) {
+	if classify("2026/10/12 Connected to WARP over WireGuard") != evConnected {
+		t.Fatal("wgtun's connect line is not recognised")
+	}
+}
+
+// A network that does not let WireGuard through must still get a tunnel:
+// wgtun exits, and the supervisor carries on over MASQUE without counting a
+// crash or asking the user anything.
+func TestFallsBackToMasqueWhenWireGuardCannotStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script as usque; the CI end-to-end step covers the real one")
+	}
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "usque")
+	calls := filepath.Join(dir, "calls")
+	script := "#!/bin/sh\necho \"$*\" >> " + calls + "\ncase \"$*\" in *wgtun*) exit 3;; esac\n" +
+		"echo 'Created TUN device: usque'\nexec sleep 30\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(dir, "config.json")
+	_ = os.WriteFile(config, []byte("{}"), 0o600)
+
+	states := make(chan State, 16)
+	w := &Warp{Exe: fake, Config: config, SNI: "example.com", Log: testWriter{t},
+		OnState: func(s State, _ string) { states <- s }}
+	w.SetMode(true, "0", "", filepath.Join(dir, "wg-warp.json"))
+	w.Start()
+	defer w.Stop()
+	waitFor(t, states, Running)
+
+	if w.Transport() != "MASQUE" {
+		t.Fatalf("running over %s after WireGuard failed", w.Transport())
+	}
+	b, _ := os.ReadFile(calls)
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], "wgtun") || !strings.Contains(lines[1], "nativetun") {
+		t.Fatalf("expected one WireGuard attempt then MASQUE, got: %q", lines)
+	}
+	w.mu.Lock()
+	crashes := len(w.exits)
+	w.mu.Unlock()
+	if crashes != 0 {
+		t.Fatalf("the fallback was counted as %d crash(es)", crashes)
+	}
+
+	// The next connect tries WireGuard again: the network may be another one.
+	w.Stop()
+	w.SetMode(true, "0", "", filepath.Join(dir, "wg-warp.json"))
+	if w.Transport() != "WireGuard" {
+		t.Fatal("a past failure kept WireGuard off for the next session")
 	}
 }

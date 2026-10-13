@@ -38,13 +38,14 @@ public final class WarpController: @unchecked Sendable {
 
     deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
 
+    /// Gaming mode: the tunnel goes over WireGuard when this network lets a
+    /// handshake through, which survives the change of public address that
+    /// ends a MASQUE flow, and over MASQUE with the hop probe when it does
+    /// not. The same choice `gamemode.sh` makes on macOS.
+    public var gaming = false
+
     /// Saves (or refreshes) the WARP profile, then starts it. iOS shows its
     /// "Add VPN Configurations" prompt the first time.
-    /// Retire each MASQUE flow at this age so the ISP's sweep of long-lived
-    /// TCP flows never reaches it. 0 keeps the warm standby only, which is the
-    /// default: rotation can briefly stall new connections.
-    public var flowTTLSeconds: Int = 0
-
     public func start(onState: @escaping @Sendable (State) -> Void) {
         self.onState = onState
         guard WarpRegistration.isRegistered() else {
@@ -52,14 +53,16 @@ public final class WarpController: @unchecked Sendable {
             return
         }
         onState(.starting)
-        Task {
+        Task { [gaming] in
+            // Once, and best effort: without it gaming mode runs over MASQUE.
+            if gaming { try? await WarpRegistration.registerWireGuard() }
             do {
                 let manager = try await Self.loadOrCreateManager()
                 let proto = NETunnelProviderProtocol()
                 proto.providerBundleIdentifier = Self.providerBundleIdentifier
                 proto.serverAddress = "Cloudflare WARP (SNI \(sni))"
                 proto.providerConfiguration = ["sni": sni,
-                                               "flowTTL": NSNumber(value: flowTTLSeconds)]
+                                               "gaming": NSNumber(value: gaming)]
                 manager.protocolConfiguration = proto
                 manager.localizedDescription = "Sweep WARP"
                 manager.isEnabled = true
@@ -150,6 +153,21 @@ public final class WarpController: @unchecked Sendable {
 }
 
 extension WarpRegistration {
+    /// Gaming mode's WireGuard registration, next to `config.json`: the same
+    /// file `gamemode.sh` looks for on macOS.
+    static var wireGuardIdentity: URL {
+        WarpController.defaultDirectory.appendingPathComponent("wg-warp.json")
+    }
+
+    /// Registers a second anonymous device, with a WireGuard key, under the
+    /// terms the user accepted for the first. Does nothing once it exists.
+    static func registerWireGuard() async throws {
+        let path = wireGuardIdentity.path
+        guard !FileManager.default.fileExists(atPath: path) else { return }
+        try await call("WireGuard registration") { SweepWarpRegisterWG(strdup(path)) }
+        EventLog.shared.record(phase: "warp", kind: "registered", detail: "wireguard")
+    }
+
     /// Registers this device with WARP in-process (the same calls as
     /// `usque register`), then binds the license key if one was given. Only
     /// call after the user accepted Cloudflare's terms. A failed license
@@ -223,7 +241,7 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
                                    completionHandler: @escaping (Error?) -> Void) {
         let proto = protocolConfiguration as? NETunnelProviderProtocol
         let sni = (proto?.providerConfiguration?["sni"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "example.com"
-        let flowTTL = (proto?.providerConfiguration?["flowTTL"] as? NSNumber)?.int32Value ?? 0
+        let gaming = (proto?.providerConfiguration?["gaming"] as? NSNumber)?.boolValue ?? false
         let configFile = WarpController.defaultDirectory.appendingPathComponent("config.json")
 
         guard let data = try? Data(contentsOf: configFile),
@@ -261,12 +279,11 @@ open class WarpPacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable
             self.lock.unlock()
             DispatchQueue.global().asyncAfter(deadline: .now() + Self.startTimeout, execute: deadline)
 
-            EventLog.shared.record(phase: "warp", kind: "starting", detail: "sni=\(sni) flowTTL=\(flowTTL)")
-            // SweepWarpStartGaming with ttl 0 is the ordinary tunnel: the warm
-            // standby it used to keep in every mode was swept along with the
-            // live flow, so it delivered a dead session and cost ~2s before the
-            // dial that worked (see hotStandby in warpmobile/main.go).
-            if let failure = SweepWarpStartGaming(strdup(configFile.path), strdup(sni), fd, flowTTL) {
+            EventLog.shared.record(phase: "warp", kind: "starting", detail: "sni=\(sni) gaming=\(gaming)")
+            // An empty identity path is the ordinary tunnel. With one, the Go
+            // side tries WireGuard first and falls back to MASQUE by itself.
+            let identity = gaming ? WarpRegistration.wireGuardIdentity.path : ""
+            if let failure = SweepWarpStartGaming(strdup(configFile.path), strdup(sni), fd, strdup(identity)) {
                 let message = String(cString: failure)
                 SweepWarpFree(failure)
                 self.finishStart(Self.error("Could not start WARP: \(message)"))

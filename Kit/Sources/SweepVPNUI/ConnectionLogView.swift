@@ -79,7 +79,7 @@ struct ConnectionLogView: View {
     private func summary(_ failure: TunnelFailure) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Midnight.warning)
                 Text(failure.detail.isEmpty ? failure.kind : failure.detail)
                     .font(.callout).fontWeight(.medium)
                     .multilineTextAlignment(.leading)
@@ -137,7 +137,7 @@ struct ConnectionLogView: View {
         let failed = entries.contains { $0.level == .error }
         return HStack(spacing: 8) {
             Image(systemName: failed ? "xmark.octagon.fill" : "circle.dashed")
-                .foregroundStyle(failed ? .red : .secondary)
+                .foregroundStyle(failed ? Midnight.danger : .secondary)
             Text("Run \(run)").font(.caption.weight(.semibold))
             if let duration {
                 Text(String(format: "%.1fs", Double(duration) / 1000))
@@ -179,8 +179,8 @@ struct ConnectionLogView: View {
         switch level {
         case .debug: return .secondary
         case .info:  return .primary
-        case .warn:  return .orange
-        case .error: return .red
+        case .warn:  return Midnight.warning
+        case .error: return Midnight.danger
         }
     }
 

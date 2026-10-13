@@ -36,9 +36,21 @@ public enum SystemProxy {
 
     static func command(enabled: Bool, port: Int) -> String {
         if enabled {
+            // The proxy is a per-service setting. Set on the active service
+            // alone, a move from Wi-Fi to Ethernet (a dock, a tether) landed on
+            // a service with no proxy: every app went out directly while the
+            // app still read "Connected". So the active service must take the
+            // setting, and every other enabled service takes it too, best
+            // effort. Disabling already walks all of them.
             return serviceScript + """
             ; networksetup -setsocksfirewallproxy "$svc" 127.0.0.1 \(port) off \
-            && networksetup -setsocksfirewallproxystate "$svc" on
+            && networksetup -setsocksfirewallproxystate "$svc" on || exit 1; \
+            networksetup -listallnetworkservices | tail -n +2 | grep -v '^\\*' | \
+            while IFS= read -r other; do \
+              [ "$other" = "$svc" ] && continue; \
+              networksetup -setsocksfirewallproxy "$other" 127.0.0.1 \(port) off >/dev/null 2>&1 \
+                && networksetup -setsocksfirewallproxystate "$other" on >/dev/null 2>&1; \
+            done; true
             """
         }
         // Off everywhere it points at us, not just on the service carrying the
@@ -77,6 +89,19 @@ public enum SystemProxy {
         }
         EventLog.shared.record(phase: "systemProxy", kind: enabled ? "enabled" : "disabled",
                                detail: "127.0.0.1:\(port)")
+    }
+
+    /// Whether the proxy apps are handed *right now* is ours: the system's
+    /// effective settings, which follow whichever service is primary. Cheap
+    /// (no child process), so it can be asked on every network change.
+    public static func isEffective(
+        port: Int,
+        settings: [String: Any]? = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any]
+    ) -> Bool {
+        guard let settings else { return false }
+        return (settings["SOCKSEnable"] as? Int) == 1
+            && (settings["SOCKSProxy"] as? String) == "127.0.0.1"
+            && (settings["SOCKSPort"] as? Int) == port
     }
 
     /// Whether the system SOCKS proxy is on and pointed at `port` on loopback.

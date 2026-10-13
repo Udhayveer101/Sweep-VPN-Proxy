@@ -9,16 +9,31 @@ import SweepVPNCore
 public struct HomeView: View {
     @ObservedObject public var model: VPNViewModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    #if os(macOS)
+    @Environment(\.controlActiveState) private var controlActive
+    private var windowInFront: Bool { controlActive != .inactive }
+    #else
+    private let windowInFront = true
+    #endif
 
     public init(model: VPNViewModel) { self.model = model }
 
     public var body: some View {
         ZStack {
-            Backdrop(tint: model.presentation.tint, animate: !reduceMotion && model.animateBackdrop)
+            Backdrop(tint: model.presentation.tint,
+                     animate: !reduceMotion && model.animateBackdrop && windowInFront)
             VStack(spacing: 20) {
                 header
                 #if os(macOS)
                 if model.availableUpdate != nil { UpdateBanner(model: model) }
+                if let notice = model.updateNotice {
+                    HStack(spacing: 12) {
+                        Text(notice).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
+                        Button("OK") { model.updateNotice = nil }
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 10)
+                    .background(Midnight.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
                 #endif
                 Spacer(minLength: 0)
                 if model.proxyOnly {
@@ -30,7 +45,9 @@ public struct HomeView: View {
             }
             .padding(24)
         }
+        .midnightPage()
         .sheet(item: $model.activeSheet) { sheet in
+            Group {
             switch sheet {
             case .settings:     SettingsView(model: model)
             case .serverPicker: ServerPickerView(model: model)
@@ -39,6 +56,8 @@ public struct HomeView: View {
             case .onboarding:   OnboardingView(model: model).interactiveDismissDisabled()
             case .connectionLog: ConnectionLogView(model: model)
             }
+            }
+            .midnightPage()
         }
     }
 
@@ -58,20 +77,15 @@ public struct HomeView: View {
         HStack {
             Text("Sweep VPN").font(.headline)
             Spacer()
-            // Permanent, not conditional on an error. A connect that hangs in
-            // "Connecting…" never raises an error banner, so hanging the only
-            // route to the log off that banner made it unreachable in exactly
-            // the case it was needed for.
-            Button { model.activeSheet = .connectionLog } label: {
-                Image(systemName: "text.alignleft").font(.title3)
-            }
-            .buttonStyle(.plain)
-            .help("Connection log")
-            .accessibilityLabel("Connection log")
+            // The connection log is one step further in, under Settings ▸
+            // Diagnostics. It is always there, never hung off an error banner:
+            // a connect that hangs in "Connecting…" raises no banner at all.
             Button { model.activeSheet = .settings } label: {
                 Image(systemName: "gearshape").font(.title3)
+                    .frame(width: 32, height: 32).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .help("Settings")
             .accessibilityLabel("Settings")
         }
     }
@@ -80,7 +94,7 @@ public struct HomeView: View {
     /// the button looked inert. Show it, and let the user dismiss it.
     private func errorRow(_ error: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Midnight.warning)
             VStack(alignment: .leading, spacing: 2) {
                 Text(error).font(.caption).multilineTextAlignment(.leading)
                 // Which attempt produced this, so a stale reason is obvious and
@@ -107,7 +121,7 @@ public struct HomeView: View {
         }
         .padding(12)
         .frame(maxWidth: 420)
-        .background(.thinMaterial, in: .rect(cornerRadius: 12, style: .continuous))
+        .background(Midnight.surface, in: .rect(cornerRadius: 12, style: .continuous))
         .accessibilityElement(children: .combine)
     }
 
@@ -115,13 +129,13 @@ public struct HomeView: View {
     /// switch reads as the app working, not the connection breaking.
     private func protocolSwitchRow(_ note: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(.blue)
+            Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(Midnight.accent)
             Text(note).font(.caption).multilineTextAlignment(.leading)
             Spacer(minLength: 0)
         }
         .padding(12)
         .frame(maxWidth: 420)
-        .background(.thinMaterial, in: .rect(cornerRadius: 12, style: .continuous))
+        .background(Midnight.surface, in: .rect(cornerRadius: 12, style: .continuous))
         .transition(.opacity)
         .accessibilityElement(children: .combine)
     }
@@ -151,7 +165,7 @@ public struct HomeView: View {
         }
         .padding(24)
         .frame(maxWidth: 420)
-        .background(.ultraThinMaterial, in: .rect(cornerRadius: 24, style: .continuous))
+        .background(Midnight.panel, in: .rect(cornerRadius: 24, style: .continuous))
         .shadow(color: .black.opacity(0.12), radius: 18, y: 8)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(model.presentation.voiceOver)
@@ -178,7 +192,7 @@ public struct HomeView: View {
                 Image(systemName: "chevron.right").font(.caption)
             }
             .padding(.horizontal, 16).padding(.vertical, 10)
-            .background(.thinMaterial, in: Capsule())
+            .background(Midnight.surface, in: Capsule())
         }
         .buttonStyle(.plain)
         .opacity(model.servers.isEmpty ? 0.7 : 1)
@@ -192,7 +206,7 @@ public struct HomeView: View {
                 .frame(maxWidth: .infinity, minHeight: 50)
         }
         .buttonStyle(.borderedProminent)
-        .tint(model.presentation.tint == .good ? .green : .accentColor)
+        .tint(model.presentation.tint == .good ? Midnight.good : .accentColor)
         .controlSize(.large)
         .frame(maxWidth: 420)
         // `isBusy` covers the whole connect, including a relay probe that can
@@ -208,60 +222,123 @@ public struct HomeView: View {
 struct ProxyHomePanel: View {
     @ObservedObject var model: VPNViewModel
 
+    private var up: Bool { model.connectionEstablished }
+
+    private var failed: Bool {
+        #if os(macOS)
+        model.gameState.isFailed || model.warpState.isFailed || model.systemProxyError != nil
+        #else
+        model.warpState.isFailed || model.systemProxyError != nil
+        #endif
+    }
+
     private var headline: String {
         if !model.warpRegistered { return "WARP is not set up" }
+        if up { return "Connected" }
+        if model.connectionActive { return "Connecting…" }
+        return failed ? "Could not connect" : "Not connected"
+    }
+
+    /// One line under the headline: the failure if there is one, otherwise
+    /// what the current mode does.
+    private var detail: (text: String, isError: Bool) {
         #if os(macOS)
-        if model.systemProxyEnabled { return "This Mac is using WARP" }
+        if case .failed(let why) = model.gameState { return (why, true) }
+        if let why = model.systemProxyError { return (why, true) }
+        if !model.connectionIsGaming, case .failed(let why) = model.warpState { return (why, true) }
+        if model.gameState == .starting { return ("macOS will ask for your admin password.", false) }
+        if model.gameState == .running { return ("This Mac's IPv4 internet traffic goes through WARP, games included. The local network stays direct.", false) }
+        if model.systemProxyEnabled { return ("Apps that use the system proxy go through WARP.", false) }
+        if model.connectionActive { return ("Starting WARP…", false) }
+        return (model.gamingPreferred
+                ? "Gaming routes the whole Mac, so games work too."
+                : "Routes apps that use the system proxy.", false)
         #else
-        if model.warpState == .running { return "This \(DeviceNoun.current) is using WARP" }
-        if model.warpState == .starting { return "Connecting to WARP…" }
-        #endif
-        if model.options.warpEnabled {
-            if model.warpState == .running { return "WARP is ready" }
-            return model.warpState.isFailed ? "WARP could not start" : "Starting WARP…"
+        // The packet tunnel carries every app in both modes; Gaming changes
+        // what carries the tunnel (see VPNViewModel.gamingPreferred).
+        let device = DeviceNoun.current
+        if case .failed(let why) = model.warpState { return (why, true) }
+        if let why = model.systemProxyError { return (why, true) }
+        if up {
+            return (model.gamingPreferred
+                    ? "Everything on this \(device) goes through WARP, held steady for games."
+                    : "Everything on this \(device) goes through WARP.", false)
         }
-        return "Proxy is off"
+        if model.connectionActive { return ("Starting WARP…", false) }
+        return (model.gamingPreferred
+                ? "Gaming keeps game connections up when the network changes path."
+                : "Routes every app on this \(device) through WARP.", false)
+        #endif
+    }
+
+    private var pillHelp: String {
+        if model.connectionActive { return "Disconnect to change mode" }
+        #if os(macOS)
+        return "On: the whole Mac is routed, so games work. Off: apps that use the system proxy."
+        #else
+        return "On: the tunnel runs over WireGuard where the network allows. Uses a little more battery."
+        #endif
+    }
+
+    private var orbPhase: PowerOrb.Phase {
+        up ? .on : (model.connectionActive ? .starting : .off)
+    }
+
+    /// The mode switch, as a pill under the button: the logo, its name and
+    /// the switch. Dimmed and locked while a connection is up.
+    private var gamingPill: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "gamecontroller.fill")
+                .foregroundStyle(model.gamingPreferred ? Midnight.good : .secondary)
+                .accessibilityHidden(true)
+            Text("Gaming").foregroundStyle(.secondary)
+            Toggle("Gaming mode", isOn: $model.gamingPreferred)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .tint(Midnight.good)
+        }
+        .font(.callout.weight(.medium))
+        .padding(.leading, 16).padding(.trailing, 10).padding(.vertical, 9)
+        .background(Midnight.card, in: Capsule())
+        .opacity(model.connectionActive ? 0.6 : 1)
+        .disabled(model.connectionActive)
+        .help(pillHelp)
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Chooses how the next connection routes traffic")
     }
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: model.systemProxyEnabled ? "lock.shield.fill" : "shield")
-                .font(.system(size: 44, weight: .medium))
-                .foregroundStyle(model.systemProxyEnabled ? .green : .secondary)
-            Text(headline).font(.title2.weight(.semibold))
-            if let status = model.warpStatusText {
-                Text(status).font(.caption)
-                    .foregroundStyle(model.warpState.isFailed ? .red : .secondary)
-                    .multilineTextAlignment(.center).textSelection(.enabled)
+        VStack(spacing: 22) {
+            if model.warpRegistered {
+                PowerOrb(phase: orbPhase) { model.toggleConnection() }
+                    .keyboardShortcut(.defaultAction)
+                    .help(model.connectionActive ? "Disconnect" : "Connect")
+                    .accessibilityLabel(model.connectionActive ? "Disconnect" : "Connect")
             }
-            if let why = model.systemProxyError {
-                Text(why).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center)
+            VStack(spacing: 6) {
+                Text(headline)
+                    .font(.system(size: 26, weight: .semibold))
+                    .multilineTextAlignment(.center)
+                Text(detail.text).font(.callout)
+                    .foregroundStyle(detail.isError ? Midnight.danger : .secondary)
+                    .multilineTextAlignment(.center).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(minHeight: 40, alignment: .top)
             }
             if model.warpRegistered {
-                Button {
-                    model.setEverythingThroughWarp(!model.systemProxyEnabled)
-                } label: {
-                    Text(model.systemProxyEnabled ? "Stop routing this \(DeviceNoun.current) through WARP"
-                                                  : "Route this \(DeviceNoun.current) through WARP")
-                        .font(.headline).frame(maxWidth: .infinity, minHeight: 44)
+                gamingPill
+                Text("Disconnect to change mode.")
+                    .font(.caption).foregroundStyle(.tertiary)
+                    .opacity(model.connectionActive ? 1 : 0)
+                    .accessibilityHidden(!model.connectionActive)
+            } else {
+                Button { model.activeSheet = .onboarding } label: {
+                    Text("Set up WARP").font(.headline).frame(maxWidth: 220, minHeight: 44)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(model.systemProxyEnabled ? .red : .accentColor)
-                #if os(macOS)
-                Text("macOS asks for your password each way. For a single app, use Settings ▸ Tor and proxy.")
-                    .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                #else
-                Text("iOS asks once to add a VPN configuration. It stays on after you close Sweep; turn it off here or in Settings ▸ VPN.")
-                    .font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                #endif
-            } else {
-                Button("Set up WARP") { model.activeSheet = .onboarding }
-                    .buttonStyle(.borderedProminent).controlSize(.large)
             }
         }
-        .padding(24)
         .frame(maxWidth: 420)
-        .background(.ultraThinMaterial, in: .rect(cornerRadius: 24, style: .continuous))
     }
 }
 
@@ -290,7 +367,7 @@ struct Backdrop: View {
 
     var body: some View {
         ZStack {
-            Color(nsColorOrSystemBackground)
+            Midnight.background
             LinearGradient(colors: [tint.color.opacity(strength),
                                     Color.clear,
                                     tint.color.opacity(strength * 0.5)],
@@ -301,14 +378,10 @@ struct Backdrop: View {
         .animation(animate ? .easeInOut(duration: 14).repeatForever(autoreverses: true) : nil,
                    value: phase)
         .onAppear { if animate { phase.toggle() } }
-    }
-
-    private var nsColorOrSystemBackground: Color {
-        #if os(macOS)
-        Color(nsColor: .windowBackgroundColor)
-        #else
-        Color(uiColor: .systemBackground)
-        #endif
+        // A repeatForever animation outlives the flag that started it, so a
+        // window sent to the background kept the GPU drawing a gradient nobody
+        // could see. Setting the phase without an animation is what stops it.
+        .onChange(of: animate) { phase = $0 }
     }
 }
 
@@ -368,18 +441,20 @@ struct UpdateBanner: View {
                     .font(.callout.weight(.medium))
                 if case .downloading = model.updateState {
                     Text("Downloading and verifying…").font(.caption).foregroundStyle(.secondary)
+                } else if case .installing = model.updateState {
+                    Text("Installing. Sweep VPN will restart…").font(.caption).foregroundStyle(.secondary)
                 } else if case .failed(let why) = model.updateState {
-                    Text(why).font(.caption).foregroundStyle(.red)
+                    Text(why).font(.caption).foregroundStyle(Midnight.danger)
                 }
             }
             Spacer(minLength: 0)
             Button("Update") { model.installUpdate() }
-                .disabled(model.updateState == .downloading)
+                .disabled(model.updateState == .downloading || model.updateState == .installing)
             Button("Later") { model.snoozeUpdate() }
                 .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary)
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .background(Midnight.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 #endif

@@ -128,8 +128,7 @@ func TestLiveFetchThroughWarp(t *testing.T) {
 	testLog = func(s string) { linesMu.Lock(); lines = append(lines, s); linesMu.Unlock() }
 	defer func() { testLog = nil }()
 
-	// ttl 0: the warm standby is on, flow rotation is not.
-	if err := start(path, "example.com", fds[0], 0); err != nil {
+	if err := start(path, "example.com", fds[0], ""); err != nil {
 		t.Fatal(err)
 	}
 	defer SweepWarpStop()
@@ -174,16 +173,5 @@ func TestSaveConfigWritesTheGivenConfig(t *testing.T) {
 	}
 	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
 		t.Fatalf("config holds the private key; mode %v", info.Mode().Perm())
-	}
-}
-
-// A standby is swept along with the live flow, so it is only worth keeping
-// where the promotion is planned. See hotStandby for the measurement.
-func TestStandbyOnlyForRotation(t *testing.T) {
-	if hotStandby(0) {
-		t.Fatal("normal mode must not park a standby: it is swept with the live flow")
-	}
-	if !hotStandby(90) {
-		t.Fatal("rotation needs a warm session to rotate into")
 	}
 }

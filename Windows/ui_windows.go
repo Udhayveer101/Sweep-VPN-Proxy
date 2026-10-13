@@ -254,29 +254,31 @@ func (w *window) eval(js string) {
 
 // uiState is everything ui.html renders. Field names are its contract.
 type uiState struct {
-	Version     string `json:"version"`
-	Registered  bool   `json:"registered"`
-	Routing     bool   `json:"routing"`
-	ProxyOn     bool   `json:"proxyOn"`
-	Warp        string `json:"warp"`
-	Status      string `json:"status"`
-	ProxyError  string `json:"proxyError"`
-	LastError   string `json:"lastError"`
-	Game        bool   `json:"game"`
-	GameState   string `json:"gameState"`
-	GameStatus  string `json:"gameStatus"`
-	GameBusy    bool   `json:"gameBusy"`
-	Disguise    string `json:"disguise"`
-	SNI         string `json:"sni"`
-	Port        int    `json:"port"`
-	Startup     bool   `json:"startup"`
-	KeepInTray  bool   `json:"keepInTray"`
-	Update      string `json:"update"`
-	UpdateState string `json:"updateState"`
-	UpdateError string `json:"updateError"`
-	SetupBusy   bool   `json:"setupBusy"`
-	SetupError  string `json:"setupError"`
-	Sheet       string `json:"sheet,omitempty"`
+	Version         string `json:"version"`
+	Registered      bool   `json:"registered"`
+	Routing         bool   `json:"routing"`
+	ProxyOn         bool   `json:"proxyOn"`
+	Warp            string `json:"warp"`
+	Status          string `json:"status"`
+	ProxyError      string `json:"proxyError"`
+	LastError       string `json:"lastError"`
+	Game            bool   `json:"game"`
+	GameState       string `json:"gameState"`
+	GameStatus      string `json:"gameStatus"`
+	GameBusy        bool   `json:"gameBusy"`
+	Disguise        string `json:"disguise"`
+	SNI             string `json:"sni"`
+	Port            int    `json:"port"`
+	Startup         bool   `json:"startup"`
+	KeepInTray      bool   `json:"keepInTray"`
+	Update          string `json:"update"`
+	UpdateState     string `json:"updateState"`
+	UpdateError     string `json:"updateError"`
+	UpdateNotice    string `json:"updateNotice"`
+	GamingPreferred bool   `json:"gamingPreferred"`
+	SetupBusy       bool   `json:"setupBusy"`
+	SetupError      string `json:"setupError"`
+	Sheet           string `json:"sheet,omitempty"`
 }
 
 func (a *app) snapshot() uiState {
@@ -286,7 +288,8 @@ func (a *app) snapshot() uiState {
 		disguise = "rotate"
 	}
 	s := uiState{Version: version, Registered: a.registered(), SNI: a.sni(), Port: proxyPort,
-		Startup: startsWithWindows(), KeepInTray: getBoolDefault("KeepInTray", true), Disguise: disguise}
+		Startup: startsWithWindows(), KeepInTray: getBoolDefault("KeepInTray", true), Disguise: disguise,
+		GamingPreferred: getBool("GamingPreferred")}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s.Routing, s.ProxyOn = a.enabled, a.proxyOn
@@ -304,7 +307,7 @@ func (a *app) snapshot() uiState {
 	if a.update != nil {
 		s.Update = a.update.Version
 	}
-	s.UpdateState, s.UpdateError = a.updateState, a.updateError
+	s.UpdateState, s.UpdateError, s.UpdateNotice = a.updateState, a.updateError, a.updateNotice
 	s.SetupBusy, s.SetupError = a.setupBusy, a.setupError
 	return s
 }
@@ -313,6 +316,28 @@ func (a *app) snapshot() uiState {
 func (a *app) handle(action, arg string) {
 	on := arg == "true"
 	switch action {
+	case "toggle":
+		// The home screen's one button (VPNViewModel.toggleConnection): off if
+		// anything is on, otherwise on in the mode the Gaming pill picks.
+		a.mu.Lock()
+		routing, game := a.enabled, a.gameOn
+		a.mu.Unlock()
+		switch {
+		case game:
+			a.setGameMode(false)
+		case routing:
+			a.setEnabled(false)
+		case getBool("GamingPreferred"):
+			a.setGameMode(true)
+		default:
+			a.setEnabled(true)
+		}
+	case "setGamingPreferred":
+		setBool("GamingPreferred", on)
+	case "dismissNotice":
+		a.mu.Lock()
+		a.updateNotice = ""
+		a.mu.Unlock()
 	case "setRouting":
 		a.setEnabled(on)
 	case "setGame":

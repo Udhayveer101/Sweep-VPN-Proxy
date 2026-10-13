@@ -1,0 +1,613 @@
+From 4e78f35913330cb51a5149e98fbaf8c7a099f6b0 Mon Sep 17 00:00:00 2001
+From: Udhayveer Singh <udhayveersingh@Udhayveer.local>
+Date: Thu, 8 Oct 2026 17:05:49 +0530
+Subject: [PATCH 1/2] Reconnect when the second hop changes instead of waiting
+ for a PING timeout
+
+The LAN gateway on the target network moves traffic between WAN uplinks, and
+each move silently kills the established MASQUE flow. --hop-probe sends a
+TTL=2 echo towards the endpoint at the given interval and ends the session as
+soon as a different router answers. Off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ api/hopprobe.go      | 97 ++++++++++++++++++++++++++++++++++++++++++++
+ api/hopprobe_test.go | 34 ++++++++++++++++
+ api/standby_test.go  |  8 ++--
+ api/tunnel.go        | 42 +++++++++++++++++--
+ cmd/nativetun.go     |  8 ++++
+ cmd/socks.go         |  8 ++++
+ 6 files changed, 190 insertions(+), 7 deletions(-)
+ create mode 100644 api/hopprobe.go
+ create mode 100644 api/hopprobe_test.go
+
+diff --git a/api/hopprobe.go b/api/hopprobe.go
+new file mode 100644
+index 0000000..db5a727
+--- /dev/null
++++ b/api/hopprobe.go
+@@ -0,0 +1,97 @@
++package api
++
++import (
++	"context"
++	"errors"
++	"log"
++	"net"
++	"os"
++	"time"
++
++	"golang.org/x/net/icmp"
++	"golang.org/x/net/ipv4"
++)
++
++// errHopChanged ends a MASQUE session whose path just moved.
++//
++// On the target network the LAN gateway moves traffic between WAN uplinks
++// (measured 2026-10-08: the second hop alternates between three addresses and
++// every tunnel loss follows a change within seconds). The new uplink is a new
++// public source address, so Cloudflare drops the established TCP flow without a
++// RST and the only signal left is our own PING timeout, 8s later. The second
++// hop changes the moment the uplink does, so watching it finds the kill in
++// about a second instead.
++var errHopChanged = errors.New("path to the endpoint changed")
++
++// hopProbeTTL is how far the probe travels: past the LAN gateway (hop 1) to
++// the first router of whichever uplink is in use.
++// ponytail: fixed at 2, which is right for one NAT gateway. A network with a
++// second private hop needs this raised; make it a flag when one is seen.
++const hopProbeTTL = 2
++
++// hopTracker turns a stream of hop observations into change events. The first
++// observation only sets the baseline.
++type hopTracker struct {
++	last string
++}
++
++func (h *hopTracker) observe(hop string) bool {
++	changed := h.last != "" && hop != h.last
++	h.last = hop
++	return changed
++}
++
++// watchHop sends a TTL-limited echo towards endpoint every interval and
++// signals on the returned channel when the router that answers changes. A
++// lost probe carries no information and is ignored. The channel holds one
++// event; a second change before the first is consumed is the same news.
++func watchHop(ctx context.Context, endpoint net.IP, interval time.Duration) <-chan struct{} {
++	changed := make(chan struct{}, 1)
++	// "udp4" is the unprivileged ICMP datagram socket, so this works for the
++	// socks proxy as well as the root nativetun.
++	conn, err := icmp.ListenPacket("udp4", "0.0.0.0")
++	if err != nil {
++		log.Printf("Hop probe disabled: %v", err)
++		return changed
++	}
++	if err := conn.IPv4PacketConn().SetTTL(hopProbeTTL); err != nil {
++		log.Printf("Hop probe disabled: %v", err)
++		_ = conn.Close()
++		return changed
++	}
++
++	go func() {
++		defer conn.Close()
++		var tracker hopTracker
++		dst := &net.UDPAddr{IP: endpoint}
++		buf := make([]byte, 1500)
++		ticker := time.NewTicker(interval)
++		defer ticker.Stop()
++		for seq := 0; ; seq++ {
++			msg := icmp.Message{Type: ipv4.ICMPTypeEcho, Body: &icmp.Echo{ID: os.Getpid() & 0xffff, Seq: seq & 0xffff, Data: []byte("usquehop")}}
++			if b, err := msg.Marshal(nil); err == nil {
++				_, _ = conn.WriteTo(b, dst)
++			}
++			_ = conn.SetReadDeadline(time.Now().Add(interval))
++			if n, peer, err := conn.ReadFrom(buf); err == nil {
++				if m, err := icmp.ParseMessage(1, buf[:n]); err == nil && m.Type == ipv4.ICMPTypeTimeExceeded {
++					hop := peer.(*net.UDPAddr).IP.String()
++					was := tracker.last
++					if tracker.observe(hop) {
++						log.Printf("Hop %d changed: %s -> %s", hopProbeTTL, was, hop)
++						select {
++						case changed <- struct{}{}:
++						default:
++						}
++					}
++				}
++			}
++			select {
++			case <-ctx.Done():
++				return
++			case <-ticker.C:
++			}
++		}
++	}()
++	return changed
++}
+diff --git a/api/hopprobe_test.go b/api/hopprobe_test.go
+new file mode 100644
+index 0000000..6d83b64
+--- /dev/null
++++ b/api/hopprobe_test.go
+@@ -0,0 +1,34 @@
++package api
++
++import (
++	"context"
++	"errors"
++	"testing"
++)
++
++func TestHopTrackerReportsOnlyChanges(t *testing.T) {
++	var h hopTracker
++	steps := []struct {
++		hop  string
++		want bool
++	}{
++		{"103.30.140.65", false}, // baseline, not a change
++		{"103.30.140.65", false},
++		{"103.225.42.209", true},
++		{"103.225.42.209", false},
++		{"103.30.140.65", true}, // flapping back is a change too
++	}
++	for i, s := range steps {
++		if got := h.observe(s.hop); got != s.want {
++			t.Fatalf("step %d (%s): changed = %v, want %v", i, s.hop, got, s.want)
++		}
++	}
++}
++
++func TestHopChangeEndsTheSession(t *testing.T) {
++	hop := make(chan struct{}, 1)
++	hop <- struct{}{}
++	if err := waitForTunnelEnd(context.Background(), make(chan error), 0, nil, hop); !errors.Is(err, errHopChanged) {
++		t.Fatalf("err = %v, want errHopChanged", err)
++	}
++}
+diff --git a/api/standby_test.go b/api/standby_test.go
+index 0613a23..a6b498b 100644
+--- a/api/standby_test.go
++++ b/api/standby_test.go
+@@ -16,7 +16,7 @@ func TestRotationFiresOnlyWithAWarmStandby(t *testing.T) {
+ 	defer drainStandby(ch)
+ 
+ 	start := time.Now()
+-	err := waitForTunnelEnd(context.Background(), make(chan error), 20*time.Millisecond, ch)
++	err := waitForTunnelEnd(context.Background(), make(chan error), 20*time.Millisecond, ch, nil)
+ 	if !errors.Is(err, errFlowRotate) {
+ 		t.Fatalf("expected a rotation, got %v", err)
+ 	}
+@@ -36,7 +36,7 @@ func TestRotationDefersWithoutStandby(t *testing.T) {
+ 
+ 	done := make(chan error, 1)
+ 	go func() {
+-		done <- waitForTunnelEnd(context.Background(), errChan, 10*time.Millisecond, ch)
++		done <- waitForTunnelEnd(context.Background(), errChan, 10*time.Millisecond, ch, nil)
+ 	}()
+ 
+ 	select {
+@@ -65,7 +65,7 @@ func TestPumpErrorEndsWaitWithoutRotation(t *testing.T) {
+ 	want := errors.New("connection closed while reading")
+ 	errChan <- want
+ 
+-	got := waitForTunnelEnd(context.Background(), errChan, 0, nil)
++	got := waitForTunnelEnd(context.Background(), errChan, 0, nil, nil)
+ 	if !errors.Is(got, want) {
+ 		t.Fatalf("got %v, want %v", got, want)
+ 	}
+@@ -74,7 +74,7 @@ func TestPumpErrorEndsWaitWithoutRotation(t *testing.T) {
+ func TestWaitForTunnelEndHonoursContext(t *testing.T) {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	cancel()
+-	if err := waitForTunnelEnd(ctx, make(chan error), 0, nil); !errors.Is(err, context.Canceled) {
++	if err := waitForTunnelEnd(ctx, make(chan error), 0, nil, nil); !errors.Is(err, context.Canceled) {
+ 		t.Fatalf("got %v, want context.Canceled", err)
+ 	}
+ }
+diff --git a/api/tunnel.go b/api/tunnel.go
+index 85bc86f..938fc53 100644
+--- a/api/tunnel.go
++++ b/api/tunnel.go
+@@ -179,6 +179,11 @@ type MaintainTunnelConfig struct {
+ 	// to tear it down. Zero disables rotation. Requires HotStandby: without a
+ 	// warm replacement, rotating would cause the gap it exists to prevent.
+ 	FlowTTL time.Duration
++	// HopProbe is how often to check which router answers two hops out. A
++	// change means the path moved and the flow is already dead, so the
++	// session is ended at once instead of waiting for a PING to time out.
++	// Zero disables the probe.
++	HopProbe time.Duration
+ 	// OnConnect is a path to an executable run after every successful tunnel
+ 	// connect. It is exec'd directly (no shell, no args) and runs fire-and-forget.
+ 	OnConnect string
+@@ -259,6 +264,13 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 		go fillStandby(standbyCtx, cfg, standbyCh)
+ 	}
+ 
++	var hopChanged <-chan struct{}
++	if cfg.HopProbe > 0 {
++		if ip := endpointIP(cfg.Endpoint); ip != nil {
++			hopChanged = watchHop(ctx, ip, cfg.HopProbe)
++		}
++	}
++
+ 	for {
+ 		if ctx.Err() != nil {
+ 			return
+@@ -303,6 +315,13 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 
+ 		log.Println("Connected to MASQUE server")
+ 
++		// A change seen before this session was dialled is about the old
++		// path; this session was built on the new one.
++		select {
++		case <-hopChanged:
++		default:
++		}
++
+ 		if cfg.OnConnect != "" {
+ 			env := cloneHookEnv(cfg.HookEnv)
+ 			env["USQUE_EVENT"] = "connect"
+@@ -395,7 +414,7 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 			}
+ 		}()
+ 
+-		err := waitForTunnelEnd(ctx, errChan, cfg.FlowTTL, standbyCh)
++		err := waitForTunnelEnd(ctx, errChan, cfg.FlowTTL, standbyCh, hopChanged)
+ 		if errors.Is(err, errFlowRotate) {
+ 			log.Println("Retiring MASQUE flow before it ages out; promoting standby")
+ 		} else {
+@@ -452,7 +471,9 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 		// out the reconnect delay before promoting it would spend the gap we
+ 		// just paid to avoid. Only the full delay is skipped, not every brake -
+ 		// see minCycleInterval.
+-		if len(standbyCh) > 0 {
++		// Nor is there anything to wait for after a path change: the probe's
++		// reply already came back over the new path.
++		if len(standbyCh) > 0 || errors.Is(err, errHopChanged) {
+ 			if rest := minCycleInterval - time.Since(cycleStart); rest > 0 {
+ 				if sleepErr := sleepCtx(ctx, rest); sleepErr != nil {
+ 					return
+@@ -472,7 +493,7 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ // A due rotation with no warm standby is deferred rather than forced. Retiring
+ // the only working flow would open exactly the gap rotation exists to close,
+ // so the timer simply re-arms and tries again once a standby lands.
+-func waitForTunnelEnd(ctx context.Context, errChan <-chan error, flowTTL time.Duration, standbyCh chan *tunnelSession) error {
++func waitForTunnelEnd(ctx context.Context, errChan <-chan error, flowTTL time.Duration, standbyCh chan *tunnelSession, hopChanged <-chan struct{}) error {
+ 	if flowTTL > 0 && standbyCh != nil {
+ 		timer := time.NewTimer(nextFlowTTL(flowTTL))
+ 		defer timer.Stop()
+@@ -483,6 +504,8 @@ func waitForTunnelEnd(ctx context.Context, errChan <-chan error, flowTTL time.Du
+ 				return err
+ 			case <-ctx.Done():
+ 				return ctx.Err()
++			case <-hopChanged:
++				return errHopChanged
+ 			case <-timer.C:
+ 				if len(standbyCh) > 0 {
+ 					return errFlowRotate
+@@ -497,7 +520,20 @@ func waitForTunnelEnd(ctx context.Context, errChan <-chan error, flowTTL time.Du
+ 		return err
+ 	case <-ctx.Done():
+ 		return ctx.Err()
++	case <-hopChanged:
++		return errHopChanged
++	}
++}
++
++// endpointIP returns the IPv4 address of a TCP or UDP endpoint, or nil.
++func endpointIP(addr net.Addr) net.IP {
++	switch a := addr.(type) {
++	case *net.TCPAddr:
++		return a.IP.To4()
++	case *net.UDPAddr:
++		return a.IP.To4()
+ 	}
++	return nil
+ }
+ 
+ // isClosedPipe reports a MASQUE session whose HTTP/2 stream was closed
+diff --git a/cmd/nativetun.go b/cmd/nativetun.go
+index 1d1c87d..e87eede 100644
+--- a/cmd/nativetun.go
++++ b/cmd/nativetun.go
+@@ -153,6 +153,12 @@ var nativeTunCmd = &cobra.Command{
+ 			return
+ 		}
+ 
++		hopProbe, err := cmd.Flags().GetDuration("hop-probe")
++		if err != nil {
++			cmd.Printf("Failed to get hop-probe: %v\n", err)
++			return
++		}
++
+ 		alwaysReconnect, err := cmd.Flags().GetBool("always-reconnect")
+ 		if err != nil {
+ 			cmd.Printf("Failed to get always-reconnect flag: %v\n", err)
+@@ -227,6 +233,7 @@ var nativeTunCmd = &cobra.Command{
+ 			UseHTTP2:          useHTTP2,
+ 			HotStandby:        hotStandby,
+ 			FlowTTL:           flowTTL,
++			HopProbe:          hopProbe,
+ 			OnConnect:         onConnect,
+ 			OnDisconnect:      onDisconnect,
+ 			HookEnv:           hookEnv,
+@@ -250,6 +257,7 @@ func init() {
+ 	nativeTunCmd.Flags().BoolP("no-iproute2", "I", false, "Linux only: Do not set up IP addresses and do not set the link up")
+ 	nativeTunCmd.Flags().DurationP("reconnect-delay", "r", 1*time.Second, "Delay between reconnect attempts")
+ 	nativeTunCmd.Flags().Bool("hot-standby", false, "Keep a second MASQUE session handshaken and idle so a lost or rotated flow is replaced by a promotion instead of a rebuild")
++	nativeTunCmd.Flags().Duration("hop-probe", 0, "Probe the second hop towards the endpoint at this interval and reconnect at once when it changes (the uplink moved and the flow is dead). 0 disables")
+ 	nativeTunCmd.Flags().Duration("flow-ttl", 0, "Retire a healthy MASQUE flow at this age (jittered +/-20%) so a network that sweeps long-lived TCP flows never catches it. Requires --hot-standby; 0 disables")
+ 	nativeTunCmd.Flags().Bool("always-reconnect", false, "Always reconnect after tunnel loss, even when idle")
+ 	nativeTunCmd.Flags().Bool("http2", false, "Use HTTP/2 over TCP+TLS instead of HTTP/3 over QUIC."+config.EndpointHelpSuffixH2)
+diff --git a/cmd/socks.go b/cmd/socks.go
+index 734e193..ebad031 100644
+--- a/cmd/socks.go
++++ b/cmd/socks.go
+@@ -229,6 +229,12 @@ var socksCmd = &cobra.Command{
+ 			return
+ 		}
+ 
++		hopProbe, err := cmd.Flags().GetDuration("hop-probe")
++		if err != nil {
++			cmd.Printf("Failed to get hop-probe: %v\n", err)
++			return
++		}
++
+ 		alwaysReconnect, err := cmd.Flags().GetBool("always-reconnect")
+ 		if err != nil {
+ 			cmd.Printf("Failed to get always-reconnect flag: %v\n", err)
+@@ -272,6 +278,7 @@ var socksCmd = &cobra.Command{
+ 			UseHTTP2:          useHTTP2,
+ 			HotStandby:        hotStandby,
+ 			FlowTTL:           flowTTL,
++			HopProbe:          hopProbe,
+ 			OnConnect:         onConnect,
+ 			OnDisconnect:      onDisconnect,
+ 			HookEnv:           hookEnv,
+@@ -326,6 +333,7 @@ func init() {
+ 	socksCmd.Flags().DurationP("reconnect-delay", "r", 1*time.Second, "Delay between reconnect attempts")
+ 	socksCmd.Flags().Duration("udp-timeout", 60*time.Second, "Idle read deadline for each remote UDP relay (SOCKS5 ASSOCIATE). Shorter frees memory sooner; raise (e.g. 300s) if a quiet peer needs longer silence. 0 disables the deadline and risks unbounded growth under DHT/uTP")
+ 	socksCmd.Flags().Bool("hot-standby", false, "Keep a second MASQUE session handshaken and idle so a lost or rotated flow is replaced by a promotion instead of a rebuild")
++	socksCmd.Flags().Duration("hop-probe", 0, "Probe the second hop towards the endpoint at this interval and reconnect at once when it changes (the uplink moved and the flow is dead). 0 disables")
+ 	socksCmd.Flags().Duration("flow-ttl", 0, "Retire a healthy MASQUE flow at this age (jittered +/-20%) so a network that sweeps long-lived TCP flows never catches it. Requires --hot-standby; 0 disables")
+ 	socksCmd.Flags().Bool("always-reconnect", false, "Always reconnect after tunnel loss, even when idle")
+ 	socksCmd.Flags().Bool("http2", false, "Use HTTP/2 over TCP+TLS instead of HTTP/3 over QUIC."+config.EndpointHelpSuffixH2)
+-- 
+2.54.0 (Apple Git-157)
+
+
+From e1c1a84a643f36d35f509724b7c623aaac569109 Mon Sep 17 00:00:00 2001
+From: Udhayveer Singh <udhayveersingh@Udhayveer.local>
+Date: Thu, 8 Oct 2026 23:27:28 +0530
+Subject: [PATCH 2/2] Hop probe: answer only to its own echo, drain the socket,
+ and skip the pump grace
+
+The probe took any Time Exceeded on its socket as its own reply and read one
+message per tick. A traceroute on the same machine ended a healthy session
+every second or two, and its queued replies made real switches arrive up to
+16s late. Match the quoted echo's destination, identifier and sequence, and
+read until the next probe is due.
+
+After a hop change the flow is dead, so the 2s pump shutdown grace was the
+whole redial (the dial itself is ~60ms). Skip it on that path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ api/hopprobe.go      | 73 ++++++++++++++++++++++++++++++++++----------
+ api/hopprobe_test.go | 43 ++++++++++++++++++++++++++
+ api/tunnel.go        | 31 +++++++++++++------
+ 3 files changed, 122 insertions(+), 25 deletions(-)
+
+diff --git a/api/hopprobe.go b/api/hopprobe.go
+index db5a727..c1498fa 100644
+--- a/api/hopprobe.go
++++ b/api/hopprobe.go
+@@ -2,6 +2,7 @@ package api
+ 
+ import (
+ 	"context"
++	"encoding/binary"
+ 	"errors"
+ 	"log"
+ 	"net"
+@@ -65,33 +66,73 @@ func watchHop(ctx context.Context, endpoint net.IP, interval time.Duration) <-ch
+ 		var tracker hopTracker
+ 		dst := &net.UDPAddr{IP: endpoint}
+ 		buf := make([]byte, 1500)
+-		ticker := time.NewTicker(interval)
+-		defer ticker.Stop()
+-		for seq := 0; ; seq++ {
+-			msg := icmp.Message{Type: ipv4.ICMPTypeEcho, Body: &icmp.Echo{ID: os.Getpid() & 0xffff, Seq: seq & 0xffff, Data: []byte("usquehop")}}
++		id := os.Getpid() & 0xffff
++		for seq := 0; ctx.Err() == nil; seq = (seq + 1) & 0xffff {
++			msg := icmp.Message{Type: ipv4.ICMPTypeEcho, Body: &icmp.Echo{ID: id, Seq: seq, Data: []byte("usquehop")}}
+ 			if b, err := msg.Marshal(nil); err == nil {
+ 				_, _ = conn.WriteTo(b, dst)
+ 			}
+-			_ = conn.SetReadDeadline(time.Now().Add(interval))
+-			if n, peer, err := conn.ReadFrom(buf); err == nil {
+-				if m, err := icmp.ParseMessage(1, buf[:n]); err == nil && m.Type == ipv4.ICMPTypeTimeExceeded {
+-					hop := peer.(*net.UDPAddr).IP.String()
+-					was := tracker.last
+-					if tracker.observe(hop) {
+-						log.Printf("Hop %d changed: %s -> %s", hopProbeTTL, was, hop)
+-						select {
+-						case changed <- struct{}{}:
+-						default:
+-						}
++			// Read until the next probe is due, not once: the socket also
++			// receives the errors other programs' packets drew (a traceroute
++			// above all), and one read per probe let those queue up until
++			// the answers we acted on were many seconds old.
++			deadline := time.Now().Add(interval)
++			_ = conn.SetReadDeadline(deadline)
++			for {
++				n, peer, err := conn.ReadFrom(buf)
++				if err != nil {
++					break
++				}
++				m, err := icmp.ParseMessage(1, buf[:n])
++				if err != nil || m.Type != ipv4.ICMPTypeTimeExceeded {
++					continue
++				}
++				te, ok := m.Body.(*icmp.TimeExceeded)
++				if !ok || !isOwnProbe(te.Data, endpoint, id, seq) {
++					continue
++				}
++				hop := peer.(*net.UDPAddr).IP.String()
++				was := tracker.last
++				if was == "" {
++					log.Printf("Hop %d is %s", hopProbeTTL, hop)
++				}
++				if tracker.observe(hop) {
++					log.Printf("Hop %d changed: %s -> %s", hopProbeTTL, was, hop)
++					select {
++					case changed <- struct{}{}:
++					default:
+ 					}
+ 				}
+ 			}
++			// A read that failed early (closed socket) must not spin.
+ 			select {
+ 			case <-ctx.Done():
+ 				return
+-			case <-ticker.C:
++			case <-time.After(time.Until(deadline)):
+ 			}
+ 		}
+ 	}()
+ 	return changed
+ }
++
++// isOwnProbe reports whether the datagram quoted in a Time Exceeded message is
++// the echo this probe sent: same destination, identifier and sequence number.
++// Without the check any expired packet on the machine reads as an answer. A
++// traceroute's first-hop reply is a different router than ours, so it looked
++// like a path change and ended a healthy session every second or two.
++func isOwnProbe(quoted []byte, endpoint net.IP, id, seq int) bool {
++	if len(quoted) < ipv4.HeaderLen {
++		return false
++	}
++	hlen := int(quoted[0]&0x0f) * 4
++	if quoted[0]>>4 != 4 || hlen < ipv4.HeaderLen || len(quoted) < hlen+8 {
++		return false
++	}
++	if !net.IP(quoted[16:20]).Equal(endpoint) || quoted[9] != 1 {
++		return false
++	}
++	echo := quoted[hlen:]
++	return echo[0] == byte(ipv4.ICMPTypeEcho) &&
++		int(binary.BigEndian.Uint16(echo[4:6])) == id &&
++		int(binary.BigEndian.Uint16(echo[6:8])) == seq
++}
+diff --git a/api/hopprobe_test.go b/api/hopprobe_test.go
+index 6d83b64..8db39a1 100644
+--- a/api/hopprobe_test.go
++++ b/api/hopprobe_test.go
+@@ -3,6 +3,7 @@ package api
+ import (
+ 	"context"
+ 	"errors"
++	"net"
+ 	"testing"
+ )
+ 
+@@ -32,3 +33,45 @@ func TestHopChangeEndsTheSession(t *testing.T) {
+ 		t.Fatalf("err = %v, want errHopChanged", err)
+ 	}
+ }
++
++// quotedEcho is what a router quotes back in Time Exceeded: the IPv4 header of
++// the expired packet and its first eight bytes.
++func quotedEcho(dst net.IP, proto byte, id, seq int) []byte {
++	b := make([]byte, 28)
++	b[0] = 0x45
++	b[9] = proto
++	copy(b[16:20], dst.To4())
++	b[20] = 8 // echo request
++	b[24], b[25] = byte(id>>8), byte(id)
++	b[26], b[27] = byte(seq>>8), byte(seq)
++	return b
++}
++
++// A traceroute running beside the probe made it end a healthy session every
++// second or two (2026-10-08): its first-hop replies arrived on the same socket.
++func TestProbeIgnoresOtherProgramsReplies(t *testing.T) {
++	ep := net.IPv4(162, 159, 198, 2)
++	if !isOwnProbe(quotedEcho(ep, 1, 0x1234, 7), ep, 0x1234, 7) {
++		t.Fatal("own probe rejected")
++	}
++	for name, q := range map[string][]byte{
++		"other identifier":  quotedEcho(ep, 1, 0x9999, 7),
++		"stale sequence":    quotedEcho(ep, 1, 0x1234, 6),
++		"other destination": quotedEcho(net.IPv4(1, 1, 1, 1), 1, 0x1234, 7),
++		"udp, not icmp":     quotedEcho(ep, 17, 0x1234, 7),
++		"truncated":         quotedEcho(ep, 1, 0x1234, 7)[:24],
++	} {
++		if isOwnProbe(q, ep, 0x1234, 7) {
++			t.Fatalf("%s accepted as our probe", name)
++		}
++	}
++}
++
++func TestNoShutdownGraceAfterAHopChange(t *testing.T) {
++	if g := shutdownGrace(errHopChanged); g != 0 {
++		t.Fatalf("grace after a hop change = %s, want 0", g)
++	}
++	if g := shutdownGrace(errors.New("http2: client connection lost")); g != pumpShutdownGrace {
++		t.Fatalf("grace after a pump error = %s, want %s", g, pumpShutdownGrace)
++	}
++}
+diff --git a/api/tunnel.go b/api/tunnel.go
+index 938fc53..dce7831 100644
+--- a/api/tunnel.go
++++ b/api/tunnel.go
+@@ -448,15 +448,17 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
+ 		} else {
+ 			_ = ipConn.Close()
+ 
+-			done := make(chan struct{})
+-			go func() {
+-				wg.Wait()
+-				close(done)
+-			}()
+-			select {
+-			case <-done:
+-			case <-time.After(pumpShutdownGrace):
+-				log.Printf("Pump shutdown grace of %s expired; a stale TUN reader may still be parked (readMu will serialize next cycle)", pumpShutdownGrace)
++			if grace := shutdownGrace(err); grace > 0 {
++				done := make(chan struct{})
++				go func() {
++					wg.Wait()
++					close(done)
++				}()
++				select {
++				case <-done:
++				case <-time.After(grace):
++					log.Printf("Pump shutdown grace of %s expired; a stale TUN reader may still be parked (readMu will serialize next cycle)", grace)
++				}
+ 			}
+ 
+ 			if tr != nil {
+@@ -525,6 +527,17 @@ func waitForTunnelEnd(ctx context.Context, errChan <-chan error, flowTTL time.Du
+ 	}
+ }
+ 
++// shutdownGrace is how long to wait for the pumps before redialling. After a
++// path change there is nothing to wait for: the flow is dead, and the device
++// reader is serialized by readMu exactly as it is across a rotation. Waiting
++// was the whole redial (measured 2026-10-08: the dial is ~60ms, the grace 2s).
++func shutdownGrace(err error) time.Duration {
++	if errors.Is(err, errHopChanged) {
++		return 0
++	}
++	return pumpShutdownGrace
++}
++
+ // endpointIP returns the IPv4 address of a TCP or UDP endpoint, or nil.
+ func endpointIP(addr net.Addr) net.IP {
+ 	switch a := addr.(type) {
+-- 
+2.54.0 (Apple Git-157)
+

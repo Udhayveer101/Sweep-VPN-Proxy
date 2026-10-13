@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -19,7 +22,9 @@ import (
 // feed and the published .sha256 is the integrity check. This half is
 // deliberately OS-independent so it is testable without a Windows machine.
 
-const releasesFeed = "https://api.github.com/repos/Udhayveer101/Sweep-VPN-Proxy/releases?per_page=30"
+// A var only so the CI end-to-end test can link a throwaway build against a
+// local feed (-X main.releasesFeed=...). Nothing at run time can change it.
+var releasesFeed = "https://api.github.com/repos/Udhayveer101/Sweep-VPN-Proxy/releases?per_page=30"
 
 // windowsTagPrefix keeps this app from offering itself a macOS DMG: both
 // products publish into the same release list, so /releases/latest is
@@ -182,4 +187,55 @@ func DownloadUpdate(client *http.Client, u *Update) ([]byte, error) {
 		return nil, fmt.Errorf("the downloaded update did not match its published checksum")
 	}
 	return payload, nil
+}
+
+// reportsVersion runs a staged build with -version and checks the answer. It
+// is the last gate before the swap: a file that matches its checksum but will
+// not run here (blocked, truncated by the disk, built for another machine)
+// must never take the place of the build that works.
+func reportsVersion(exe, want string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, "-version")
+	prepare(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("it would not start: %w", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != want {
+		return fmt.Errorf("it reports version %q, not %q", got, want)
+	}
+	return nil
+}
+
+// swapExe puts staged at exe and keeps the build it replaces at exe+".old".
+// Windows lets a running exe be renamed but not overwritten, which is what
+// makes this possible without an installer. On failure exe is untouched.
+func swapExe(exe, staged string) error {
+	old := exe + ".old"
+	_ = os.Remove(old)
+	if err := os.Rename(exe, old); err != nil {
+		return err
+	}
+	if err := os.Rename(staged, exe); err != nil {
+		_ = os.Rename(old, exe) // put ourselves back rather than leave a hole
+		return err
+	}
+	return nil
+}
+
+// rollbackExe undoes swapExe: the kept build goes back to exe and the one
+// that failed is deleted.
+func rollbackExe(exe string) error {
+	failed := exe + ".failed"
+	_ = os.Remove(failed)
+	if err := os.Rename(exe, failed); err != nil {
+		return err
+	}
+	if err := os.Rename(exe+".old", exe); err != nil {
+		_ = os.Rename(failed, exe)
+		return err
+	}
+	_ = os.Remove(failed)
+	return nil
 }

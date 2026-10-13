@@ -14,7 +14,7 @@ Config/*.bak
 Tools/relay-mirror/.wrangler/
 DataPlane/openvpn/openvpn3/
 DataPlane/openvpn/mbedtls/
-DataPlane/sweepovpn/build-mac/
+DataPlane/sweepovpn/build-mac*/
 
 # Wrangler caches the Cloudflare account id and the account holder's email.
 Tools/**/.wrangler/

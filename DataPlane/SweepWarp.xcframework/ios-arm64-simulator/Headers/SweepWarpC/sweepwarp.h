@@ -30,6 +30,7 @@ static inline void sweep_warp_call_log(sweep_warp_log_fn fn, const char *line) {
 #line 1 "cgo-generated-wrapper"
 
 
+
 /* End of preamble from import "C" comments.  */
 
 
@@ -94,9 +95,10 @@ extern void SweepWarpFree(char* p);
 extern char* SweepWarpRegister(char* configPath, char* deviceName, char* teamToken);
 extern char* SweepWarpSetLicense(char* configPath, char* key);
 extern char* SweepWarpStart(char* configPath, char* sni, int tunFd);
-extern char* SweepWarpStartGaming(char* configPath, char* sni, int tunFd, int flowTTLSeconds);
+extern char* SweepWarpStartGaming(char* configPath, char* sni, int tunFd, char* wgIdentityPath);
 extern void SweepWarpStop(void);
 extern int SweepWarpFindTunnelFd(void);
+extern char* SweepWarpRegisterWG(char* identityPath);
 
 #ifdef __cplusplus
 }

@@ -38,6 +38,7 @@ import (
 	"github.com/Diniboy1123/usque/config"
 	"github.com/Diniboy1123/usque/internal"
 	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/tun"
 )
 
 const (
@@ -191,43 +192,38 @@ func load(path string) (config.Config, error) {
 //
 //export SweepWarpStart
 func SweepWarpStart(configPath, sni *C.char, tunFd C.int) *C.char {
-	return cError(start(C.GoString(configPath), C.GoString(sni), int(tunFd), 0))
+	return cError(start(C.GoString(configPath), C.GoString(sni), int(tunFd), ""))
 }
 
-// SweepWarpStartGaming is SweepWarpStart with the flow-kill mitigations on.
+// SweepWarpStartGaming is SweepWarpStart for games, as gaming mode is on macOS.
 //
 // The packet tunnel already carries every packet, so games work on iOS in the
-// ordinary mode; what they cannot ride out is this network's habit of killing
-// long-lived TCP flows, which stalls the tunnel for seconds. flowTTLSeconds
-// additionally retires each flow before the sweep can reach it - opt-in,
-// because the swap can briefly stall new connections. 0 is then the same as
-// SweepWarpStart: see hotStandby for why a parked standby is not a mitigation.
+// ordinary mode; what they cannot ride out is this network moving traffic to
+// another uplink, which ends the MASQUE flow and resets every connection
+// inside its replacement. So the tunnel goes over WireGuard when the
+// registration at wgIdentityPath gets a handshake through, and over MASQUE
+// with the hop probe when it does not (no registration, or a network that
+// drops WireGuard). One-way per start, like gamemode.sh.
+//
+// Never flow rotation or a parked standby: every MASQUE session is a new
+// connection for whatever is inside it, and a standby is swept in the same
+// sweep as the live flow (measured 2026-09-20).
 //
 //export SweepWarpStartGaming
-func SweepWarpStartGaming(configPath, sni *C.char, tunFd C.int, flowTTLSeconds C.int) *C.char {
-	return cError(start(C.GoString(configPath), C.GoString(sni), int(tunFd), int(flowTTLSeconds)))
+func SweepWarpStartGaming(configPath, sni *C.char, tunFd C.int, wgIdentityPath *C.char) *C.char {
+	return cError(start(C.GoString(configPath), C.GoString(sni), int(tunFd), C.GoString(wgIdentityPath)))
 }
 
-// hotStandby reports whether to keep a warm MASQUE session parked.
-//
-// It used to be on in every mode, on the theory that a killed flow becomes a
-// promotion instead of a rebuild. Measured 2026-09-20 on the filtered network,
-// logging the parked session's age at each promotion: the standby is swept in
-// the *same* sweep as the live flow. Live flows died at 23.1s, 28.1s, 33.2s and
-// 55.9s, and the standby promoted after each was 21.8s, 27.9s, 34.0s and 49.7s
-// old and already dead - "Promoted standby MASQUE session" and "Tunnel
-// connection lost" in the same second, twice in a row, which is the churn the
-// iOS journal of 2026-09-20 shows. Only a session dialled after the kill
-// survived. So in kill recovery a standby buys nothing and costs a wasted
-// promote cycle (~2s) ahead of the dial that actually works.
-//
-// It stays on for flow rotation, where the promotion is planned rather than a
-// response to a kill and there has to be a warm session to rotate into. That
-// matches macOS (WarpController passes no --hot-standby; gamemode.sh does) and
-// Windows.
-func hotStandby(flowTTLSeconds int) bool { return flowTTLSeconds > 0 }
+// hopProbe is gamemode.sh's --hop-probe: end a MASQUE session the moment the
+// second hop changes instead of waiting 7s for a PING timeout.
+const hopProbe = 250 * time.Millisecond
 
-func start(path, sni string, fd int, flowTTLSeconds int) error {
+// masquePort is not 443 because this network's firewall proxies every tcp/443
+// flow. Keep in step with WarpController.masquePort on macOS.
+const masquePort = 8443
+
+// start maintains the tunnel on fd. A non-empty wgIdentity is gaming mode.
+func start(path, sni string, fd int, wgIdentity string) error {
 	if fd < 0 {
 		return errors.New("no tunnel file descriptor")
 	}
@@ -251,7 +247,7 @@ func start(path, sni string, fd int, flowTTLSeconds int) error {
 	if err != nil {
 		return err
 	}
-	endpoint, err := config.SelectEndpointFromConfig(true, false, 443)
+	endpoint, err := config.SelectEndpointFromConfig(true, false, masquePort)
 	if err != nil {
 		return err
 	}
@@ -264,7 +260,7 @@ func start(path, sni string, fd int, flowTTLSeconds int) error {
 	ctx, c := context.WithCancel(context.Background())
 	d := &utun{fd: fd}
 	cancel = func() { c(); d.closed.Store(true) }
-	go api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
+	masque := api.MaintainTunnelConfig{
 		TLSConfig:       tlsConfig,
 		KeepalivePeriod: keepalive,
 		Endpoint:        endpoint,
@@ -273,10 +269,28 @@ func start(path, sni string, fd int, flowTTLSeconds int) error {
 		ReconnectDelay:  reconnectDelay,
 		AlwaysReconnect: true,
 		UseHTTP2:        true,
-		HotStandby:      hotStandby(flowTTLSeconds),
-		FlowTTL:         time.Duration(flowTTLSeconds) * time.Second,
-	})
-	log.Printf("WARP tunnel starting: endpoint %s, SNI %s, flow ttl %ds", endpoint, sni, flowTTLSeconds)
+	}
+	gaming := wgIdentity != ""
+	if gaming {
+		masque.HopProbe = hopProbe
+	}
+	log.Printf("WARP tunnel starting: endpoint %s, SNI %s, gaming %t", endpoint, sni, gaming)
+	go func() {
+		if gaming {
+			wg, peerConf, err := openWG(ctx, wgIdentity, cfg.IPv4, func() (tun.Device, error) { return wgTun(fd) })
+			if err == nil {
+				log.Println("Connected to WARP over WireGuard")
+				wgWatch(ctx, wg, peerConf)
+				wg.Close()
+				return
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("WireGuard not used (%v); carrying the tunnel over MASQUE", err)
+		}
+		api.MaintainTunnel(ctx, masque)
+	}()
 	return nil
 }
 
